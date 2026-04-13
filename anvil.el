@@ -73,9 +73,8 @@ so AI tool calls never freeze the human's editor."
 These are not loaded by default.  Available modules:
 - `xlsx' — Excel read/write (requires Python + openpyxl)
 - `pdf'  — PDF extraction (requires Python + pymupdf)
-- `agenda' — Agenda with rokuyo calendar (requires org-mode)
 - `ide'  — IDE tools: xref, diagnostics (requires project.el)
-- `ide'  — IDE tools: xref, diagnostics (requires project.el)"
+- `cron' — Scheduled task runner with worker dispatch"
   :type '(repeat symbol)
   :group 'anvil)
 
