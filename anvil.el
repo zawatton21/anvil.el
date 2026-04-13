@@ -59,10 +59,12 @@
   :prefix "anvil-")
 
 (defcustom anvil-modules
-  '(eval org file host git proc fs emacs text clipboard data net)
+  '(worker eval org file host git proc fs emacs text clipboard data net)
   "List of anvil modules to load when `anvil-enable' is called.
 Each symbol corresponds to an `anvil-SYMBOL.el' file that provides
-a set of MCP tools.  Modules are loaded in the order listed."
+a set of MCP tools.  Modules are loaded in the order listed.
+The `worker' module should be first — it spawns an isolated sub-Emacs
+so AI tool calls never freeze the human's editor."
   :type '(repeat symbol)
   :group 'anvil)
 
@@ -72,6 +74,7 @@ These are not loaded by default.  Available modules:
 - `xlsx' — Excel read/write (requires Python + openpyxl)
 - `pdf'  — PDF extraction (requires Python + pymupdf)
 - `agenda' — Agenda with rokuyo calendar (requires org-mode)
+- `ide'  — IDE tools: xref, diagnostics (requires project.el)
 - `ide'  — IDE tools: xref, diagnostics (requires project.el)"
   :type '(repeat symbol)
   :group 'anvil)
