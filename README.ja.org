@@ -375,6 +375,102 @@ AI クライアント側: エージェントにツール一覧を要求するか
 =anvil-host-info= などを呼び出してみてください。呼び出しが返れば、ブリッジは
 正常に動作しています。
 
+* AI に Anvil を使わせる — CLAUDE.md の書き方
+
+Anvil を接続しただけではツールが「使える状態になる」だけで、
+エージェントが組み込みの =Read= / =Edit= / =Write= より Anvil を
+*優先する* ようにしないと、上で説明したトークン節約は実現しません。
+ほとんどの LLM クライアントはプロジェクト単位の指示ファイル
+（Claude Code なら =CLAUDE.md=、Cursor なら =.cursorrules= 等）
+を読むので、以下のスニペットを貼り付けてください。
+
+** 推奨スニペット（Claude Code =CLAUDE.md=）
+
+#+begin_src markdown
+## ファイル編集
+
+該当する場合は、組み込みの Read/Edit/Write より Anvil MCP ツールを
+優先する。差分のみを送り、複数編集を 1 ラウンドトリップに集約し、
+フルファイル read を回避できる。
+
+- `anvil-file-batch` — 同一ファイルへの 3 つ以上の編集（1 コールに集約）
+- `anvil-file-replace-string` / `anvil-file-replace-regexp` —
+  ピンポイント置換。ファイル全体を read 不要
+- `anvil-file-insert-at-line` / `anvil-file-delete-lines` /
+  `anvil-file-append` — 行単位の局所操作
+
+組み込みの `Edit` は小さな単発編集のみに使う。同一ファイルに 3 箇所
+以上編集するなら必ず `anvil-file-batch` を使う。
+
+## org-mode
+
+セクション移動・refile・分割、または大きい org からの単一見出し読み取りは、
+Read+Write ではなく `anvil-org-*` ツールを使う。トークン消費が 10〜20 倍
+少ない。
+
+- `anvil-org-read-headline` — 単一サブツリーの読み取り
+- `anvil-org-read-outline` — body なしのアウトライン表示
+- `anvil-org-edit-body` / `anvil-org-rename-headline` /
+  `anvil-org-update-todo-state` — 局所的な org 編集
+
+## 重い処理 — ワーカーディスパッチ
+
+長時間の Emacs 操作（大規模タングル、バイトコンパイル、マルチ MB
+org スキャン、フルツリー検索）はメインデーモンで実行してはいけない。
+他のすべてのツール呼び出しがブロックされる。ワーカープール経由で
+ディスパッチすること。
+
+- Anvil 内から呼ぶ elisp: ~1 秒を超えそうなものは raw `eval` ではなく
+  `anvil-worker-call` を優先する。
+- ワーカーを別 MCP サーバとして登録している場合（README 「オプション:
+  ワーカープールも登録する」参照）、重い `eval` は
+  `mcp__anvil-worker__eval` を直接ターゲットにする。メインセッションの
+  応答性が保たれる。
+
+ワーカー使用すべきだったサイン: メイン MCP セッションが数秒間ツール
+呼び出しを受け付けなくなった。
+
+## スケジュールタスク（cron）
+
+`anvil-cron` タスクが設定されている場合（lint、ヘルスチェック、バッチ
+インデクサ等）、その作業を場当たり的に再実装しない。cron MCP ツール経由で
+状態確認・トリガーする:
+
+- `anvil-cron-list` — 登録タスクとスケジュール一覧
+- `anvil-cron-status` — 最終実行時刻、状態、最近の失敗
+- `anvil-cron-run` — 登録済みタスクの即時実行
+
+新規アドホックスクリプトを書く前に `anvil-cron-list` を確認する。
+すでにジョブとして定義されているかもしれない。
+#+end_src
+
+** 自己強化ルール（任意）
+
+長いセッションでも軌道修正できるよう、自己補正トリガを追記しておく:
+
+#+begin_src markdown
+## MCP ツール自己強化
+
+作業中に以下を検知したら、続行前に該当する Anvil ツールへ切り替える:
+
+- 同じ elisp パターンを同一セッション内で 2 回以上書いた
+- 1 つの論理編集に対して `anvil-eval` を 3 回以上呼んだ
+  （`anvil-file-batch` 1 コールで済んだはず）
+- 同じ大きいファイルをフルで何度も Read している
+- 重い elisp 操作でメインセッションがブロックされた
+  （`anvil-worker-call` / `mcp__anvil-worker__eval` 経由にすべきだった）
+
+タスク末尾ではなく、その場で軌道修正すること。
+#+end_src
+
+** なぜこれが必要か
+
+明示的な指示がないと、エージェントはどの MCP サーバが接続されていても
+最大公約数的なツール（=Read=、=Edit=、=Write=）にフォールバックします。
+README 冒頭のトークン節約表は、エージェントが実際に Anvil ツールを
+*選ぶ* ことを前提にしています。その判断を駆動するのは指示ファイルで
+あって、Anvil 自身ではありません。
+
 * アーキテクチャ
 
 #+begin_example
