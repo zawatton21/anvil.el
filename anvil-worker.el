@@ -233,12 +233,43 @@ caller indefinitely."
       (when (buffer-live-p buf) (kill-buffer buf)))
     alive))
 
+(defun anvil-worker--server-file-pid (server-file)
+  "Return the PID recorded on the first line of SERVER-FILE.
+Returns nil if the file cannot be read or the PID cannot be parsed.
+Emacs server files start with `HOST:PORT PID' on line one."
+  (ignore-errors
+    (with-temp-buffer
+      (insert-file-contents server-file nil 0 256)
+      (goto-char (point-min))
+      (when (re-search-forward "^\\S-+ \\([0-9]+\\)" (line-end-position) t)
+        (string-to-number (match-string 1))))))
+
+(defun anvil-worker--server-file-stale-p (server-file)
+  "Return non-nil if SERVER-FILE's recorded PID is no longer running.
+A missing PID (unparseable file) is treated as stale too."
+  (let ((pid (anvil-worker--server-file-pid server-file)))
+    (or (null pid)
+        (null (process-attributes pid)))))
+
 (defun anvil-worker-alive-p (&optional index)
-  "Return non-nil if worker at INDEX (default 0) is reachable."
+  "Return non-nil if worker at INDEX (default 0) is reachable.
+Performs three checks in order: file-exists, PID still alive, and
+a bounded `emacsclient' probe.  The PID check catches the common
+stale case (daemon crashed but socket file remained) cheaply —
+without opening a TCP connection that might hang if the port has
+since been reused.  A stale server file is deleted as a side
+effect so the next spawn starts cleanly."
   (let* ((idx (or index 0))
          (server-file (anvil-worker--server-file idx)))
-    (and (file-exists-p server-file)
-         (anvil-worker--probe-emacsclient server-file))))
+    (cond
+     ((not (file-exists-p server-file)) nil)
+     ((anvil-worker--server-file-stale-p server-file)
+      (ignore-errors (delete-file server-file))
+      (anvil-worker--log
+       'stale-server-file
+       (file-name-nondirectory server-file))
+      nil)
+     (t (anvil-worker--probe-emacsclient server-file)))))
 
 (defun anvil-worker--spawn-one (index)
   "Spawn worker at INDEX if not already running."
