@@ -3,13 +3,14 @@
 #+property: status DRAFT
 
 * STATUS
-~Phase 1+2(full) SHIPPED~ (2026-04-16) — Phase 1 helpers に加え、
-全 mutating ~file-*~ tool に ~:warnings~ を組込:
-~file-read~, ~file-replace-string~, ~file-replace-regexp~, ~file-insert-at-line~,
-~file-delete-lines~, ~file-append~, ~file-prepend~, ~file-batch~,
-~file-ensure-import~ (~file-batch-across~ は内部で ~file-batch~ を呼ぶため
-per-file result に自動伝播)。
-~buffer-*~ 系 MCP tool (Phase 3) は未着手。
+~Phase 1+2(full)+3 SHIPPED~ (2026-04-16) — Phase 1 helpers, 全 mutating
+~file-*~ tool への ~:warnings~ 組込 (Phase 2 full) に加え、Phase 3 で
+3 つの ~buffer-*~ MCP tool を新規登録:
+- ~buffer-read~           — visited buffer の live 内容取得 + status
+- ~buffer-save~           — write-region 経由で disk 書き戻し、
+  ~disk-newer~ / ~both-modified~ は force なしで refuse
+- ~buffer-list-modified~  — file-visiting な modified buffer 全列挙
+Doc 05 の三部作は完了、残タスクはドキュメント化と長期 soak のみ。
 
 * Goal
 

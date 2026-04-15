@@ -77,7 +77,8 @@ These are not loaded by default.  Available modules:
 - `cron'   — Scheduled task runner with worker dispatch
 - `sqlite'    — Read-only SQLite query tool (requires Emacs 29+)
 - `elisp'     — Elisp development tools: ERT runner, byte-compile, describe
-- `org-index' — Persistent SQLite index of org files (requires Emacs 29+)"
+- `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
+- `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)"
   :type '(repeat symbol)
   :group 'anvil)
 
