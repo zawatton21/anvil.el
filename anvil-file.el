@@ -1450,12 +1450,19 @@ Returns plist (:files N :succeeded M :failed K :results ((PATH . PLIST) ...))."
 ;;;; --- MCP tool wrappers (new helpers) -------------------------------------
 
 (defun anvil-file--tool-json-object-add (path pairs-json &optional on-duplicate indent)
-  "MCP wrapper for `anvil-json-object-add'.
+  "Add key/value pairs to the top-level JSON object at PATH.
+
 PAIRS-JSON is a JSON array of two-element arrays or objects.  Examples:
   [[\"key1\",\"val1\"], [\"key2\",\"val2\"]]
   [{\"key\":\"a\",\"value\":\"b\"}, ...]
 ON-DUPLICATE is \"skip\"|\"overwrite\"|\"error\" (default: skip).
-INDENT is a string that parses as a number (default: auto-detect)."
+INDENT is a string that parses as a number (default: auto-detect).
+
+MCP Parameters:
+  path - Absolute path to the JSON file to edit
+  pairs-json - JSON array of [key, value] pairs or {key, value} objects
+  on-duplicate - \"skip\" (default), \"overwrite\", or \"error\"
+  indent - Optional indentation width as a string (e.g. \"2\"); auto-detected if omitted"
   (anvil-server-with-error-handling
    (let* ((parsed (json-parse-string pairs-json
                                      :object-type 'alist
@@ -1484,9 +1491,17 @@ INDENT is a string that parses as a number (default: auto-detect)."
      (format "%S" (anvil-json-object-add path pairs opts)))))
 
 (defun anvil-file--tool-ensure-import (path import-line &optional after-regex position)
-  "MCP wrapper for `anvil-file-ensure-import'.
-POSITION is a string: \"after-last-match\" (default) | \"before-first-match\"
-| \"top\" | \"bottom\"."
+  "Idempotently ensure IMPORT-LINE exists as a line in PATH.
+
+If the line is already present, no change is made.  Otherwise inserts
+after the last line matching AFTER-REGEX (default: \"^import \").
+POSITION overrides insertion location.
+
+MCP Parameters:
+  path - Absolute path to the file to edit
+  import-line - The full line of text to ensure (e.g. \"import x from 'y';\")
+  after-regex - Optional regexp; insert after the last matching line (default: \"^import \")
+  position - Optional: \"after-last-match\" (default), \"before-first-match\", \"top\", or \"bottom\""
   (anvil-server-with-error-handling
    (let ((opts (append
                 (when after-regex (list :after-regex after-regex))
@@ -1494,10 +1509,14 @@ POSITION is a string: \"after-last-match\" (default) | \"before-first-match\"
      (format "%S" (anvil-file-ensure-import path import-line opts)))))
 
 (defun anvil-file--tool-batch-across (file-ops-json)
-  "MCP wrapper for `anvil-file-batch-across'.
-FILE-OPS-JSON is a JSON array of objects:
-  [{\"path\":\"/a.el\",\"operations\":[{...},...]},
-   {\"path\":\"/b.el\",\"operations\":[{...},...]}]"
+  "Apply `anvil-file-batch' to multiple files in a single call.
+
+FILE-OPS-JSON is a JSON array of objects, each with a `path' and an
+`operations' array (same format as file-batch).  Failures in one file
+do not abort the rest; per-file results are returned.
+
+MCP Parameters:
+  file-ops-json - JSON array of {\"path\":...,\"operations\":[...]} objects"
   (anvil-server-with-error-handling
    (let ((file-ops (json-parse-string file-ops-json
                                       :object-type 'alist
