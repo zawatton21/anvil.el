@@ -887,7 +887,8 @@ caller does not have to scan it."
          (warnings nil)
          (errors nil)
          (result nil))
-    (with-current-buffer log-buf (erase-buffer))
+    (with-current-buffer log-buf
+      (let ((inhibit-read-only t)) (erase-buffer)))
     (condition-case err
         (setq result (byte-compile-file path))
       (error (push (error-message-string err) errors)))
