@@ -6,7 +6,7 @@
 ;; Keywords: convenience, files, matching, outlines
 ;; Version: 0.9.0
 ;; Package-Requires: ((emacs "27.1"))
-;; URL: https://github.com/zawatton21/anvil.el
+;; URL: https://github.com/zawatton/anvil.el
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -40,6 +40,16 @@
 (defcustom anvil-org-allowed-files nil
   "List of absolute paths to Org files that can be accessed via MCP."
   :type '(repeat file)
+  :group 'anvil-org)
+
+(defcustom anvil-org-use-index t
+  "When non-nil, `org-read-*' tools try `anvil-org-index' first.
+A hit returns straight from the SQLite-backed index (ms-scale).
+On a miss — index not loaded, entry absent, path ambiguous, or
+any error inside the fast-path — the handler falls back to the
+existing org-element-based implementation.  Set to nil to
+disable the fast-path entirely (e.g. while comparing behaviour)."
+  :type 'boolean
   :group 'anvil-org)
 
 (defcustom anvil-org-allowed-files-enabled t
@@ -1218,6 +1228,33 @@ MCP Parameters:
   file - Absolute path to an Org file"
   (anvil-org--handle-outline-resource `(("filename" . ,file))))
 
+(declare-function anvil-org-index-read-by-id    "anvil-org-index" (org-id))
+(declare-function anvil-org-index-read-headline  "anvil-org-index" (file path))
+
+(defun anvil-org--index-available-p ()
+  "Return non-nil when the `anvil-org-index' fast-path can be tried.
+Checks the feature-flag, the library itself, and the live DB
+handle so callers do not need to repeat those guards."
+  (and anvil-org-use-index
+       (featurep 'anvil-org-index)
+       (boundp 'anvil-org-index--db)
+       anvil-org-index--db))
+
+(defun anvil-org--try-index-read-by-id (uuid)
+  "Try `anvil-org-index-read-by-id' for UUID; return the body or nil.
+A nil return means fall back to the org-element handler."
+  (when (anvil-org--index-available-p)
+    (condition-case _err
+        (anvil-org-index-read-by-id uuid)
+      (error nil))))
+
+(defun anvil-org--try-index-read-headline (file headline-path)
+  "Try `anvil-org-index-read-headline'; return the body or nil."
+  (when (anvil-org--index-available-p)
+    (condition-case _err
+        (anvil-org-index-read-headline file headline-path)
+      (error nil))))
+
 (defun anvil-org--tool-read-headline (file headline_path)
   "Tool wrapper for org-headline://{filename}#{path} resource.
 FILE is the absolute path to an Org file.
@@ -1243,8 +1280,9 @@ MCP Parameters:
     (anvil-org--tool-validation-error
      "Parameter headline_path must be non-empty; use \
 org-read-file tool to read entire files"))
-  (let ((full-path (concat file "#" headline_path)))
-    (anvil-org--handle-headline-resource `(("filename" . ,full-path)))))
+  (or (anvil-org--try-index-read-headline file headline_path)
+      (let ((full-path (concat file "#" headline_path)))
+        (anvil-org--handle-headline-resource `(("filename" . ,full-path))))))
 
 (defun anvil-org--tool-read-by-id (uuid)
   "Tool wrapper for org-id://{uuid} resource template.
@@ -1252,7 +1290,8 @@ UUID is the UUID from headline's ID property.
 
 MCP Parameters:
   uuid - UUID from headline's ID property"
-  (anvil-org--handle-id-resource `(("uuid" . ,uuid))))
+  (or (anvil-org--try-index-read-by-id uuid)
+      (anvil-org--handle-id-resource `(("uuid" . ,uuid)))))
 
 (defun anvil-org-enable ()
   "Enable the anvil-org module."
