@@ -301,7 +301,10 @@ doesn't match function arguments, or if any parameter is not documented."
 (defun anvil-server--generate-schema-from-function (func)
   "Generate JSON schema by analyzing FUNC's signature.
 Returns a schema object suitable for tool registration.
-Extracts parameter descriptions from the docstring if available."
+Extracts parameter descriptions from the docstring if available.
+Parameters prefixed with `_' (the Elisp unused-arg convention) are
+hidden from the client-facing schema — `anvil-server--handle-tools-call'
+fills them with nil at dispatch time."
   (let ((arglist (help-function-arglist func t)))
     (when (memq '&rest arglist)
       (error "MCP tool handlers do not support &rest parameters"))
@@ -311,13 +314,19 @@ Extracts parameter descriptions from the docstring if available."
          (docstring (documentation func t))
          (param-descriptions
           (anvil-server--extract-param-descriptions
-           docstring arglist)))
-      (if arglist
-          ;; One or more arguments case
+           docstring arglist))
+         ;; Filter out `_'-prefixed args for the user-visible schema.
+         (visible-arglist
+          (cl-remove-if
+           (lambda (a)
+             (string-prefix-p "_" (symbol-name a)))
+           arglist)))
+      (if visible-arglist
+          ;; One or more user-visible arguments case
           (let ((properties '())
                 (required '())
                 (seen-optional nil))
-            (dolist (arg arglist)
+            (dolist (arg visible-arglist)
               (let ((param-name (symbol-name arg)))
                 (if (string= param-name "&optional")
                     ;; Mark that we've seen &optional
@@ -341,7 +350,7 @@ Extracts parameter descriptions from the docstring if available."
             `((type . "object")
               (properties . ,(nreverse properties))
               (required . ,(vconcat (nreverse required)))))
-        ;; No arguments case
+        ;; No user-visible arguments case (all args are `_'-prefixed or empty)
         '((type . "object"))))))
 
 (defun anvil-server--ref-counted-register (key item table)
@@ -892,18 +901,23 @@ METHOD-METRICS is used to track errors for this method."
                    (seen-optional nil)
                    (result
                     (progn
-                      ;; Collect expected and required parameter names
+                      ;; Collect expected and required parameter names.
+                      ;; `_'-prefixed args follow the Elisp unused-arg
+                      ;; convention — they are hidden from the client-facing
+                      ;; schema (see `anvil-server--generate-schema-from-function')
+                      ;; and must be skipped here too.
                       (dolist (param arglist)
                         (let ((param-name (symbol-name param)))
-                          (if (string= param-name "&optional")
-                              ;; Mark that we've seen &optional
-                              (setq seen-optional t)
-                            ;; Regular parameter
+                          (cond
+                           ((string= param-name "&optional")
+                            (setq seen-optional t))
+                           ((string-prefix-p "_" param-name)
+                            nil)
+                           (t
                             (push (intern param-name) expected-params)
-                            ;; Add to required only if before &optional
                             (unless seen-optional
                               (push (intern param-name)
-                                    required-params)))))
+                                    required-params))))))
                       ;; Collect provided parameter names
                       (dolist (arg tool-args)
                         (push (car arg) provided-params))
@@ -915,21 +929,30 @@ METHOD-METRICS is used to track errors for this method."
                            (list
                             (format "Missing required parameter: %s"
                                     required)))))
-                      ;; Check for unexpected parameters
+                      ;; Check for unexpected parameters.  `_'-prefixed
+                      ;; names are silently accepted even when not in
+                      ;; `expected-params' — a stale client that still has
+                      ;; a pre-fix schema may send them.  We just drop them.
                       (dolist (provided provided-params)
-                        (unless (memq provided expected-params)
+                        (unless
+                            (or (string-prefix-p
+                                 "_" (symbol-name provided))
+                                (memq provided expected-params))
                           (signal
                            'anvil-server-invalid-params
                            (list
                             (format "Unexpected parameter: %s"
                                     provided)))))
-                      ;; All validation passed, collect values and call handler
+                      ;; All validation passed, collect values and call handler.
+                      ;; `_'-prefixed args always receive nil (client can't send them).
                       (dolist (param arglist)
                         (let ((param-name (symbol-name param)))
                           (unless (string= param-name "&optional")
                             (let ((value
-                                   (alist-get
-                                    (intern param-name) tool-args)))
+                                   (if (string-prefix-p "_" param-name)
+                                       nil
+                                     (alist-get
+                                      (intern param-name) tool-args))))
                               (push value arg-values)))))
                       (apply handler (nreverse arg-values))))
                    ;; Ensure result is string or nil, error on other types
