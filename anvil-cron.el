@@ -283,17 +283,16 @@ MCP Parameters:
   (none)"
   (anvil-cron-list))
 
-(defun anvil-cron--tool-run (args)
+(defun anvil-cron--tool-run (task_id)
   "Run a scheduled task immediately.
 
 MCP Parameters:
   task_id - Task ID to run (string, required)
             Example: \"morning-lint\""
   (anvil-server-with-error-handling
-    (let* ((id-str (or (plist-get args :task_id)
-                       (error "task_id required")))
-           (id (intern id-str)))
-      (anvil-cron-run-now id))))
+    (unless (and (stringp task_id) (> (length task_id) 0))
+      (error "task_id required"))
+    (anvil-cron-run-now (intern task_id))))
 
 (defun anvil-cron--tool-status (_args)
   "Show detailed status of all tasks.

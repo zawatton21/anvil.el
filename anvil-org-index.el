@@ -659,42 +659,83 @@ Windows tools touch mtime without raising a normal change event."
                (string-match-p "\\.org\\'" file))
       (anvil-org-index--schedule-refresh (expand-file-name file)))))
 
+(defun anvil-org-index--watch-add-one (dir)
+  "Add a `file-notify' watch for DIR.  Returns non-nil on success."
+  (condition-case err
+      (let ((desc (file-notify-add-watch
+                   dir '(change attribute-change)
+                   #'anvil-org-index--on-file-event)))
+        (push (cons dir desc) anvil-org-index--watch-descriptors)
+        t)
+    (error
+     (message "anvil-org-index: cannot watch %s: %S" dir err)
+     nil)))
+
+(defun anvil-org-index--watch-dirs-chunked (dirs chunk-size delay)
+  "Install file-notify watches for DIRS, CHUNK-SIZE at a time.
+After each chunk, yield to the event loop via `run-at-time' with
+DELAY seconds so the human never sees a multi-second freeze."
+  (if (<= (length dirs) chunk-size)
+      ;; Last (or only) chunk — install and finish.
+      (progn
+        (dolist (dir dirs)
+          (anvil-org-index--watch-add-one dir))
+        (message "anvil-org-index: watching %d director%s"
+                 (length anvil-org-index--watch-descriptors)
+                 (if (= 1 (length anvil-org-index--watch-descriptors))
+                     "y" "ies")))
+    ;; Install this chunk, then defer the rest.
+    (let ((chunk (cl-subseq dirs 0 chunk-size))
+          (rest  (cl-subseq dirs chunk-size)))
+      (dolist (dir chunk)
+        (anvil-org-index--watch-add-one dir))
+      (run-at-time delay nil
+                   #'anvil-org-index--watch-dirs-chunked
+                   rest chunk-size delay))))
+
 ;;;###autoload
-(defun anvil-org-index-watch (&optional paths)
-  "Start watching PATHS for .org file changes; auto-refresh the index.
-PATHS defaults to `anvil-org-index-paths'.  Idempotent — a
-second call tears down and re-establishes all watches.  Installs
-the periodic safety-net scan when
-`anvil-org-index-periodic-scan-seconds' is positive.  Returns
-the list of directories now under watch."
+(defun anvil-org-index-periodic-scan-start (&optional interval)
+  "Start just the periodic mtime scan (no filesystem watches).
+INTERVAL overrides `anvil-org-index-periodic-scan-seconds'.
+This is the recommended startup mode on Windows where
+`file-notify-add-watch' takes ~1s per directory and causes a
+25+ second freeze during daemon startup.  Idempotent."
   (interactive)
   (unless anvil-org-index--db (anvil-org-index-enable))
-  (require 'filenotify)
-  (anvil-org-index-unwatch)
-  (let ((dirs (anvil-org-index--collect-dirs paths)))
-    (dolist (dir dirs)
-      (condition-case err
-          (let ((desc (file-notify-add-watch
-                       dir '(change attribute-change)
-                       #'anvil-org-index--on-file-event)))
-            (push (cons dir desc) anvil-org-index--watch-descriptors))
-        (error
-         (message "anvil-org-index: cannot watch %s: %S" dir err))))
-    (when (and (> anvil-org-index-periodic-scan-seconds 0)
+  (let ((secs (or interval anvil-org-index-periodic-scan-seconds)))
+    (when (and (> secs 0)
                (not (timerp anvil-org-index--periodic-timer)))
       (setq anvil-org-index--periodic-timer
             (run-with-timer
-             anvil-org-index-periodic-scan-seconds
-             anvil-org-index-periodic-scan-seconds
+             secs secs
              (lambda ()
                (condition-case err
                    (anvil-org-index-refresh-if-stale)
                  (error
                   (message "anvil-org-index periodic scan failed: %S"
-                           err)))))))
-    (message "anvil-org-index: watching %d director%s"
-             (length dirs)
-             (if (= 1 (length dirs)) "y" "ies"))
+                           err))))))
+      (message "anvil-org-index: periodic scan every %ds (no filenotify)"
+               secs))))
+
+;;;###autoload
+(defun anvil-org-index-watch (&optional paths)
+  "Start watching PATHS for .org file changes; auto-refresh the index.
+PATHS defaults to `anvil-org-index-paths'.  Idempotent — a
+second call tears down and re-establishes all watches.  Also
+installs the periodic safety-net scan.
+
+WARNING: on Windows, `file-notify-add-watch' takes ~1s per
+directory.  With 25 directories this freezes the editor for 25+
+seconds.  Use `anvil-org-index-periodic-scan-start' instead."
+  (interactive)
+  (unless anvil-org-index--db (anvil-org-index-enable))
+  (require 'filenotify)
+  (anvil-org-index-unwatch)
+  (let ((dirs (anvil-org-index--collect-dirs paths)))
+    ;; Chunked watch setup — 3 dirs per tick, 0.1s yield between chunks
+    (anvil-org-index--watch-dirs-chunked dirs 3 0.1)
+    ;; Periodic safety-net scan
+    (anvil-org-index-periodic-scan-start)
     dirs))
 
 ;;;###autoload

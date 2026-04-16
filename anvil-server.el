@@ -6,7 +6,7 @@
 ;; Keywords: comm, tools
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1"))
-;; URL: https://github.com/zawatton21/anvil.el
+;; URL: https://github.com/zawatton/anvil.el
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -286,9 +286,12 @@ doesn't match function arguments, or if any parameter is not documented."
       ;; Check that all function parameters have descriptions
       (dolist (arg arglist)
         (let ((arg-name (symbol-name arg)))
-          ;; Skip &optional and &rest markers - they're not parameters
+          ;; Skip &optional / &rest markers and `_'-prefixed parameters
+          ;; (the Elisp convention for intentionally unused parameters —
+          ;; these have no user-facing meaning and need no MCP docs).
           (unless (or (string= arg-name "&optional")
                       (string= arg-name "&rest")
+                      (string-prefix-p "_" arg-name)
                       (assoc arg-name descriptions))
             (error
              "Function parameter '%s' missing from MCP Parameters section"

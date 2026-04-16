@@ -608,9 +608,11 @@ code should pass an explicit LANE."
 
 (defun anvil-worker--send-warmup (worker)
   "Send `anvil-worker-batch-warmup-expressions' to WORKER, fire-and-forget.
-Returns the list of expressions actually dispatched (empty when
-WORKER has not come alive yet — the caller may re-schedule)."
-  (when (anvil-worker--worker-alive-p worker)
+Uses `anvil-worker--quick-alive-p' (no probe) so the warmup
+timer never blocks the editor.  If the worker's server socket
+hasn't bound yet, `call-process' with DESTINATION 0 fails
+silently and the expressions are simply not sent."
+  (when (anvil-worker--quick-alive-p worker)
     (let ((server-file (plist-get worker :server-file))
           (sent '()))
       (dolist (expr anvil-worker-batch-warmup-expressions)
@@ -631,11 +633,31 @@ its server socket before we start firing `emacsclient' at it."
     (run-at-time anvil-worker-batch-warmup-delay nil
                  #'anvil-worker--send-warmup worker)))
 
+(defun anvil-worker--quick-alive-p (worker)
+  "Fast, non-blocking alive check for WORKER.
+Unlike `anvil-worker--worker-alive-p', this never spawns an
+`emacsclient' probe — it only checks file existence and PID
+liveness.  Returns non-nil when the server file exists AND its
+PID is still running.  Deletes stale server files as a side
+effect."
+  (let ((server-file (plist-get worker :server-file)))
+    (cond
+     ((not (file-exists-p server-file)) nil)
+     ((anvil-worker--server-file-stale-p server-file)
+      (ignore-errors (delete-file server-file))
+      (anvil-worker--log
+       'stale-server-file
+       (file-name-nondirectory server-file))
+      nil)
+     (t t))))
+
 (defun anvil-worker--spawn-worker (worker)
   "Spawn WORKER if not already alive.  Returns the start-process or nil.
+Uses `anvil-worker--quick-alive-p' (file + PID only, no probe)
+so the spawn path never blocks on `accept-process-output'.
 Batch-lane spawns also schedule a deferred warmup so common
 libraries are loaded before the first real dispatch."
-  (if (anvil-worker--worker-alive-p worker)
+  (if (anvil-worker--quick-alive-p worker)
       (progn
         (anvil-worker--log
          'spawn-skipped
@@ -671,11 +693,19 @@ libraries are loaded before the first real dispatch."
 
 ;;;###autoload
 (defun anvil-worker-spawn ()
-  "Spawn every worker in every lane.  Idempotent."
+  "Spawn every worker in every lane.  Idempotent.
+Workers are staggered with `run-at-time' so each spawn yields
+back to the event loop — the human never sees the editor freeze
+while four Emacs daemons are starting up."
   (interactive)
   (unless anvil-worker--pool
     (anvil-worker--init-pool))
-  (anvil-worker--map-pool #'anvil-worker--spawn-worker)
+  (let ((delay 0.0)
+        (step  0.5))
+    (anvil-worker--map-pool
+     (lambda (worker)
+       (run-at-time delay nil #'anvil-worker--spawn-worker worker)
+       (setq delay (+ delay step)))))
   (message "Anvil worker pool: spawned (read=%d write=%d batch=%d)"
            anvil-worker-read-pool-size
            anvil-worker-write-pool-size
@@ -989,9 +1019,14 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 ;;; Module enable/disable
 
 (defun anvil-worker-enable ()
-  "Initialise every lane, spawn workers, start health monitoring."
+  "Initialise every lane, defer spawn, start health monitoring.
+The actual `start-process' calls are deferred to a 1-second timer
+so the module-load phase of `anvil-enable' returns instantly and
+the human never sees the editor freeze."
   (anvil-worker--init-pool)
-  (anvil-worker-spawn)
+  ;; Defer the heavy work (start-process × N) so it does not block
+  ;; the synchronous module-load phase of `anvil-enable'.
+  (run-at-time 1 nil #'anvil-worker-spawn)
   (anvil-worker-health-timer-start))
 
 (defun anvil-worker-disable ()

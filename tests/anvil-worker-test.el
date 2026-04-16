@@ -316,7 +316,7 @@ Disable health timer + spawning so no real subprocesses start."
                        :server-file "/tmp/no-such"
                        :busy nil :last-state nil))
          (calls 0))
-    (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
+    (cl-letf (((symbol-function 'anvil-worker--quick-alive-p)
                (lambda (_) nil))
               ((symbol-function 'call-process)
                (lambda (&rest _) (cl-incf calls) 0))
@@ -334,7 +334,7 @@ Disable health timer + spawning so no real subprocesses start."
          (anvil-worker-batch-warmup-expressions
           '("(require 'org)" "(require 'cl-lib)"))
          (recorded '()))
-    (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
+    (cl-letf (((symbol-function 'anvil-worker--quick-alive-p)
                (lambda (_) t))
               ((symbol-function 'call-process)
                (lambda (&rest args) (push args recorded) 0))
