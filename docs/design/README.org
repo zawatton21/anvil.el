@@ -1,5 +1,5 @@
 #+title: Anvil — Next Architecture Design Docs
-#+author: Fujisawa Electric Management Office
+#+author: zawatton
 #+startup: overview
 
 * Background

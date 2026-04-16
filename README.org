@@ -1,7 +1,14 @@
-#+title: Anvil — An Emacs MCP Server
-#+author: Fujisawa Electric Management Office
+#+title: Anvil — Forge Emacs into an AI's Weapon
+#+author: zawatton
 
 *Languages:* English / [[file:README.ja.org][日本語]]
+
+#+begin_quote
+*Note on language:* I'm a non-native English speaker. The phrasing in this
+README is shaped with help from an LLM, but the thinking and the design
+decisions are entirely mine. The LLM is acting as a translator/editor, not
+the author. If something reads oddly, please read it with that in mind.
+#+end_quote
 
 #+begin_quote
 Your AI's workbench. Turn Emacs into a tool server for any LLM
@@ -34,55 +41,129 @@ elisp.
        └──────────────────────────┘
 #+end_example
 
-Until now, humans used text editors with AI assistance.
-With anvil, /the AI uses the text editor./
+Until now, humans have used text editors with AI assistance.
+With Anvil installed, /the AI uses the text editor./
 
-Every modern editor (VSCode, Cursor, Zed, JetBrains) is configured by
-code the vendor decided to expose. AI extensions live inside whatever
-extension API the vendor shipped. Emacs is different in a way that has
-always been a niche Lisp-y boast, and is now — suddenly — the most
-important property in the space:
+And to an AI, Emacs is not merely an "editor."
+
+Emacs has org-mode, dired, magit, comint, EAT, calc — and is also a Lisp REPL
+with the filesystem mounted.
 
 #+begin_quote
-*Emacs is built out of elisp, at runtime.*
+Decades of Emacs history — every feature it has accumulated — becomes the AI's arsenal.
 #+end_quote
 
-Which means an AI that can write elisp doesn't just /use/ Emacs. It can
-rewrite Emacs, while Emacs is running, to fit the task in front of it:
+AI is no longer just a code-completion sidekick.
+An AI equipped with Emacs can do so much more.
 
-- Define new commands for itself mid-session
-- Advise existing functions to change their behavior
-- Build new MCP tools for itself when the existing ones don't fit
-- Persist those tools into your init so the next session keeps them
-- Reshape the editor around the workflow, not the other way around
 
-A VSCode extension calls APIs Microsoft decided to expose. An
-anvil-equipped Emacs lets the agent extend its own toolset, inside the
-editor, while you watch.
+Modern editors (VSCode, Cursor, Zed, JetBrains) are configured by code the
+vendor decided to expose.
+
+AI-powered extensions can only operate within the extension API the vendor
+chose to ship.
+
+Emacs is different.
+Emacs is built from Emacs Lisp — a LISP interpreter whose capabilities can be
+extended without limit.
+Whatever capability the AI needs, it can be realized through Emacs (it all
+comes down to your ideas).
+
+Humans set themselves apart from other animals through tool use, and went on
+to build civilizations.
+
+#+begin_quote
+When the AI gains Emacs as its tool, what kind of history is about to begin?
+#+end_quote
 
 * Why I built it
 
-I run a one-person electrical engineering firm in Japan — industrial
-maintenance — and Windows is my daily driver. I've been a longtime
-Emacs user. Over the past several months I've been collaborating with
-Claude on real day-job work: inspection reports, bookkeeping
-automation, a 22-file org-mode legal database. The workflow evolved
-from Claude Desktop to Claude Code in the terminal, and finally
-directly inside Emacs itself. Anvil is what fell out of that third
-phase.
+Anvil stands on the shoulders of existing work.
 
-One frustration kept coming back:
+The MCP protocol foundation comes from Laurynas Biveinis's [[https://github.com/laurynas-biveinis/mcp-server-lib.el][mcp-server-lib.el]],
+and the org primitives are an extension and integration of his [[https://github.com/laurynas-biveinis/org-mcp][org-mcp]].
 
-#+begin_quote
-The AI's stock tools were built for /code in folders/.
-My day-to-day is /org buffers in a Lisp image./
-#+end_quote
+On top of these proven packages, Anvil adds four layers:
 
-Generic =edit_file= / =read_file= / =run_shell= are fine for
-greenfield code, but they're terrible at surgical edits inside a
-13,000-line org journal, at org-mode-aware operations, and at routing
-heavy work through the long-lived Emacs process I've already set up.
-Anvil closes that gap.
+- *File operations* — read/write text files, localized edits on large files
+- *External process integration* — invoke shell commands or other languages (Python, etc.)
+- *Long-running operation support* — OCR, PDF conversion, batch file scans, and more
+- *Background Emacs processes* that handle the above — your interactive Emacs never freezes while they run
+
+
+I run a one-person electrical engineering firm in Japan.
+Industrial maintenance, around 40 customer sites.
+Work circumstances mean Windows is my daily driver, but I've been a long-time Emacs user.
+
+For client reasons, my work depends heavily on Microsoft Office.
+I use Excel for inspection reports, and Emacs (org-mode) for casual notes and scheduling.
+
+(Side note: I've cycled through plenty of note-taking apps over the years, and finally settled on Emacs.)
+
+
+Over the past several months, my workflow has evolved through three phases of using Claude.
+
+** Phase 1 — Claude Desktop (Claude Cowork)
+
+Anthropic's local-file agent dramatically streamlined my work.
+The ability to edit Excel files and operate web browsers directly let me streamline — and even automate — document organization, report drafting, and accounting tasks.
+
+But as I kept pushing for more efficiency and exploring what else was possible, I quickly hit the contract plan limit (MAX plan, $200/month), and that became its own problem.
+
+** Phase 2 — Claude Code (CLI)
+
+I gradually shifted from the Claude Desktop app to a Claude Code workflow in Windows Terminal. The experience was excellent.
+
+Shell and git integration got far smoother, and automation kept advancing — but I started to feel the limits of Excel-based reports.
+(Mainly in terms of communicating with Claude. Things like "which cell in this Excel inspection report should be edited, and how.")
+
+What ChatGPT, Claude, and other generative AIs are best at is working with text.
+
+So I started wanting to manage inspection report data in org files (plain text) using Emacs (org-mode), the editor I was already using.
+(Excel files would still serve purely as the print-format layer.)
+
+If I did that, I could collaborate with the generative AI in the file format it's best at. With that in mind, I steadily kept converting my data over to org.
+
+For me personally, switching to org files made data editing dramatically easier.
+All customers managed in a single org file, sortable section by section.
+Anyone who's used org-mode can picture what I mean.
+
+But what about Claude Code?
+It can't edit a large org file the way a human edits it inside Emacs.
+And token consumption seemed to grow. Claude Code appears to read the entire file content every time and write back the full revised content.
+
+To top it off, on Windows there's a file-mount problem: when editing a roughly 1.2 MB org file, content at the end keeps getting lost.
+
+
+Was the move to an org-based workflow for collaboration with Claude a mistake?
+If only Claude could use Emacs's convenient features...
+
+Wait — couldn't Emacs itself make that possible?
+
+
+That was the starting point for Anvil's development.
+
+** Phase 3 — Through Anvil, into Emacs itself
+
+And so the third phase: I built Anvil and brought Emacs up as an MCP server that Claude Code can call into.
+
+Now the agent talks to the running Emacs image itself, through typed MCP tools.
+Org structure, heading-level edits, dispatch of long-running operations — all handled on the Emacs side, then passed across.
+
+The 1.2 MB org file truncation is no longer an issue.
+For Emacs, a large org file is a familiar friend — it edits accurately by line and by heading.
+
+Some examples of what this enabled in the past few weeks:
+
+- Refiling 29 sub-tasks across a 1,200-line =todo.org= in a single atomic =file-batch= call — under one second.
+- Renaming =zawatton21= → =zawatton= across 39 files in 7 repositories with one elisp loop through =emacs-eval= — one round trip.
+- Dispatching OCR and PDF rasterization for inspection reports to =anvil-worker= — even during scans, the interactive Emacs doesn't freeze.
+
+
+The problems I had — "I can't edit large org files," "Excel makes communication awkward," "token consumption is ballooning" — are probably ones that you, as an Emacs user, have run into in some similar form.
+
+Humans build tools, and then build the next thing using those tools — let's use Anvil to forge Emacs into the AI's strongest tool!!
+With Emacs, that is possible.
 
 * What is Anvil?
 
@@ -94,10 +175,26 @@ One ~(anvil-enable)~ and your Emacs becomes an AI-accessible workbench
 with 50+ tools: file editing, org-mode operations, git inspection,
 Elisp evaluation, and more — all through a safe, sandboxed interface.
 
+* Feature Highlights
+
+Anvil exposes about 50 MCP tools, letting an AI call Emacs's capabilities directly.
+Five that have proven the most useful:
+
+| Capability | What it does |
+|------------+--------------|
+| =file-batch= | Apply multiple edits to the same file atomically in one round trip (up to ~90% token reduction) |
+| =org-read-outline= / =org-read-headline= | Read just the headings or a single subtree, even on a 13,000-line org. No full-file read needed |
+| =anvil-worker= | Dispatch long-running tasks (OCR, PDF conversion, batch file scans) to a separate background Emacs. The interactive Emacs never freezes |
+| Large org file editing | Edit org files of 1.2 MB or more without truncation (avoids the Windows file-mount issue) |
+| LLM client agnostic | Claude Code / Claude Desktop / GPT / local LLMs via Ollama — all speak through MCP |
+
+For numerical evidence and detailed case studies, see [[*Efficiency — why Anvil saves AI tokens]].
+For the full module list, see [[*Modules]].
+
 * Why Anvil?
 
 - *LLM-agnostic* — works with any MCP-compatible client
-- *Safe by design* — worker daemon pool isolates AI tool calls from your editor
+- *Safe by design* — long-running tasks are dispatched to a background Emacs, so your interactive Emacs is never affected
 - *Org-mode native* — first-class org read/write/refactor support
 - *Large file safe* — handles 1.2MB+ files without data loss or truncation
 - *Cross-platform* — Linux, macOS, Windows, WSL
@@ -683,6 +780,15 @@ it's the same idea wearing a bigger coat.
 | macOS (native Emacs) | Supported |
 | Windows (native)     | Supported |
 | WSL                  | Supported |
+
+* How to help shape what comes next
+
+If something in this README resonates with you, the most useful signals are these four:
+
+- A *Star* on the repo — it lets me see what kind of context lands.
+- An *Issue* describing your concrete org / MCP workflow — that decides which primitives I add next.
+- Honest comparisons with [[https://github.com/laurynas-biveinis/org-mcp][org-mcp]] or any existing MCP shim I might have unknowingly reinvented.
+- Tool naming and granularity feedback — is there "too many small ops," or is it "about right"? Your gut take helps a lot.
 
 * Contributing
 
