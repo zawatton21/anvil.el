@@ -1439,6 +1439,299 @@ Returns plist (:inserted BOOL :line N :already-present BOOL :file PATH :warnings
               (list :inserted t :already-present nil
                     :line 1 :file abs :warnings warnings)))))))))
 
+;;;; --- code-add-field-by-map (TS/JS object literal bulk add) --------------
+
+(defun anvil-file--map-normalize (map)
+  "Normalize MAP into an alist of (LOOKUP . ADD) string pairs.
+Accepts alist, list of two-element lists, or hash-table."
+  (cond
+   ((hash-table-p map)
+    (let (acc)
+      (maphash (lambda (k v) (push (cons k v) acc)) map)
+      (nreverse acc)))
+   ((listp map)
+    (mapcar
+     (lambda (p)
+       (cond
+        ((and (consp p) (stringp (car p)) (stringp (cdr p)))
+         (cons (car p) (cdr p)))
+        ((and (consp p) (stringp (car p)) (consp (cdr p))
+              (null (cddr p)) (stringp (cadr p)))
+         (cons (car p) (cadr p)))
+        (t (error "anvil-code: invalid map pair (need string→string): %S" p))))
+     map))
+   (t (error "anvil-code: map must be alist or hash-table: %S" map))))
+
+(defun anvil-file--ts-string-end (start)
+  "Return position just past the closing `\"' of a TS string starting at START.
+START must point at the opening `\"'.  Handles `\\\\' and `\\\"' escapes.
+Returns nil if the string is unterminated within the buffer."
+  (save-excursion
+    (goto-char (1+ start))
+    (catch 'done
+      (while (not (eobp))
+        (let ((c (char-after)))
+          (cond
+           ((eq c ?\\)
+            (forward-char 2))
+           ((eq c ?\")
+            (forward-char 1)
+            (throw 'done (point)))
+           (t (forward-char 1)))))
+      nil)))
+
+(defun anvil-file--ts-block-bounds (pos)
+  "Return (BRACE-START . BRACE-END) of the single-line `{...}' block at POS.
+POS must lie inside the block.  Returns nil if no single-line block contains
+POS, or if the block spans multiple lines.  The bounds are character positions
+of `{' and the character after `}'."
+  (let* ((line-bol (line-beginning-position))
+         (line-eol (line-end-position))
+         (brace-start (save-excursion
+                        (goto-char pos)
+                        (when (search-backward "{" line-bol t)
+                          (point))))
+         (brace-end (save-excursion
+                      (goto-char pos)
+                      (when (search-forward "}" line-eol t)
+                        (point)))))
+    (when (and brace-start brace-end
+               (< brace-start pos) (>= brace-end pos))
+      (cons brace-start brace-end))))
+
+(defun anvil-file--collect-scope-regions (scope-regex)
+  "Return list of (START . END) substring regions matching SCOPE-REGEX.
+When SCOPE-REGEX is nil, returns one region covering the whole buffer."
+  (if (null scope-regex)
+      (list (cons (point-min) (point-max)))
+    (let ((acc nil))
+      (save-excursion
+        (goto-char (point-min))
+        (while (re-search-forward scope-regex nil t)
+          (push (cons (match-beginning 0) (match-end 0)) acc)
+          ;; Avoid infinite loop on zero-width matches.
+          (when (= (match-beginning 0) (match-end 0))
+            (forward-char 1))))
+      (nreverse acc))))
+
+(defun anvil-code-add-field-by-map (path spec)
+  "Add a field to TS/JS object literals by mapping from another field's value.
+
+For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a single-line `{...}'
+block at PATH, look up VALUE in MAP and insert `ADD-KEY: \"MAPPED-VALUE\"'
+before the block's closing `}'.
+
+PATH is the absolute path to the file.
+
+SPEC is a plist:
+  :lookup-key    String — existing field name (e.g. \"ja\")
+  :add-key       String — field name to add (e.g. \"en\")
+  :map           Alist of (LOOKUP-VALUE . ADD-VALUE) string pairs, or
+                 hash-table with the same shape
+  :syntax        Symbol — currently only `ts' (default)
+  :on-existing   Symbol — `error' (default) | `skip' | `overwrite'
+                 Action when ADD-KEY is already present in the block
+  :on-missing    Symbol — `skip' (default) | `error'
+                 Action when LOOKUP-VALUE is not in MAP
+  :scope-regex   String — only edit substrings matching this regexp
+                 (each match becomes one independent region; nil = whole file)
+  :apply         Boolean — when nil (default), preview only; when t, write disk
+
+Returns plist:
+  :added N            new ADD-KEY insertions made (or would-be in dry-run)
+  :skipped N          matches skipped (existing ADD-KEY under `skip', or
+                       lookup-value not in MAP under `skip')
+  :overwritten N      existing ADD-KEY values replaced
+  :missing ((V . COUNT) ...)  lookup-values seen in source but absent from MAP
+  :total-matches N    total LOOKUP-KEY occurrences inspected
+  :dry-run BOOL       t when :apply was nil
+  :preview ((LINE BEFORE-LINE AFTER-LINE) ...)  always populated
+  :file PATH
+  :warnings LIST
+
+Implementation notes:
+  - Only single-line `{...}' blocks are matched (the i18n shape this targets).
+  - String values must be double-quoted; `\\\\' and `\\\"' escapes are honored
+    when scanning the lookup string, but the captured value is the raw text
+    between the quotes (escapes pass through verbatim into MAP lookups).
+  - The added field is inserted immediately before the closing `}', preceded
+    by a comma if the block is non-empty after the lookup-key entry."
+  (let* ((abs (anvil--prepare-path path))
+         (warnings (anvil-file-warn-if-diverged abs))
+         (lookup-key (or (plist-get spec :lookup-key)
+                         (error "anvil-code: :lookup-key is required")))
+         (add-key (or (plist-get spec :add-key)
+                      (error "anvil-code: :add-key is required")))
+         (map-norm (anvil-file--map-normalize
+                    (or (plist-get spec :map)
+                        (error "anvil-code: :map is required"))))
+         (syntax (or (plist-get spec :syntax) 'ts))
+         (on-existing (or (plist-get spec :on-existing) 'error))
+         (on-missing (or (plist-get spec :on-missing) 'skip))
+         (scope-regex (plist-get spec :scope-regex))
+         (apply-p (plist-get spec :apply))
+         (added 0) (skipped 0) (overwritten 0) (total 0)
+         (missing-counts (make-hash-table :test 'equal))
+         (preview nil)
+         ;; List of edits as (REGION-INDEX BLOCK-END KIND VALUE INSERT-TEXT)
+         ;; KIND ∈ 'insert | 'overwrite-value-end (we instead recompute on apply).
+         ;; We collect (POS-INSERT INSERT-STRING DELETE-RANGE) tuples for apply.
+         (edits nil))
+    (unless (eq syntax 'ts)
+      (error "anvil-code: only :syntax 'ts is supported (got %S)" syntax))
+    (unless (memq on-existing '(error skip overwrite))
+      (error "anvil-code: :on-existing must be error|skip|overwrite (got %S)"
+             on-existing))
+    (unless (memq on-missing '(skip error))
+      (error "anvil-code: :on-missing must be skip|error (got %S)" on-missing))
+    (with-temp-buffer
+      (anvil--insert-file abs)
+      (let* ((lookup-pat
+              (concat "\\b" (regexp-quote lookup-key)
+                      "[ \t]*:[ \t]*\""))
+             (add-key-pat
+              (concat "\\b" (regexp-quote add-key) "[ \t]*:")))
+        (dolist (region (anvil-file--collect-scope-regions scope-regex))
+          (save-excursion
+            (goto-char (car region))
+            (while (re-search-forward lookup-pat (cdr region) t)
+              (let* ((quote-open (1- (match-end 0)))
+                     (value-end (anvil-file--ts-string-end quote-open)))
+                (when value-end
+                  (let* ((value (buffer-substring-no-properties
+                                 (1+ quote-open) (1- value-end)))
+                         (block (anvil-file--ts-block-bounds quote-open)))
+                    (when block
+                      (cl-incf total)
+                      (let* ((brace-start (car block))
+                             (brace-end (cdr block))
+                             (block-text (buffer-substring-no-properties
+                                          brace-start brace-end))
+                             (mapping (assoc value map-norm)))
+                        (cond
+                         ((null mapping)
+                          (puthash value
+                                   (1+ (gethash value missing-counts 0))
+                                   missing-counts)
+                          (pcase on-missing
+                            ('skip (cl-incf skipped))
+                            ('error
+                             (error "anvil-code: lookup-value not in map: %S \
+(file %s, line %d)"
+                                    value abs
+                                    (line-number-at-pos quote-open)))))
+                         (t
+                          (let* ((mapped (cdr mapping))
+                                 (line (line-number-at-pos quote-open))
+                                 (before-line
+                                  (buffer-substring-no-properties
+                                   (line-beginning-position)
+                                   (line-end-position))))
+                            (cond
+                             ;; ADD-KEY already present in this block.
+                             ((string-match-p add-key-pat block-text)
+                              (pcase on-existing
+                                ('skip (cl-incf skipped))
+                                ('error
+                                 (error "anvil-code: %s already present \
+in block (file %s, line %d) — pass :on-existing 'skip or 'overwrite"
+                                        add-key abs line))
+                                ('overwrite
+                                 (let* ((existing-pat
+                                         (concat "\\b"
+                                                 (regexp-quote add-key)
+                                                 "[ \t]*:[ \t]*\""))
+                                        (find-pos
+                                         (save-excursion
+                                           (goto-char brace-start)
+                                           (when (re-search-forward
+                                                  existing-pat brace-end t)
+                                             (point)))))
+                                   (when find-pos
+                                     (let* ((existing-end
+                                             (anvil-file--ts-string-end
+                                              (1- find-pos))))
+                                       (when existing-end
+                                         (let* ((after-line
+                                                 (concat
+                                                  (substring before-line 0
+                                                             (- find-pos
+                                                                (line-beginning-position)))
+                                                  (anvil--json-escape-string mapped)
+                                                  "\""
+                                                  (substring before-line
+                                                             (- existing-end
+                                                                (line-beginning-position))))))
+                                           (push (list line before-line after-line)
+                                                 preview)
+                                           (push (list 'overwrite
+                                                       find-pos
+                                                       existing-end
+                                                       (concat
+                                                        (anvil--json-escape-string mapped)
+                                                        "\""))
+                                                 edits)
+                                           (cl-incf overwritten)))))))))
+                             ;; ADD-KEY not present — insert before closing `}'.
+                             (t
+                              (let* ((inner-end
+                                      (save-excursion
+                                        (goto-char (1- brace-end))
+                                        (skip-chars-backward " \t"
+                                                             (1+ brace-start))
+                                        (point)))
+                                     (between-text
+                                      (string-trim
+                                       (buffer-substring-no-properties
+                                        (1+ brace-start) (1- brace-end))))
+                                     (sep (if (string-empty-p between-text) "" ", "))
+                                     (insert-text
+                                      (concat sep add-key ": \""
+                                              (anvil--json-escape-string mapped)
+                                              "\""))
+                                     (after-line
+                                      (concat
+                                       (substring before-line 0
+                                                  (- inner-end
+                                                     (line-beginning-position)))
+                                       insert-text
+                                       (substring before-line
+                                                  (- inner-end
+                                                     (line-beginning-position))))))
+                                (push (list line before-line after-line) preview)
+                                (push (list 'insert inner-end insert-text) edits)
+                                (cl-incf added)))))))))))
+                ;; Always advance past the lookup match to avoid re-scanning.
+                (when value-end (goto-char value-end))))))
+        ;; Apply edits if requested.  Apply in reverse position order so that
+        ;; earlier positions remain valid after later edits.
+        (when (and apply-p edits)
+          (dolist (e (sort (copy-sequence edits)
+                           (lambda (a b)
+                             (> (nth 1 a) (nth 1 b)))))
+            (pcase (car e)
+              ('insert
+               (goto-char (nth 1 e))
+               (insert (nth 2 e)))
+              ('overwrite
+               (let ((from (nth 1 e)) (to (nth 2 e)))
+                 (delete-region (1- from) to)
+                 (goto-char (1- from))
+                 (insert "\"" (nth 3 e))))))
+          (anvil--write-current-buffer-to abs))
+        (let ((missing-list nil))
+          (maphash (lambda (k v) (push (cons k v) missing-list))
+                   missing-counts)
+          (list :added added
+                :skipped skipped
+                :overwritten overwritten
+                :missing (nreverse missing-list)
+                :total-matches total
+                :dry-run (not apply-p)
+                :preview (nreverse preview)
+                :file abs
+                :warnings warnings))))))
+
 ;;;; --- batch across multiple files -----------------------------------------
 
 (defun anvil-file-batch-across (file-ops)
@@ -1549,6 +1842,55 @@ MCP Parameters:
                                       :object-type 'alist
                                       :array-type 'list)))
      (format "%S" (anvil-file-batch-across file-ops)))))
+
+(defun anvil-file--tool-code-add-field-by-map
+    (path lookup-key add-key map-json
+          &optional on-existing on-missing scope-regex apply)
+  "Add ADD-KEY to single-line `{...}' object literals in PATH by mapping LOOKUP-KEY values.
+
+For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a `{...}' block,
+look up VALUE in MAP-JSON and insert `ADD-KEY: \"MAPPED-VALUE\"' before
+the closing `}'.  Default is preview-only — pass APPLY=\"t\" to write.
+
+MAP-JSON accepts either a JSON object {\"v1\":\"t1\",\"v2\":\"t2\"} or a
+JSON array of two-element arrays [[\"v1\",\"t1\"],[\"v2\",\"t2\"]].
+
+MCP Parameters:
+  path - Absolute path to the TS/JS file to edit
+  lookup-key - Existing field name to look up (e.g. \"ja\")
+  add-key - Field name to add (e.g. \"en\")
+  map-json - JSON object or array of [lookup-value, add-value] pairs
+  on-existing - \"error\" (default), \"skip\", or \"overwrite\"
+  on-missing - \"skip\" (default) or \"error\"
+  scope-regex - Optional regexp; only edit within substrings matching it
+  apply - \"t\" to write the file; otherwise (default) preview only"
+  (anvil-server-with-error-handling
+   (let* ((parsed (json-parse-string map-json
+                                     :object-type 'alist
+                                     :array-type 'list))
+          (map (cond
+                ;; alist form (parsed JSON object)
+                ((and parsed (consp (car parsed))
+                      (or (symbolp (caar parsed)) (stringp (caar parsed))))
+                 (mapcar (lambda (kv)
+                           (let ((k (car kv)) (v (cdr kv)))
+                             (cons (if (symbolp k) (symbol-name k) k) v)))
+                         parsed))
+                ;; list-of-lists form (parsed JSON array of arrays)
+                (t parsed)))
+          (apply-p (and apply (member apply '("t" "true" "1" "yes"))))
+          (spec (append
+                 (list :lookup-key lookup-key
+                       :add-key add-key
+                       :map map)
+                 (when (and on-existing (not (string-empty-p on-existing)))
+                   (list :on-existing (intern on-existing)))
+                 (when (and on-missing (not (string-empty-p on-missing)))
+                   (list :on-missing (intern on-missing)))
+                 (when (and scope-regex (not (string-empty-p scope-regex)))
+                   (list :scope-regex scope-regex))
+                 (when apply-p (list :apply t)))))
+     (format "%S" (anvil-code-add-field-by-map path spec)))))
 
 ;;;; --- outline --------------------------------------------------------------
 
@@ -1753,6 +2095,21 @@ a format= override.  Emits (:kind :name :line) entries for Elisp
 def-forms, org headlines, or Markdown headings.  Use this to orient
 in large files before deciding what to Read."
    :read-only t
+   :server-id anvil-file--server-id)
+
+  (anvil-server-register-tool
+   #'anvil-file--tool-code-add-field-by-map
+   :id "code-add-field-by-map"
+   :description
+   "Add a field to TS/JS object literals by mapping from another field's value.
+For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a single-line `{...}'
+block at PATH, look up VALUE in MAP-JSON and insert `ADD-KEY: \"MAPPED-VALUE\"'
+before the closing `}'.  Targets bulk i18n / schema-extension workflows where
+Read+Write of whole files would dominate token cost.  Default is preview-only;
+pass apply=\"t\" to write the file.  on-existing controls behavior when
+ADD-KEY already exists (error|skip|overwrite, default error).  scope-regex
+restricts edits to substrings matching the pattern.  Returns plist with
+:added :skipped :overwritten :missing :total-matches :dry-run :preview."
    :server-id anvil-file--server-id))
 
 (defun anvil-file-disable ()
@@ -1767,7 +2124,8 @@ in large files before deciding what to Read."
   (anvil-server-unregister-tool "file-batch" anvil-file--server-id)
   (anvil-server-unregister-tool "json-object-add" anvil-file--server-id)
   (anvil-server-unregister-tool "file-ensure-import" anvil-file--server-id)
-  (anvil-server-unregister-tool "file-batch-across" anvil-file--server-id))
+  (anvil-server-unregister-tool "file-batch-across" anvil-file--server-id)
+  (anvil-server-unregister-tool "code-add-field-by-map" anvil-file--server-id))
 
 (provide 'anvil-helpers)
 (provide 'anvil-file)

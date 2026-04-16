@@ -1,0 +1,322 @@
+#+title: Code Transformation Tools — Pattern Extract & Field-Map Edit
+#+date: 2026-04-16
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+
+- Tool 1 (~code-extract-pattern~): ~DRAFT~ — 未着手
+- Tool 2 (~ts-add-field-by-map~ → ~code-add-field-by-map~): ~SHIPPED~ (2026-04-16)
+  - 実装: ~anvil-file.el~ の ~anvil-code-add-field-by-map~ + MCP tool
+    ~code-add-field-by-map~。テスト: ~tests/anvil-file-test.el~ の
+    ~anvil-code-test-*~ (12 件 pass)。
+  - MVP 修正点 (検討時のレビュー反映):
+    - 命名は ~code-add-field-by-map~ に変更 (~:syntax 'ts~ 既定で言語非依存に)
+    - ~:apply~ 既定 nil = preview-only (dry-run mandatory)
+    - ~:on-existing~ 既定 ~'error~ (fail-loud)
+    - ~:scope-regex~ MVP から実装
+
+本 doc は 2026-04-16 の newDTW 開発セッション (item registry 構築 + i18n 翻訳) で
+「あったらトークンを大幅削減できた」と特定された 2 ツールの仕様提案。
+
+* Goal
+
+以下 2 ツールを anvil に追加し、AI client (Claude Code 等) が
+「大きいファイルから構造データを抽出する」「TS/JS の object literal にフィールドを
+一括追加する」作業を、ファイル全体を Read/Write せずに完結させる。
+
+1. ~code-extract-pattern~ — テキストファイルからパターンマッチで構造化データ抽出
+2. ~ts-add-field-by-map~  — TS/JS object literal の特定フィールドにマッピング JSON で値追加
+
+* Problem
+
+** 発端となった作業 (2026-04-16 newDTW セッション)
+
+newDTW.github.io (HSP からの TypeScript 移植 JoJo ファンゲーム) で:
+
+1. ~src/renderer/func/func492.ts~ (3407 行) に 347 個の if-block でアイテム定義が散在:
+   #+begin_src typescript
+   if (Gvar.belongings_item_list == 100) {
+       Gvar.buying_price = 17000;
+       Gvar.item_name = "ｽﾀｰ･ﾌﾟﾗﾁﾅのDISC";
+       Gvar.item_description1 = "攻撃:8  防御:4";
+       Gvar.effects_message = "[発動]射撃攻撃を防げるようになるぞ";
+       // ... 8 fields
+   }
+   #+end_src
+2. これを ~items/data/*.ts~ の category 別 registry に再構成し、
+   ~LocalizedStrings { ja, en }~ で多言語化する作業。
+3. 抽出 → 8 ファイルに分配 → 各エントリに ~en:~ 追加、を行った。
+
+** 実際に行った操作とコスト
+
+| 工程 | 手段 | コスト |
+|------+------+--------|
+| func492.ts のパターン抽出 | ~tools/extract-items.mjs~ を作成 + ~node~ 実行 | スクリプト ~50 行 + 2 round trip |
+| カテゴリ別 TS 生成 | ~tools/gen-item-data.mjs~ を作成 + ~node~ 実行 | スクリプト ~120 行 + 2 round trip |
+| EN 翻訳追加 | 各 data ファイルを Read → 全文に en: 追記 → Write | 8 ファイル × Read+Write = ~16,000 token |
+
+合計でメインコンテキストの 11.5% (~115k token) を消費。
+このうち data ファイルの Read+Write が支配的。
+
+** 何が問題か
+
+- *Read+Write 全文置換が高い*: 200〜400 行の TS data ファイルを Read (差分なくフル送信)
+  → 編集 (en: 追加) → Write (フル送信) で、入出力の大半が「変更しない部分」を運んでいる。
+- *Edit tool が役に立たない局面*: 「全 ~name: { ja: "..." }~ に ~en: "..."~ を追加」のような
+  パターン置換は Edit の old_string/new_string 1:1 で書くと手数が爆発し、結局 Write になる。
+- *スクリプト書き起こしが冗長*: パターン抽出のために毎回 Node スクリプトを書いて run するのは、
+  「巨大ファイルを Read しなくて済む」という目的に対して回り道。
+
+* Tool 1: ~code-extract-pattern~
+
+** 目的
+
+テキストファイルから繰り返し現れる構造的パターンをマッチさせ、
+キャプチャした各部分を JSON で返す。AI client がファイル全文を Read せずに
+構造データだけを得られる。
+
+** API (案)
+
+#+begin_src elisp
+(anvil-code-extract-pattern PATH PATTERN-SPEC)
+#+end_src
+
+引数:
+- ~PATH~ : 対象ファイルの絶対パス
+- ~PATTERN-SPEC~ : plist
+  - ~:block-start~ regexp — マッチ箇所の開始行 (キャプチャ可)
+  - ~:block-end~   regexp — 終了行 (省略時は次の ~:block-start~ 直前まで)
+  - ~:fields~      list of plist — block 内から抽出する field 定義
+    - 各 plist: ~(:name "id" :regexp "Gvar\\.item_name *= *\"\\(.*\\)\"")~
+  - ~:max-blocks~  number (optional) — 上限 (default: なし)
+
+戻り値:
+#+begin_src json
+{
+  "matches": [
+    { "id_capture": "100", "fields": { "name": "ｽﾀｰ･ﾌﾟﾗﾁﾅのDISC", "price": "17000" },
+      "start_line": 60, "end_line": 71 },
+    ...
+  ],
+  "total": 347,
+  "skipped": []  // パターン部分一致で field 不揃いだったもの
+}
+#+end_src
+
+** 使用例 (newDTW のケース)
+
+#+begin_src elisp
+(anvil-code-extract-pattern
+ "src/renderer/func/func492.ts"
+ '(:block-start "if *( *Gvar\\.belongings_item_list *== *\\([0-9]+\\) *)"
+   :block-end   "^ *}"
+   :fields ((:name "name"  :regexp "Gvar\\.item_name *= *\"\\(.*\\)\"")
+            (:name "price" :regexp "Gvar\\.buying_price *= *\\([0-9]+\\)")
+            (:name "desc"  :regexp "Gvar\\.item_description1 *= *\"\\(.*\\)\"")
+            ...)))
+#+end_src
+
+これで func492.ts 全体を Read せずに 347 item 分の構造データが取れる。
+
+** 削減効果見積
+
+- 従来: 3407 行 ~ 8000 token を Read + 50 行のスクリプト作成 + 実行
+- 新ツール: 1 MCP call + JSON return (~3000-5000 token)
+- *純削減: 3000-5000 token / 1 ファイル*
+
+繰り返し抽出が必要な作業 (legacy code 移行、i18n 棚卸し、データ移行) で効果増幅。
+
+** 実装方針
+
+- 既存の ~anvil-text~ または新規 ~anvil-codegrep.el~ に追加。
+- elisp の ~re-search-forward~ + ~match-string~ ベースで実装可能。
+- AST パースは行わない (regexp ベースで十分シンプルな用途)。
+- block の中で ~{}~ ネストを正しく数える option (~:track-braces t~) を後付け可能。
+
+** 検討事項 (次セッション Claude へ)
+
+- [ ] block-end を省略した時の挙動: 次の block-start 直前か、~}~ 単独行か、ネストカウントか。
+- [ ] field 抽出失敗 (regexp が match しない) を skip するか error にするか option 化要。
+- [ ] multiline pattern を扱うか? (例: ~"text\n  cont"~ を 1 field に取る)
+- [ ] 出力 JSON の key 命名規則 (snake_case vs camelCase)。
+
+* Tool 2: ~ts-add-field-by-map~
+
+** 目的
+
+TS/JS ファイル内の object literal から、特定フィールド (key) の値を「マッピング辞書」
+で引いて、別フィールド (key) を一括追加する。i18n 翻訳追加の主作業を
+「マッピング JSON を送るだけ」に短縮する。
+
+** API (案)
+
+#+begin_src elisp
+(anvil-ts-add-field-by-map PATH SPEC)
+#+end_src
+
+引数:
+- ~PATH~ : 対象 TS/JS ファイル
+- ~SPEC~ : plist
+  - ~:lookup-key~  string  — 既存 field 名 (例: "ja")
+  - ~:add-key~     string  — 追加する field 名 (例: "en")
+  - ~:map~         alist   — lookup-key の値 → add-key の値
+  - ~:on-missing~  symbol  — マップ不在時: 'skip / 'error / 'leave-empty (default: 'skip)
+  - ~:dry-run~     boolean — 書き換えずに変更プレビューを返す
+
+戻り値:
+#+begin_src json
+{
+  "updated": 26,
+  "skipped": 0,
+  "missing_keys": [],
+  "preview": [...]  // dry-run 時のみ
+}
+#+end_src
+
+** 使用例
+
+food.ts を i18n 化する場合:
+
+#+begin_src elisp
+(anvil-ts-add-field-by-map
+ "src/renderer/items/data/food.ts"
+ '(:lookup-key "ja"
+   :add-key    "en"
+   :map (("ﾋﾟｯﾂｧ"             . "Pizza")
+         ("ﾈｱﾎﾟﾘｽのﾋﾟｯﾂｧ"      . "Naples Pizza")
+         ("くさったﾋﾟｯﾂｧ"      . "Rotten Pizza")
+         ;; ... 翻訳 26 件
+         )))
+#+end_src
+
+before:
+#+begin_src typescript
+name: { ja: "ﾋﾟｯﾂｧ" },
+#+end_src
+
+after:
+#+begin_src typescript
+name: { ja: "ﾋﾟｯﾂｧ", en: "Pizza" },
+#+end_src
+
+** 削減効果見積
+
+- 従来 (food.ts, 217 行): Read ~600 token + Write ~1200 token = ~1800 token
+- 新ツール: マッピング JSON のみ ~400 token (約 78% 削減)
+- 8 data ファイル合計で *~10,000 token 節約*
+
+i18n 翻訳ワークフロー全般で効く。1 セッションで 8 ファイル × 25-100 entry を翻訳した今回、
+非常に大きい。
+
+** 実装方針
+
+- ~anvil-file.el~ に既にある ~anvil-json-object-add~ と兄弟関係。
+- TS/JS の object literal 検出は regexp ベースで十分:
+  - ~\\([a-zA-Z_$][a-zA-Z0-9_$]*\\) *: *{\\([^}]*\\)}~ で field-block を取り、
+    内部で ~lookup-key: "value"~ を見つけ、~add-key:~ が無ければ追記。
+- 既に ~add-key~ がある場合の挙動を option 化:
+  - ~:on-existing 'skip~ (default), ~'overwrite~, ~'error~
+- ネスト object には対応しない (TS の i18n パターンは flat な ~{ja, en}~ が大半)。
+  ネストする場合は ~:scope-regexp~ で対象範囲を絞る option を別途。
+
+** 検討事項
+
+- [ ] regexp ベースで十分か、ts-morph 等の AST 必要か (Emacs 単体で完結したい)。
+- [ ] マッピングサイズ上限: 1000 件超を 1 call で送るのは MCP プロトコル的に妥当か。
+- [ ] 同名 lookup-key が複数 object に出現する場合、全部に同じ値を入れるべきか位置別か。
+  (今回の i18n では「同じ ja text には同じ en text」で問題ないので全部更新で OK)
+- [ ] 既存 ~anvil-json-object-add~ との API 統一性: 命名規則 (~:on-duplicate~ vs ~:on-existing~) を揃えたい。
+
+* 不採用案
+
+** ~file-scaffold~ (codegen テンプレート展開)
+
+検討したが除外:
+- 今回は ~tools/gen-item-data.mjs~ で plain JS スクリプトで十分役目を果たせた。
+- MCP tool 化のメリットが薄く、汎用テンプレート言語 (mustache 等) を採用すると依存と
+  学習コストが増える。
+- AI client が直接 Write ループで複数ファイル作る方が柔軟性高い。
+
+** 個人特化ツール
+
+例: ~jojo-stand-translate~ (スタンド名の ja→en 辞書) や ~func492-block-edit~。
+これらは newDTW 専用なので anvil ではなく ~newDTW.github.io/tools/~ 内のローカル
+スクリプトに留める。
+
+* 優先順位
+
+| Tool | 効果 | 実装コスト | 優先度 |
+|------+------+------------+--------|
+| ~code-extract-pattern~ | 高 (any-language, 大ファイル parse 不要化) | 中 (regexp + block 検出) | ★★★ |
+| ~ts-add-field-by-map~  | 高 (i18n / 構造的 refactor 全般) | 低 (~json-object-add~ の TS 版) | ★★★ |
+
+両方とも ~newDTW~ 以外でも有効 (前者: legacy migration 全般、後者: i18n / schema 拡張 全般)。
+
+* Implementation Hints
+
+** anvil-server registration
+
+両ツールとも ~anvil-server-register-tool~ で MCP server に登録。
+docstring に ~MCP Parameters:~ セクション必須 (memory: ~feedback_my_cc_helpers_proposal.md~ 参照)。
+
+** 配置案
+
+| Tool | ファイル | 既存類似機能 |
+|------+----------+--------------|
+| ~code-extract-pattern~ | 新規 ~anvil-codegrep.el~ | なし |
+| ~ts-add-field-by-map~  | ~anvil-file.el~ に追加 | ~anvil-json-object-add~ |
+
+** Test
+
+両方とも ~tests/~ 配下に ERT test を書く:
+- ~tests/anvil-codegrep-test.el~ — sample TS / JS / elisp file からの抽出
+- ~tests/anvil-file-test.el~ に ~anvil-ts-add-field-by-map~ ケースを追加
+
+** 既存ツールとの境界
+
+- ~code-extract-pattern~ vs ~grep~ — grep は line 単位、本ツールは block + multi-field。
+- ~ts-add-field-by-map~ vs ~file-replace-string/regexp~ — 後者は 1 patternsubstitution、
+  本ツールは map で N 件を 1 call にまとめる + object literal 構造を保つ。
+- ~ts-add-field-by-map~ vs ~json-object-add~ — JSON 専用 vs TS object literal 専用。
+  両方残す価値あり (JSON は厳密、TS は型情報や trailing comma あり)。
+
+* Open Questions for Next Session
+
+レビュー時に明確化したい論点:
+
+1. *AST vs regexp*: ~ts-add-field-by-map~ は regexp で十分か。tsx (JSX 入り) や TypeScript の
+   advanced syntax で誤マッチしないか。pre-MVP で sample プロジェクト数本に走らせて検証要。
+
+2. *Cross-language化*: ~code-extract-pattern~ を JS/TS/elisp/Python/Go で広く使えるようにすると
+   pattern syntax 設計が問題。最初は line-based regexp で十分か、tree-sitter integration するか。
+
+3. *Idempotency*: ~ts-add-field-by-map~ を同じ map で 2 回呼んだら no-op か。
+   既存値があった場合の挙動 (~:on-existing~) のデフォルトは何が安全か。
+
+4. *Map サイズ上限*: 1000 件以上の翻訳マップを 1 call で送るのが MCP plumbing 的に問題ないか。
+   (Claude Code の SSE / stdio bridge で大きい argument が壊れた事例があれば事前確認)。
+
+5. *Output format 統一*: 既存 anvil tool は plist 戻り値が多いが、本ツールは JSON 想定。
+   JSON 統一に揃えるか plist のままにするか。
+
+* References
+
+- 発端セッション: 2026-04-16 newDTW item registry 構築 (Notes/dev/newDTW.github.io)
+- 関連実装: ~anvil-file.el~ の ~anvil-json-object-add~ (構造的 add の先例)
+- 関連 memory:
+  - ~feedback_my_cc_helpers_proposal.md~ — 「同じ pattern 2 回以上 / 3+ call で MCP 化提案」ルール
+  - ~feedback_my_cc_helpers_utf8_journals.md~ — file 操作の coding-system 罠 (本ツールでも要対処)
+
+* Appendix: 今回セッションでの実コスト
+
+メイン context 消費 (発端〜検討まで):
+- 開始時 14% → 検討開始時 17% → 設計 doc 作成時点 +α
+- 内訳の支配項: ~items/data/*.ts~ の Read + Write × 8 ファイル
+
+仮に 2 ツールが存在していた場合の試算:
+- ~code-extract-pattern~ で func492 解析: -5000 token
+- ~ts-add-field-by-map~ で 8 data files i18n: -10000 token
+- *合計 -15000 token (~約 1.5 % of 1M context, 単一作業として大)*
+
+これが「次の同種セッション」毎に効いてくる。
