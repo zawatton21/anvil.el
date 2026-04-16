@@ -4,11 +4,85 @@
 *Languages:* English / [[file:README.ja.org][日本語]]
 
 #+begin_quote
-Your AI's workbench. Turn Emacs into a tool server for any LLM agent.
+Your AI's workbench. Turn Emacs into a tool server for any LLM
+agent — and let the agent extend its own toolset, mid-session, in
+elisp.
 #+end_quote
 
 #+html: <a href="https://github.com/zawatton/anvil.el/actions"><img src="https://img.shields.io/github/actions/workflow/status/zawatton/anvil.el/ci.yml?branch=master&style=flat-square" alt="CI"></a>
 #+html: <a href="https://github.com/sponsors/zawatton"><img src="https://img.shields.io/badge/Sponsor_%E2%9D%A4_Support_this_project-pink?style=for-the-badge" alt="Sponsor"></a>
+
+* The idea
+
+#+begin_example
+       ┌──────────────────────────┐
+       │  Claude Code  (or any    │
+       │  MCP-speaking agent)     │
+       └────────────┬─────────────┘
+                    │ MCP protocol
+       ┌────────────▼─────────────┐
+       │        anvil.el          │
+       │  ┌──────┬──────┬──────┐  │
+       │  │ file │ org  │ proc │  │
+       │  └──────┴──────┴──────┘  │
+       └────────────┬─────────────┘
+                    │
+       ┌────────────▼─────────────┐
+       │   Running Emacs image    │
+       │   (buffers, org files,   │
+       │    init.el, your config) │
+       └──────────────────────────┘
+#+end_example
+
+Until now, humans used text editors with AI assistance.
+With anvil, /the AI uses the text editor./
+
+Every modern editor (VSCode, Cursor, Zed, JetBrains) is configured by
+code the vendor decided to expose. AI extensions live inside whatever
+extension API the vendor shipped. Emacs is different in a way that has
+always been a niche Lisp-y boast, and is now — suddenly — the most
+important property in the space:
+
+#+begin_quote
+*Emacs is built out of elisp, at runtime.*
+#+end_quote
+
+Which means an AI that can write elisp doesn't just /use/ Emacs. It can
+rewrite Emacs, while Emacs is running, to fit the task in front of it:
+
+- Define new commands for itself mid-session
+- Advise existing functions to change their behavior
+- Build new MCP tools for itself when the existing ones don't fit
+- Persist those tools into your init so the next session keeps them
+- Reshape the editor around the workflow, not the other way around
+
+A VSCode extension calls APIs Microsoft decided to expose. An
+anvil-equipped Emacs lets the agent extend its own toolset, inside the
+editor, while you watch.
+
+* Why I built it
+
+I run a one-person electrical engineering firm in Japan — industrial
+maintenance — and Windows is my daily driver. I've been a longtime
+Emacs user. Over the past several months I've been collaborating with
+Claude on real day-job work: inspection reports, bookkeeping
+automation, a 22-file org-mode legal database. The workflow evolved
+from Claude Desktop to Claude Code in the terminal, and finally
+directly inside Emacs itself. Anvil is what fell out of that third
+phase.
+
+One frustration kept coming back:
+
+#+begin_quote
+The AI's stock tools were built for /code in folders/.
+My day-to-day is /org buffers in a Lisp image./
+#+end_quote
+
+Generic =edit_file= / =read_file= / =run_shell= are fine for
+greenfield code, but they're terrible at surgical edits inside a
+13,000-line org journal, at org-mode-aware operations, and at routing
+heavy work through the long-lived Emacs process I've already set up.
+Anvil closes that gap.
 
 * What is Anvil?
 
@@ -520,6 +594,67 @@ MCP servers are connected. The savings table at the top of this
 README assumes the agent actually *picks* the Anvil tool — and
 that decision is driven by your instructions file, not by Anvil
 itself.
+
+* FAQ — how does this compare to…?
+
+** …claude-code-ide?
+
+They solve different problems and coexist well. =claude-code-ide=
+brings Claude Code's interactive UI /into/ Emacs via eat; its MCP
+surface is primarily IDE-oriented (xref / diagnostics / buffer
+metadata). For file edits it leans on Claude Code's built-in Read /
+Edit / Write against the filesystem.
+
+Anvil goes the opposite direction: it's a standalone MCP server
+exposing /Emacs itself/ — file ops, org primitives, worker dispatch,
+elisp introspection — to any MCP client. In practice I run both:
+claude-code-ide for the inline Claude session inside Emacs, and anvil
+as a separate MCP server that both claude-code-ide /and/ the
+standalone ~claude~ CLI can call into.
+
+** …an "arbitrary elisp eval" MCP?
+
+Single-eval MCPs (e.g. [[https://github.com/steveyegge/efrit][efrit]]) are philosophically pure: zero
+client-side intelligence, the agent writes elisp for every task. The
+trade-off is /permission granularity/ — a single eval tool can't be
+marked =:read-only=, so you can't auto-approve reads while gating
+writes.
+
+Anvil exposes ~50 named primitives, each registered with an explicit
+=:read-only= hint where applicable. In Claude Code that maps cleanly
+onto =/permissions=: auto-approve ~org-read-outline~, ~file-read~,
+~elisp-describe-function~; force a prompt on ~file-batch~,
+~org-edit-body~, ~file-replace-string~. Anvil still ships
+~emacs-eval~ and ~emacs-eval-async~ as escape hatches — they just
+aren't the 80% path.
+
+** …calling =emacsclient= from bash?
+
+That was my starting point too. Reasons I moved off it:
+
+- *No permission granularity.* Every =emacsclient -e '...'= is opaque
+  to =/permissions= — it's all "Bash". With MCP each named tool
+  registers a =:read-only= hint so the client can auto-approve reads
+  and prompt on writes.
+- *No schema.* The agent has to remember the elisp surface from
+  prompt; MCP publishes the tool list in the system schema so the
+  right tool gets picked without being reminded each turn.
+- *Escape hell.* Multi-line elisp through bash quoting is famously
+  fragile, especially with Japanese paths or regex.
+- *Structured returns.* MCP tools return typed JSON; =emacsclient=
+  returns a printed sexp you have to parse.
+
+Same Emacs underneath; the MCP layer is just a typed, permissioned
+facade.
+
+** …org-mcp?
+
+[[https://github.com/laurynas-biveinis/org-mcp][Org-mcp]] focuses tightly on org editing primitives over MCP. Anvil
+bundles those primitives (with extensions and bug fixes) and adds the
+file / subprocess / heavy-op / worker-pool layers, so a single MCP
+server covers an entire workflow rather than just org. If you're
+already happy with org-mcp on its own, anvil isn't a replacement —
+it's the same idea wearing a bigger coat.
 
 * Architecture
 
