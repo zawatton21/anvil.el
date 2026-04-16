@@ -42,6 +42,7 @@
 
 (require 'cl-lib)
 (require 'server)
+(require 'anvil-server)  ; for tool registration + anvil-server-with-error-handling
 
 ;;; Customization
 
@@ -1018,6 +1019,84 @@ comparison visible in `anvil-worker-latency-metrics-show'."
 
 ;;; Module enable/disable
 
+;;; MCP tools (probe / reset-pool)
+
+(defvar anvil-worker--server-id "emacs-eval"
+  "MCP server ID for `anvil-worker' tool registration.")
+
+(defun anvil-worker--tool-probe (_args)
+  "Return a per-lane status report: workers, PIDs, metrics summary.
+
+Uses the non-blocking `quick-alive-p' check so the response is
+cheap enough to poll at interactive rates.
+
+MCP Parameters:
+  (none)"
+  (anvil-server-with-error-handling
+    (unless anvil-worker--pool
+      (anvil-worker--init-pool))
+    (let (lines)
+      (push (format "pool: read=%d write=%d batch=%d"
+                    anvil-worker-read-pool-size
+                    anvil-worker-write-pool-size
+                    anvil-worker-batch-pool-size)
+            lines)
+      (dolist (lane anvil-worker--lanes)
+        (let ((vec (anvil-worker--lane-pool lane)))
+          (when (and vec (> (length vec) 0))
+            (push (format "  [%s]" (anvil-worker--lane-name lane)) lines)
+            (dotimes (i (length vec))
+              (let* ((w      (aref vec i))
+                     (alive  (anvil-worker--quick-alive-p w))
+                     (busy   (plist-get w :busy))
+                     (sfile  (plist-get w :server-file))
+                     (pid    (and alive
+                                  (anvil-worker--server-file-pid sfile))))
+                (push (format "    %s: %s%s%s"
+                              (plist-get w :name)
+                              (if alive "alive" "dead")
+                              (if pid (format " pid=%d" pid) "")
+                              (if busy " [busy]" ""))
+                      lines))))))
+      (push "" lines)
+      (push (format "classify: %S"
+                    (or anvil-worker--metrics-classify
+                        '(:no-samples-yet)))
+            lines)
+      (let ((latency-summary
+             (if (null anvil-worker--metrics-latency)
+                 "no samples"
+               (mapconcat
+                (lambda (lane)
+                  (let* ((b (plist-get anvil-worker--metrics-latency lane))
+                         (n (or (plist-get b :samples) 0)))
+                    (if (zerop n)
+                        (format "%s=0" (anvil-worker--lane-name lane))
+                      (format "%s n=%d mean=%.0fms"
+                              (anvil-worker--lane-name lane)
+                              n
+                              (/ (plist-get b :total-ms-sum) n)))))
+                anvil-worker--lanes " | "))))
+        (push (format "latency:  %s" latency-summary) lines))
+      (mapconcat #'identity (nreverse lines) "\n"))))
+
+(defun anvil-worker--tool-reset-pool (_args)
+  "Kill all workers, then respawn fresh daemons.  Recovers from stuck pool.
+
+Does NOT drop metrics (classify / latency) — use the UI
+`r' key or `anvil-worker-latency-metrics-reset' for that.
+
+MCP Parameters:
+  (none)"
+  (anvil-server-with-error-handling
+    (anvil-worker-kill)
+    (anvil-worker-spawn)
+    (format
+     "anvil-worker: killed + respawning (read=%d write=%d batch=%d, staggered)"
+     anvil-worker-read-pool-size
+     anvil-worker-write-pool-size
+     anvil-worker-batch-pool-size)))
+
 (defun anvil-worker-enable ()
   "Initialise every lane, defer spawn, start health monitoring.
 The actual `start-process' calls are deferred to a 1-second timer
@@ -1027,13 +1106,28 @@ the human never sees the editor freeze."
   ;; Load the Phase 5 metrics UI so `M-x anvil-worker-metrics' is
   ;; discoverable without a separate `(require 'anvil-worker-ui)'.
   (require 'anvil-worker-ui)
+  ;; Register MCP tools so Claude can probe / reset the pool.
+  (anvil-server-register-tool
+   #'anvil-worker--tool-probe
+   :id "anvil-worker-probe"
+   :description "Per-lane worker status: name, alive/busy, PID, metrics summary"
+   :read-only t
+   :server-id anvil-worker--server-id)
+  (anvil-server-register-tool
+   #'anvil-worker--tool-reset-pool
+   :id "anvil-worker-reset-pool"
+   :description "Kill all workers and respawn fresh daemons (recovers stuck pool)"
+   :server-id anvil-worker--server-id)
   ;; Defer the heavy work (start-process × N) so it does not block
   ;; the synchronous module-load phase of `anvil-enable'.
   (run-at-time 1 nil #'anvil-worker-spawn)
   (anvil-worker-health-timer-start))
 
 (defun anvil-worker-disable ()
-  "Stop health monitoring (does not kill running workers)."
+  "Unregister MCP tools and stop health monitoring (does not kill workers)."
+  (anvil-server-unregister-tool "anvil-worker-probe" anvil-worker--server-id)
+  (anvil-server-unregister-tool "anvil-worker-reset-pool"
+                                anvil-worker--server-id)
   (anvil-worker-health-timer-stop))
 
 (provide 'anvil-worker)

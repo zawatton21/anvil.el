@@ -552,4 +552,51 @@ deadlock on Windows (2026-04-16) that could not be broken with
               (anvil-worker-call "(emacs-pid)" :kind :read :timeout 1))
             (should (equal '(client server) dispatched))))))))
 
+;;;; --- MCP probe / reset-pool tools --------------------------------------
+
+(ert-deftest anvil-worker-test-tool-probe-reports-per-lane ()
+  "`anvil-worker--tool-probe' returns a string with lane headers and metrics."
+  (anvil-worker-test--with-pool
+      '(:read 2 :write 1 :batch 1)
+      '("anvil-worker-read-1" "anvil-worker-write-1")
+    (cl-letf (((symbol-function 'anvil-worker--quick-alive-p)
+               (lambda (w)
+                 (member (plist-get w :name)
+                         anvil-worker--alive-set)))
+              ((symbol-function 'anvil-worker--server-file-pid)
+               (lambda (_) 99999))
+              ;; isolate metrics state
+              (anvil-worker--metrics-classify '(:read 3 :write 1))
+              (anvil-worker--metrics-latency nil))
+      (let ((report (anvil-worker--tool-probe nil)))
+        (should (stringp report))
+        (should (string-match-p "pool: read=2 write=1 batch=1" report))
+        (should (string-match-p "\\[read\\]" report))
+        (should (string-match-p "\\[write\\]" report))
+        (should (string-match-p "\\[batch\\]" report))
+        ;; alive workers get pid= suffix
+        (should (string-match-p
+                 "anvil-worker-read-1: alive pid=99999"
+                 report))
+        ;; dead workers do NOT get pid=
+        (should (string-match-p
+                 "anvil-worker-read-2: dead\\($\\|\n\\)"
+                 report))
+        (should (string-match-p "classify:" report))
+        (should (string-match-p "latency:" report))))))
+
+(ert-deftest anvil-worker-test-tool-reset-pool-calls-kill-and-spawn ()
+  "`--tool-reset-pool' triggers both `anvil-worker-kill' and `-spawn'."
+  (let ((calls '()))
+    (cl-letf (((symbol-function 'anvil-worker-kill)
+               (lambda () (push 'kill calls)))
+              ((symbol-function 'anvil-worker-spawn)
+               (lambda () (push 'spawn calls))))
+      (let ((ret (anvil-worker--tool-reset-pool nil)))
+        (should (stringp ret))
+        (should (string-match-p "killed \\+ respawning" ret))
+        ;; kill before spawn — order matters so the new daemons don't
+        ;; collide with the old server files before they're cleaned up
+        (should (equal '(kill spawn) (nreverse calls)))))))
+
 ;;; anvil-worker-test.el ends here
