@@ -64,12 +64,33 @@ serialise writes; future phases may shard by file path."
   :type 'integer
   :group 'anvil-worker)
 
-(defcustom anvil-worker-batch-pool-size 0
+(defcustom anvil-worker-batch-pool-size 1
   "Number of batch-lane worker daemons (pre-warmed `emacs --batch' style).
-Defaults to 0 — Phase 3 of Doc 01 will populate this lane.  The
-plumbing is in place so callers may pass `:kind :batch' today and
-the dispatcher will simply find no workers and signal an error."
+Default is 1 since Doc 01 Phase 3 — set to 0 to disable the lane
+entirely (the classifier then silently downgrades batch-flagged
+expressions to `:write')."
   :type 'integer
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-batch-warmup-expressions
+  '("(require 'org)"
+    "(require 'cl-lib)"
+    "(require 'subr-x)")
+  "S-expression strings sent to each freshly-spawned batch worker.
+Pre-loading the common libraries the first real `:batch' tool
+call is likely to need amortises the cold-start `require' time so
+the user does not pay for it on the first dispatch.
+
+Each expression runs via `emacsclient -n -e' (fire-and-forget),
+so failures only surface in the worker's own *Messages* buffer."
+  :type '(repeat string)
+  :group 'anvil-worker)
+
+(defcustom anvil-worker-batch-warmup-delay 2.0
+  "Seconds to wait after a batch daemon spawn before sending warmup.
+The fresh daemon needs a moment for its server socket to bind;
+firing `emacsclient' too soon would simply fail with `not running'."
+  :type 'number
   :group 'anvil-worker)
 
 (define-obsolete-variable-alias 'anvil-worker-pool-size
@@ -462,8 +483,35 @@ code should pass an explicit LANE."
   (let ((worker (anvil-worker--worker (or lane :read) (or index 0))))
     (and worker (anvil-worker--worker-alive-p worker))))
 
+(defun anvil-worker--send-warmup (worker)
+  "Send `anvil-worker-batch-warmup-expressions' to WORKER, fire-and-forget.
+Returns the list of expressions actually dispatched (empty when
+WORKER has not come alive yet — the caller may re-schedule)."
+  (when (anvil-worker--worker-alive-p worker)
+    (let ((server-file (plist-get worker :server-file))
+          (sent '()))
+      (dolist (expr anvil-worker-batch-warmup-expressions)
+        (call-process "emacsclient" nil 0 nil
+                      "-n" "-f" server-file "-e" expr)
+        (push expr sent))
+      (anvil-worker--log
+       'warmup
+       (format "%s sent=%d" (plist-get worker :name) (length sent)))
+      (nreverse sent))))
+
+(defun anvil-worker--maybe-schedule-warmup (worker)
+  "If WORKER lives on the `:batch' lane, schedule a deferred warmup.
+Uses `run-at-time' so the freshly spawned daemon has time to bind
+its server socket before we start firing `emacsclient' at it."
+  (when (and (eq :batch (plist-get worker :lane))
+             anvil-worker-batch-warmup-expressions)
+    (run-at-time anvil-worker-batch-warmup-delay nil
+                 #'anvil-worker--send-warmup worker)))
+
 (defun anvil-worker--spawn-worker (worker)
-  "Spawn WORKER if not already alive.  Returns the start-process or nil."
+  "Spawn WORKER if not already alive.  Returns the start-process or nil.
+Batch-lane spawns also schedule a deferred warmup so common
+libraries are loaded before the first real dispatch."
   (if (anvil-worker--worker-alive-p worker)
       (progn
         (anvil-worker--log
@@ -487,6 +535,7 @@ code should pass an explicit LANE."
                name
                (anvil-worker--lane-name (plist-get worker :lane))
                (process-id proc)))
+      (anvil-worker--maybe-schedule-warmup worker)
       proc)))
 
 (defun anvil-worker--map-pool (fn)

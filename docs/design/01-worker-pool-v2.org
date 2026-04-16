@@ -1,11 +1,12 @@
 #+title: Worker Pool v2 — Read/Write Routing, File Affinity, Batch Sub-Pool
 #+date: 2026-04-15
-#+property: status PHASE-2-SHIPPED
+#+property: status PHASE-3-SHIPPED
 
 * STATUS
-~Phase 1+2 SHIPPED 2026-04-16~ — lane split + ~:kind~ keyword + regex/intent
-classifier + ~--metrics-classify~ ヒストグラム + 29 ERT。batch warmup
-(Phase 3) / connection reuse (Phase 4) / metrics UI (Phase 5) は未着手。
+~Phase 1+2+3 SHIPPED 2026-04-16~ — lane split + ~:kind~ keyword + regex
+classifier + batch lane 既定 1 + spawn 後 deferred warmup
+(~run-at-time~ + ~emacsclient -n~ で fire-and-forget) + 37 worker ERT。
+connection reuse (Phase 4) / metrics UI (Phase 5) は未着手。
 
 * Goal
 

@@ -297,4 +297,97 @@ Disable health timer + spawning so no real subprocesses start."
       (let ((w (anvil-worker--pick-worker :auto "(file-read \"x\")")))
         (should (eq :write (plist-get w :lane)))))))
 
+;;;; --- batch warmup (Doc 01 Phase 3) --------------------------------------
+
+(ert-deftest anvil-worker-test-batch-pool-default-is-one ()
+  "Phase 3 enabled the batch lane by default (size 1)."
+  (should (= 1 (default-value 'anvil-worker-batch-pool-size))))
+
+(ert-deftest anvil-worker-test-batch-warmup-defaults-non-empty ()
+  "Default warmup expression list pre-loads at least one library."
+  (let ((defaults (default-value 'anvil-worker-batch-warmup-expressions)))
+    (should (> (length defaults) 0))
+    (should (cl-every #'stringp defaults))))
+
+(ert-deftest anvil-worker-test-send-warmup-noop-when-dead ()
+  "`--send-warmup' returns nil and emits no calls when worker is dead."
+  (let* ((worker (list :lane :batch :index 0
+                       :name "anvil-worker-batch-1"
+                       :server-file "/tmp/no-such"
+                       :busy nil :last-state nil))
+         (calls 0))
+    (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
+               (lambda (_) nil))
+              ((symbol-function 'call-process)
+               (lambda (&rest _) (cl-incf calls) 0))
+              ((symbol-function 'anvil-worker--log)
+               (lambda (&rest _) nil)))
+      (should-not (anvil-worker--send-warmup worker))
+      (should (= 0 calls)))))
+
+(ert-deftest anvil-worker-test-send-warmup-fires-each-expression ()
+  "Each warmup expression issues exactly one fire-and-forget emacsclient call."
+  (let* ((worker (list :lane :batch :index 0
+                       :name "anvil-worker-batch-1"
+                       :server-file "/tmp/sf"
+                       :busy nil :last-state nil))
+         (anvil-worker-batch-warmup-expressions
+          '("(require 'org)" "(require 'cl-lib)"))
+         (recorded '()))
+    (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
+               (lambda (_) t))
+              ((symbol-function 'call-process)
+               (lambda (&rest args) (push args recorded) 0))
+              ((symbol-function 'anvil-worker--log)
+               (lambda (&rest _) nil)))
+      (let ((sent (anvil-worker--send-warmup worker)))
+        (should (= 2 (length sent)))
+        (should (= 2 (length recorded)))
+        ;; Every dispatch goes through emacsclient -n -f SERVER-FILE -e EXPR.
+        (dolist (call recorded)
+          (should (equal "emacsclient" (nth 0 call)))
+          (should (member "-n" call))
+          (should (member "-f" call))
+          (should (member "/tmp/sf" call)))))))
+
+(ert-deftest anvil-worker-test-maybe-schedule-warmup-only-batch ()
+  "Read- and write-lane spawns must NOT trigger warmup scheduling."
+  (let (scheduled)
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest args) (push args scheduled) nil)))
+      (anvil-worker--maybe-schedule-warmup
+       (list :lane :read :name "r" :server-file "/x"))
+      (anvil-worker--maybe-schedule-warmup
+       (list :lane :write :name "w" :server-file "/x"))
+      (should (null scheduled))
+      (anvil-worker--maybe-schedule-warmup
+       (list :lane :batch :name "b" :server-file "/x"))
+      (should (= 1 (length scheduled))))))
+
+(ert-deftest anvil-worker-test-maybe-schedule-warmup-honours-empty-config ()
+  "An empty `batch-warmup-expressions' suppresses scheduling."
+  (let ((scheduled 0)
+        (anvil-worker-batch-warmup-expressions '()))
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _) (cl-incf scheduled) nil)))
+      (anvil-worker--maybe-schedule-warmup
+       (list :lane :batch :name "b" :server-file "/x"))
+      (should (= 0 scheduled)))))
+
+(ert-deftest anvil-worker-test-pick-batch-lane-with-pool ()
+  "With batch-pool-size > 0 the dispatcher routes :kind :batch correctly."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1 :batch 1)
+      '("anvil-worker-batch-1")
+    (let ((w (anvil-worker--pick-worker :batch)))
+      (should w)
+      (should (eq :batch (plist-get w :lane))))))
+
+(ert-deftest anvil-worker-test-classify-batch-routes-when-pool-set ()
+  "With batch-pool-size > 0 the classifier returns :batch for matching exprs."
+  (anvil-worker-test--with-fresh-classifier-metrics
+    (let ((anvil-worker-batch-pool-size 1))
+      (should (eq :batch
+                  (anvil-worker--classify "(byte-compile-file \"x.el\")"))))))
+
 ;;; anvil-worker-test.el ends here
