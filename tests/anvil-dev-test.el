@@ -165,4 +165,111 @@ Non-git `call-process' calls still signal exit-status 1."
                 (should (null (plist-get res :warning)))))))
       (delete-directory installed t))))
 
+;;;; --- parse-ert-summary --------------------------------------------------
+
+(ert-deftest anvil-dev-test-parse-ert-summary-unskipped ()
+  (let ((s (anvil-dev--parse-ert-summary
+            "Ran 8 tests, 8 results as expected, 0 unexpected (2026-04-17 ...)")))
+    (should (equal 8 (plist-get s :total)))
+    (should (equal 8 (plist-get s :passed)))
+    (should (equal 0 (plist-get s :failed)))
+    (should (equal 0 (plist-get s :skipped)))))
+
+(ert-deftest anvil-dev-test-parse-ert-summary-with-skipped ()
+  (let ((s (anvil-dev--parse-ert-summary
+            "Ran 12 tests, 10 results as expected, 1 unexpected, 1 skipped")))
+    (should (equal 12 (plist-get s :total)))
+    (should (equal 10 (plist-get s :passed)))
+    (should (equal 1  (plist-get s :failed)))
+    (should (equal 1  (plist-get s :skipped)))))
+
+(ert-deftest anvil-dev-test-parse-ert-summary-unmatched ()
+  (should (null (anvil-dev--parse-ert-summary "noise — no ERT line here"))))
+
+;;;; --- discover-test-files -------------------------------------------------
+
+(ert-deftest anvil-dev-test-discover-empty-dir ()
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (should (null (anvil-dev--discover-test-files d)))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-discover-finds-and-sorts ()
+  "Returns only matching files, sorted."
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "tests" d))
+          (dolist (f '("anvil-zzz-test.el" "anvil-aaa-test.el"
+                       "notes.el" "anvil-test.el" "helper-test.el"))
+            (with-temp-file (expand-file-name (format "tests/%s" f) d)
+              (insert "")))
+          (let* ((files (anvil-dev--discover-test-files d))
+                 (names (mapcar #'file-name-nondirectory files)))
+            (should (equal '("anvil-aaa-test.el" "anvil-test.el" "anvil-zzz-test.el")
+                           names))))
+      (delete-directory d t))))
+
+;;;; --- scaffold-module -----------------------------------------------------
+
+(ert-deftest anvil-dev-test-scaffold-rejects-bad-names ()
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (should-error (anvil-dev-scaffold-module "" "desc" d) :type 'user-error)
+          (should-error (anvil-dev-scaffold-module "Bad-Case" "d" d) :type 'user-error)
+          (should-error (anvil-dev-scaffold-module "has space" "d" d) :type 'user-error)
+          (should-error (anvil-dev-scaffold-module "x" "" d) :type 'user-error))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-scaffold-writes-both-files ()
+  "Happy path: both files created, feature + test-feature match the name."
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (let* ((res (anvil-dev-scaffold-module "foo" "Foo module demo" d))
+               (mod  (plist-get res :module-file))
+               (test (plist-get res :test-file)))
+          (should (file-exists-p mod))
+          (should (file-exists-p test))
+          (let ((content (with-temp-buffer
+                           (insert-file-contents mod)
+                           (buffer-string))))
+            (should (string-match-p "anvil-foo\\.el --- Foo module demo" content))
+            (should (string-match-p "(provide 'anvil-foo)" content))
+            (should (string-match-p "(defun anvil-foo-enable ()" content))
+            ;; Placeholders must all be substituted — no stray %NAME%.
+            (should-not (string-match-p "%NAME%" content))
+            (should-not (string-match-p "%DESC%" content))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-scaffold-refuses-overwrite ()
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (anvil-dev-scaffold-module "bar" "first" d)
+          (should-error (anvil-dev-scaffold-module "bar" "second" d)
+                        :type 'user-error))
+      (delete-directory d t))))
+
+;;;; --- run-one-test-file (integration, tiny) -------------------------------
+
+(ert-deftest anvil-dev-test-run-one-file-parses-counts ()
+  "End-to-end: write a trivial test file, run it, assert parsed counts."
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "tests" d))
+          (with-temp-file (expand-file-name "tests/anvil-xyz-test.el" d)
+            (insert "(require 'ert)\n"
+                    "(ert-deftest anvil-xyz-dummy-pass () (should t))\n"
+                    "(ert-deftest anvil-xyz-dummy-pass2 () (should (= 2 (+ 1 1))))\n"))
+          (let ((r (anvil-dev--run-one-test-file
+                    (expand-file-name "tests/anvil-xyz-test.el" d)
+                    d)))
+            (should (plist-get r :ok))
+            (should (equal 2 (plist-get r :total)))
+            (should (equal 2 (plist-get r :passed)))
+            (should (equal 0 (plist-get r :failed)))))
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here
