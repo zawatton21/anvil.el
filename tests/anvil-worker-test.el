@@ -490,9 +490,12 @@ Disable health timer + spawning so no real subprocesses start."
 
 ;;;; --- server-eval-at transport (Doc 01 Phase 4c) -------------------------
 
-(ert-deftest anvil-worker-test-connection-method-default-is-server-eval-at ()
-  "Phase 4c flipped the default transport to server-eval-at."
-  (should (eq 'server-eval-at
+(ert-deftest anvil-worker-test-connection-method-default-is-emacsclient ()
+  "Phase 4c shipped `server-eval-at' as an OPT-IN transport; the default
+stays on `emacsclient' because the new path reproduced a hard main-daemon
+deadlock on Windows (2026-04-16) that could not be broken with
+`with-timeout'."
+  (should (eq 'emacsclient
               (default-value 'anvil-worker-connection-method))))
 
 (ert-deftest anvil-worker-test-dispatch-server-eval-at-roundtrips-value ()

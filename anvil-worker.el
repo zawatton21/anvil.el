@@ -134,18 +134,21 @@ probing daemon indefinitely."
   :type 'integer
   :group 'anvil-worker)
 
-(defcustom anvil-worker-connection-method 'server-eval-at
+(defcustom anvil-worker-connection-method 'emacsclient
   "Transport used by `anvil-worker-call' to reach a worker daemon.
 
-  `server-eval-at' (default)  — in-process TCP via the Emacs server
-      protocol.  No external `emacsclient' is spawned per call,
-      which is the Phase 4c optimisation for Windows where the
-      spawn + binary-load overhead accounts for tens of ms.
-  `emacsclient'               — legacy external process per call
-      (Phase 1-3 behaviour).  Kept as a safety fallback; set this
-      if `server-eval-at' misbehaves on your platform."
-  :type '(choice (const :tag "In-process TCP (server-eval-at)" server-eval-at)
-                 (const :tag "External process (emacsclient)" emacsclient))
+  `emacsclient' (default)    — external process per call.  Reliable
+      but pays ~10ms spawn + emacsclient binary load every dispatch.
+  `server-eval-at'            — in-process TCP via the Emacs server
+      protocol.  Phase 4c experiment: no per-call spawn.
+      WARNING: 2026-04-16 reproduced a hard main-daemon deadlock
+      when invoked in a tight loop from within an emacsclient-
+      initiated eval — `with-timeout' did not fire and the daemon
+      had to be force-killed.  Do NOT enable without reproducing
+      the failure in a throwaway daemon first."
+  :type '(choice (const :tag "External process (emacsclient)" emacsclient)
+                 (const :tag "In-process TCP (server-eval-at) — EXPERIMENTAL"
+                        server-eval-at))
   :group 'anvil-worker)
 
 (defcustom anvil-worker-heavy-timeout 300

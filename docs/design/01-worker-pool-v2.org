@@ -1,13 +1,22 @@
 #+title: Worker Pool v2 — Read/Write Routing, File Affinity, Batch Sub-Pool
 #+date: 2026-04-15
-#+property: status PHASE-4C-SHIPPED
+#+property: status PHASE-4C-OPT-IN
 
 * STATUS
-~Phase 1+2+3+4a+4c SHIPPED 2026-04-16~ — lane split + ~:kind~ + classifier
-+ batch warmup + latency metrics + ~server-eval-at~ 既定 transport (per-
-call emacsclient spawn を排除、~emacsclient~ path は fallback として
-~anvil-worker-connection-method~ で切替可) + 52 worker ERT。
-4b (worker 側 persistent listener with keepalive) は 4c baseline 再測後に判断。
+~Phase 1+2+3+4a+4c(opt-in) SHIPPED 2026-04-16~ — lane split + ~:kind~ +
+classifier + batch warmup + latency metrics + ~server-eval-at~ transport
+(*OPT-IN*, default stays ~emacsclient~) + 52 worker ERT。
+
+*** 4c regression (2026-04-16)
+
+~server-eval-at~ を既定にしたまま probe loop (15 call, ~(list :s ... :e ...
+:p (emacs-pid))~ を返す) を emacsclient 経由で main daemon 上から叩いた
+ところ、main daemon が ~with-timeout~ の発火を受けずハードデッドロック。
+taskkill で強制再起動が必要となった。既定を ~emacsclient~ に戻し、
+~server-eval-at~ は experimental choice として残置。再挑戦は
+throwaway daemon (別 init.el、別 server-auth-dir) で再現確認した後。
+
+4b (worker 側 persistent listener with keepalive) は 4c 再測後に判断。
 metrics UI (Phase 5) は未着手。
 
 * Goal
