@@ -39,6 +39,7 @@
 (require 'subr-x)
 (require 'json)
 (require 'anvil-disk)
+(require 'anvil-server)   ; provides `anvil-server-with-error-handling' macro
 
 ;;;; --- internal -----------------------------------------------------------
 
