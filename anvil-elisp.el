@@ -984,7 +984,9 @@ in tokens than shelling out and parsing stdout."
 shelling out to `emacs --batch -f batch-byte-compile' when you
 just need a clean yes/no plus the list of diagnostics.  Errors
 and warnings are parsed out of the log buffer for you."
-   :read-only nil)
+   :read-only nil
+   :offload t
+   :offload-inherit-load-path t)
   (anvil-server-register-tool
    #'anvil-elisp--describe-function
    :id "elisp-describe-function"

@@ -279,6 +279,59 @@ The stub handler lives in tests/anvil-offload-stub.el which provides
   (let ((sym (make-symbol "anvil-test--never-defined")))
     (should-not (anvil-server--offload-auto-derive sym))))
 
+(ert-deftest anvil-test-offload-inherit-load-path-adds-daemon-entries ()
+  "`:offload-inherit-load-path t' grows the subprocess's `load-path'.
+Compare the same handler invoked with and without the flag — the
+inheriting call must report a strictly larger `load-path'."
+  (require 'anvil-offload)
+  (let (len-inherit len-plain)
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-offload-stub-load-path-size
+           :id "anvil-test-lp-inherit"
+           :description "inherit"
+           :server-id "anvil-test"
+           :offload t
+           :offload-inherit-load-path t
+           :offload-timeout 30)
+          (let* ((params '((name . "anvil-test-lp-inherit")
+                           (arguments . ((_ignored . "x")))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-lp-i" params
+                        (make-anvil-server-metrics) "anvil-test"))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0))))
+            (setq len-inherit (string-to-number text))))
+      (anvil-server-unregister-tool "anvil-test-lp-inherit" "anvil-test")
+      (ignore-errors (anvil-offload-stop-repl)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-offload-stub-load-path-size
+           :id "anvil-test-lp-plain"
+           :description "plain"
+           :server-id "anvil-test"
+           :offload t
+           :offload-timeout 30)
+          (let* ((params '((name . "anvil-test-lp-plain")
+                           (arguments . ((_ignored . "x")))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-lp-p" params
+                        (make-anvil-server-metrics) "anvil-test"))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0))))
+            (setq len-plain (string-to-number text))))
+      (anvil-server-unregister-tool "anvil-test-lp-plain" "anvil-test")
+      (ignore-errors (anvil-offload-stop-repl)))
+    (should (integerp len-inherit))
+    (should (integerp len-plain))
+    (should (> len-inherit len-plain))))
+
 (ert-deftest anvil-test-offload-timeout-surfaces-as-tool-error ()
   "A tool that exceeds `:offload-timeout' signals an MCP tool error."
   (require 'anvil-offload)

@@ -31,5 +31,14 @@ MCP Parameters:
   _ignored - unused placeholder for the single-arg MCP schema convention"
   (sleep-for 30))
 
+(defun anvil-offload-stub-load-path-size (_ignored)
+  "Return the subprocess's `load-path' length as a decimal string.
+Used to confirm that `:offload-inherit-load-path' actually inflates
+the subprocess's load-path relative to a bare REPL.
+
+MCP Parameters:
+  _ignored - unused placeholder for the single-arg MCP schema convention"
+  (format "%d" (length load-path)))
+
 (provide 'anvil-offload-stub)
 ;;; anvil-offload-stub.el ends here

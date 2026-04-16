@@ -1062,10 +1062,18 @@ Signals `anvil-server-tool-error' on timeout or remote error."
   (let* ((form `(apply #',handler ',args))
          (explicit-req (plist-get tool :offload-require))
          (explicit-lp  (plist-get tool :offload-load-path))
+         (inherit-lp   (plist-get tool :offload-inherit-load-path))
          (auto (unless (or explicit-req explicit-lp)
                  (anvil-server--offload-auto-derive handler)))
          (requires (or explicit-req (car auto)))
-         (extra-load-path (or explicit-lp (cdr auto)))
+         (base-lp (or explicit-lp (cdr auto)))
+         ;; When :offload-inherit-load-path is set, snapshot the daemon's
+         ;; `load-path' at dispatch time and hand it to the subprocess so
+         ;; handlers that `(require)' arbitrary user code — byte-compile
+         ;; being the motivating case — resolve the same way as in the
+         ;; daemon.  Pure tools should leave this off so pool slots stay
+         ;; lean.
+         (extra-load-path (if inherit-lp (append base-lp load-path) base-lp))
          (timeout (or (plist-get tool :offload-timeout)
                       anvil-server-offload-default-timeout))
          (future (anvil-offload form
@@ -1324,6 +1332,7 @@ See also:
         ;; symbol (not a lambda) because the subprocess identifies it by
         ;; name after loading the features listed in :offload-require.
         (dolist (k '(:offload :offload-require :offload-load-path
+                              :offload-inherit-load-path
                               :offload-timeout))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))

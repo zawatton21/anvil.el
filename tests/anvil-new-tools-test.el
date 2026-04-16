@@ -129,6 +129,46 @@
       (ignore-errors (delete-file tmp))
       (ignore-errors (delete-file (concat (file-name-sans-extension tmp) ".elc"))))))
 
+(ert-deftest anvil-tools-test-byte-compile-offload-e2e ()
+  "elisp-byte-compile-file goes through the offload REPL end-to-end.
+Register the real tool via `anvil-elisp-enable', call it over the
+dispatcher, and confirm the .elc appears on disk.  Load-path must
+be inherited so the target file's `(require)'s resolve."
+  (require 'anvil-elisp)
+  (require 'anvil-offload)
+  (let ((tmp (make-temp-file "anvil-bc-offload-" nil ".el")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp
+           ";;; tmp --- x -*- lexical-binding: t; -*-
+;;; Commentary: tmp
+;;; Code:
+(defun anvil-tools-tmp-offload () \"offload-path clean function.\" 7)
+(provide 'anvil-tools-tmp-offload)
+;;; tmp ends here
+")
+          (anvil-elisp-enable)
+          (let* ((params `((name . "elisp-byte-compile-file")
+                           (arguments . ((file . ,tmp)))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-bc-off" params
+                        (make-anvil-server-metrics) "emacs-eval"))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (is-error (alist-get 'isError result))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0)))
+                 (plist (anvil-new-tools-test--read-plist text)))
+            (should (eq :json-false is-error))
+            (should (eq t (plist-get plist :ok)))
+            (should (file-exists-p
+                     (concat (file-name-sans-extension tmp) ".elc")))))
+      (anvil-server-unregister-tool "elisp-byte-compile-file" "emacs-eval")
+      (ignore-errors (anvil-offload-stop-repl))
+      (ignore-errors (delete-file tmp))
+      (ignore-errors (delete-file (concat (file-name-sans-extension tmp) ".elc"))))))
+
 ;;;; --- file-outline ---------------------------------------------------------
 
 (ert-deftest anvil-tools-test-outline-elisp ()

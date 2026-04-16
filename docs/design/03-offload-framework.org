@@ -44,18 +44,16 @@
 - Phase 2c (anvil-worker との関係整理): ~DRAFT~ — daemon / pipe の
   意味論を分けるか統合するかの設計判断が必要
 - Phase 3–4: ~DRAFT~ — レビュー前。
-- Phase 5 (heavy tool retrofit, 初期ターゲット): ~SHIPPED~ (2026-04-17)
-  - ~anvil-server--offload-auto-derive~ 追加 — ~:offload t~ だけ書けば
-    handler の ~symbol-file~ から feature 名 (basename) と dir を
-    推定して ~:offload-require~ / ~:offload-load-path~ を自動補完
-  - retrofit: ~file-outline~ (大 file 構造 dump), ~code-extract-pattern~
-    (regexp block 抽出)。どちらも pure / read-only / regex scan 中心で
-    subprocess 実行の安全性が高い
-  - 拡張候補 (未 retrofit): ~elisp-byte-compile-file~ は load-path を
-    subprocess 側で組む必要があり、ユーザーの外部 .el では
-    依存解決が壊れうる → 保留
-  - tests: auto-derive helper 単体 / ~:offload t~ alone の dispatch 成功
-    (subprocess PID 確認) 2 件追加。全 242/242 green
+- Phase 5 (heavy tool retrofit): ~SHIPPED~ 2nd wave (2026-04-17)
+  - 1st wave: ~file-outline~ / ~code-extract-pattern~ retrofit + auto-derive
+    (~:offload t~ 単体で動く)
+  - 2nd wave: ~elisp-byte-compile-file~ retrofit
+    + ~:offload-inherit-load-path t~ keyword 追加 — dispatch 時に daemon の
+    ~load-path~ を snapshot して subprocess に渡す。byte-compile の
+    target file の ~(require)~ が解決可能になる。pure 寄り tool は
+    この flag を付けずに使う想定 (pool slot を汚さないため)
+  - tests: inherit-load-path がサイズ増加 / byte-compile 経由 MCP E2E 追加。
+    全 244/244 green
 
 * Goal
 
