@@ -1,0 +1,459 @@
+#+title: Browser Framework — agent-browser Wrapper & Anvil Next-Primitives Vision
+#+date: 2026-04-17
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+
+- Phase A (anvil-browser MVP): ~APPROVED~ (2026-04-17、初回レビュー完了)
+  — 実装着手可。Review Questions 4 件すべて resolved、Proposed Design
+  セクションの内容で fix
+- Phase B〜F: この doc 後半 "Next-Primitives Roadmap" で提案のみ、
+  個別 doc は当該 phase 着手時に切り出す
+
+本 doc は 2 層構造:
+
+1. *Phase A*: ~anvil-browser.el~ の具体設計 (直近着手)
+2. *Vision*: anvil.el 全体の next-primitives (~anvil-state~, ~anvil-http~,
+   ~anvil-metrics~, ~anvil-embed~, ~anvil-content~, ~anvil-validate~,
+   ~anvil-agent~) のレイヤー / 依存 / 構築順
+
+Phase A を単独で読めばすぐ実装着手できるよう、自己完結な構成にしている。
+
+* Goal
+
+LLM client (Claude Code / Claude Desktop / 他 MCP client) が Emacs 経由で
+web にアクセスする際の **トークン消費を桁違いに削減** する層を提供する。
+
+** agent-browser との連携
+
+agent-browser (Vercel Labs 製、~npm install -g agent-browser~) は
+accessibility tree + ref 方式で従来の DOM/HTML dump 比 **最大 25x** の
+トークン圧縮を実現する CLI ツール。
+
+生 Bash で叩くと以下のロスが発生する:
+
+- session 毎 cold start (Chrome 起動 ~1-2s)
+- 同 URL の再 fetch でもキャッシュなし
+- org capture 統合が手動 (Claude が都度 =write-region= を書く)
+- ref 操作の token 節約効果が session 境界で切れる
+
+anvil-browser はこれらを **MCP tool 1 call に畳み込む** wrapper として
+汎用化する。
+
+** 汎用 primitive としての位置付け
+
+anvil.el は 「第三者も使える generic な Emacs MCP server」を維持する。
+ゆえに anvil-browser は以下を満たす:
+
+- agent-browser CLI の存在前提は docstring で明示 (`executable-find`
+  失敗時に明確に skip)
+- CLI path / capture dir / cache TTL 等は全部 defcustom
+- 「電気管理業務の Web 監視」等の domain 固有 workflow は
+  ~init.org~ composition に委譲。anvil 本体は fetch / interact / capture
+  の primitive tool のみ
+
+* Problem
+
+** 生 agent-browser CLI 運用の具体コスト
+
+Claude Code から現状 bash で:
+
+#+begin_src shell
+agent-browser open https://example.com/docs/page
+agent-browser snapshot -ic
+# … claude が ref 番号を解析 …
+agent-browser click @e5
+agent-browser snapshot -ic
+agent-browser get text @e8
+#+end_src
+
+問題:
+
+- 4 回の CLI invocation → Chrome launch overhead は最初のみでも、
+  Claude 側で毎回 bash tool call round-trip が発生 (~300-500ms/call)
+- 同 session の ref 番号管理が Claude の context 依存
+- 取得したテキストを org 化する手順は Claude が毎回書き起こし
+- 同じ URL を 30 分後に再 fetch する時もフル再実行
+
+** Maxun との棲み分けが必要
+
+並行して検討した Maxun (GitHub getmaxun/maxun) は Docker self-host
+の no-code scraper。録画 robot + scheduler + REST API が強みだが:
+
+- Docker compose の setup cost
+- robot は user が GUI で作る = 「自分の用途」向け artifact
+- anvil が wrap するとしても「REST call + JSON parse」の薄い層のみ
+
+→ Maxun は init.org composition (user workflow) で anvil-http 経由に叩く
+形が自然。**anvil 本体には入れない**。
+
+** Claude in Chrome との棲み分け
+
+Cowork workspace では Claude in Chrome (MCP 拡張、MacOS/Windows Desktop
+app) が既に稼働しており、対話的ブラウジング・ログイン後画面操作を担当する。
+anvil-browser は以下で差別化:
+
+- Claude Code (CLI) から使える
+- headless が default (screenshot 要求時のみ描画)
+- 決定的な ref API、セッション境界を anvil が管理
+- org capture / metrics / cache が Emacs 生態系と整合
+
+** 3 者の棲み分け表
+
+| 用途                                         | ツール                       |
+|----------------------------------------------+------------------------------|
+| 対話的ブラウズ・ログイン後フォーム送信       | Claude in Chrome (既存)      |
+| Claude Code から programmatic fetch / 構造抽出 | **agent-browser + anvil-browser** |
+| 定期巡回 robot・認証 crawl・REST 経由他連携    | Maxun (Docker self-host)     |
+
+* Proposed Design — Phase A (anvil-browser)
+
+** Module boundary
+
+- 新規ファイル: ~anvil-browser.el~
+- 依存 (hard): ~anvil-server~ のみ。agent-browser CLI は runtime 依存
+- 依存 (soft): ~anvil-offload~ — 重い crawl を offload したい時のみ
+- 公開 MCP tool: server-id は既存の ~"emacs-eval"~ に合流 (tool 数を
+  散らさない)
+
+** 公開 MCP tool 一覧
+
+| id                   | 引数                               | 返り値           | 備考                         |
+|----------------------+------------------------------------+------------------+------------------------------|
+| ~browser-fetch~      | ~url~, ~selector?~                 | accessibility tree text | open→snapshot→subtree を 1 call |
+| ~browser-interact~   | ~url~, ~actions~ (JSON 配列)       | 最終 snapshot   | 複数 click/fill を 1 session で |
+| ~browser-capture~    | ~url~, ~title?~, ~tags?~           | 保存 path        | ~capture/web/~ 直下に org 生成 |
+| ~browser-screenshot~ | ~url~, ~region?~                   | image path       | temp file に PNG              |
+| ~browser-close~      | 引数なし (~_ignored~)              | status plist     | 長時間保持している session を close |
+
+** Protocol / 内部構造
+
+*** Session 管理
+
+agent-browser CLI は serve/daemon モードを持たない (2026-04-17 時点、
+~agent-browser-skill-raw.txt~ 確認済)。各 CLI 呼び出しで Chrome が
+cold start する。
+
+しかし ~--session-name NAME~ オプションで cookies + localStorage を
+~~/.agent-browser/sessions/NAME/~ に永続化でき、**認証状態を引き継げる**。
+これが実質 "session reuse" の代替になる。
+
+Phase A の戦略:
+
+- anvil-browser 内部で固定の session name (既定
+  ~anvil-browser-default-session~ = ~"anvil-default"~) を使う
+- user が workflow 毎に session を分けたい時は
+  ~browser-fetch~ 引数 ~session~ で上書き可能
+- Chrome cold start cost は許容 (~500ms-1s)、後続 phase で
+  agent-browser が serve mode を入れたら移行
+- 毎回 CLI 再起動するのでプロセス管理は簡素 — session 死亡検知 /
+  idle timer / prune ロジックは MVP では不要
+
+*** Cache
+
+同一 URL の snapshot を hash-table にキャッシュ:
+
+#+begin_src elisp
+(defvar anvil-browser--cache
+  (make-hash-table :test 'equal)
+  "URL → (:snapshot TEXT :fetched-at FLOAT-TIME) plist.")
+
+(defcustom anvil-browser-cache-ttl-sec 300
+  "Return cached snapshot for same URL within TTL seconds.
+0 disables caching." :type 'integer)
+#+end_src
+
+Phase A では hash-table in-memory のみ (再起動で消失)。Phase B で
+~anvil-state~ に移行して永続化する。
+
+*** capture 統合
+
+~browser-capture~ は既存の ~capture/web/web_YYYYMMDD_*.org~ pattern を
+automate:
+
+#+begin_src elisp
+(defcustom anvil-browser-capture-dir
+  (expand-file-name "capture/web" "~/Cowork/Notes")
+  "Default directory for `browser-capture' output.
+Override per-project as needed."
+  :type 'directory)
+
+(defcustom anvil-browser-capture-template
+  ";; default org template — user can override for md / json / etc.
+#+TITLE: %TITLE%
+#+DATE: %DATE%
+#+PROPERTY: TYPE web_summary
+#+PROPERTY: URL %URL%
+#+FILETAGS: %TAGS%
+
+%CONTENT%
+"
+  "Template used by `browser-capture' when generating the captured file.
+
+Either a STRING with %TITLE% %DATE% %URL% %TAGS% %CONTENT%
+placeholders (simple, covers most cases), OR a FUNCTION of one
+argument (plist of the same keys) that returns the rendered
+string (allows per-domain formatting, content-length branching,
+etc.).  Emacs-idiomatic dual-type pattern, same as
+`org-capture-templates'."
+  :type '(choice string function))
+
+(defun anvil-browser--render-capture (plist)
+  "Render `anvil-browser-capture-template' against PLIST."
+  (let ((tmpl anvil-browser-capture-template))
+    (if (functionp tmpl)
+        (funcall tmpl plist)
+      (anvil-browser--subst-template tmpl plist))))
+#+end_src
+
+** エラーハンドリング
+
+- agent-browser CLI 不在 → `user-error "agent-browser not found on PATH"`
+- Chrome crash / timeout → `anvil-server-tool-error` に正規化 (既存 pattern)
+- network error → cache から返せれば返す (graceful degradation)、なければ
+  tool-error として client 通知
+
+** Lifecycle / enable / disable
+
+#+begin_src elisp
+(defun anvil-browser-enable ()
+  "Register MCP tools.  Does NOT spawn a browser session.
+Session is lazy — first `browser-fetch' call triggers it."
+  (interactive)
+  (anvil-browser--register-tools))
+
+(defun anvil-browser-disable ()
+  "Unregister MCP tools and close any live session."
+  (interactive)
+  (anvil-browser--close-session)
+  (anvil-browser--unregister-tools))
+#+end_src
+
+* Non-goals (Phase A)
+
+Phase A で意図的に *やらない* もの。後続 phase か init.org composition で扱う:
+
+- session プール (pool-size > 1) — ほとんどの fetch は逐次で十分。
+  並列必要な crawl workflow が出てから Phase A' で追加
+- 永続 cache — Phase B で ~anvil-state~ 抽出後に移行
+- metrics / event log — Phase C で ~anvil-metrics~ 導入後に instrumentation
+- offload 経由 dispatch — Chrome 自体が external process なので main daemon
+  を長時間ブロックしない。offload は Phase A では不要
+- JavaScript eval helper — ~browser-interact~ の actions に
+  ~{eval: "..."}~ を通すだけ、専用 tool は作らない
+- cookie / profile 管理 — agent-browser CLI 側の機能に任せる
+- 「電気法令サイトを定期 scan」等の user 固有 crawl robot — init.org で
+  anvil-browser + anvil-cron を組み合わせる形
+- Maxun REST 連携 — anvil-http (Phase C1) 経由で init.org composition
+
+* Migration / Backward Compatibility
+
+- 新規モジュール。既存 tool の挙動変更なし
+- Phase B で cache が永続化に変わる際、hash-table → SQLite 移行は
+  内部実装のみ、MCP tool API は変わらない
+- ~anvil-browser-capture-dir~ の default は Cowork 前提だが、defcustom
+  なので他 user は override で自 repo に向ける
+
+* Risks
+
+- *agent-browser CLI の仕様変更*。公開 command 一覧 (snapshot / click /
+  find 等) が将来 breaking change すると一気に壊れる。
+  → ~anvil-browser--run-cli~ で引数組み立てを 1 箇所に寄せ、変更時の
+  修正点を局所化する
+- *Chrome 異常終了によるハング*。session 死亡後も cache を返してしまう罠。
+  → session health check を fetch 毎に行う (軽量 query 1 本)
+- *Windows Defender 誤検知*。agent-browser の Rust バイナリが detection
+  される既知 issue (#549)。
+  → README.org の Windows 節でガイドリンク。anvil-browser 本体は
+  例外メッセージで「Defender 除外設定」を案内する
+- *cache の staleness*. TTL 5 分なのに重要ニュースを取りこぼす可能性。
+  → TTL は defcustom、critical path は ~anvil-browser-cache-ttl-sec 0~ で
+  無効化可能
+
+* Platform Notes
+
+** Windows
+
+- Chrome for Testing が system 側にあれば ~agent-browser install~ 不要
+- Defender 除外: =%APPDATA%\npm\node_modules\agent-browser\bin\=
+- msys bash と native Windows Chrome の path 相互変換は agent-browser
+  側が吸収してくれる (実測確認済)
+
+** macOS / Linux
+
+- 特記なし。CLI の cold start が Windows より速い
+
+* Success Metrics
+
+- agent-browser 直叩き比で web fetch 1 件あたりの Claude token 消費が
+  30% 以上削減 (capture 統合分の節約込み)
+- ~browser-fetch~ 同一 URL 再取得の cache hit 時 token 消費 0 (tool 呼び
+  出しの framework overhead のみ)
+- ~M-x anvil-browser-status~ で last N fetch の URL / elapsed / cache hit
+  可視化 (Phase A では in-memory で良い)
+
+---
+
+* Vision — Anvil Next-Primitives Roadmap
+
+Phase A (anvil-browser) が完成したあとの anvil.el 全体像。
+本 doc で **全容だけ共有** し、着手時に個別 design doc (08 以降) を切る。
+
+** 前提: layering diagram
+
+#+begin_example
+┌─────────────────────────────────────────────────────────┐
+│  APP     : init.org composition (user 固有 workflow)     │
+│            my-inspection-* / my-invoice-* …              │
+├─────────────────────────────────────────────────────────┤
+│  CAPSTONE: anvil-agent                                   │
+│            (長時間自律 task、budget + resume)            │
+├─────────────────────────────────────────────────────────┤
+│  ACTION  : anvil-browser / anvil-http / anvil-file       │
+│            anvil-org / anvil-sqlite / anvil-git …        │
+├─────────────────────────────────────────────────────────┤
+│  EXTRACT : anvil-pdf / anvil-xlsx / anvil-content        │
+├─────────────────────────────────────────────────────────┤
+│  SEMANT  : anvil-org-index / anvil-embed                 │
+├─────────────────────────────────────────────────────────┤
+│  COMPUTE : anvil-offload / anvil-worker                  │
+├─────────────────────────────────────────────────────────┤
+│  STORE   : anvil-state / anvil-metrics                   │
+├─────────────────────────────────────────────────────────┤
+│  XPORT   : anvil-server / anvil-validate                 │
+└─────────────────────────────────────────────────────────┘
+#+end_example
+
+凡例: 新規提案 = anvil-browser / anvil-http / anvil-content /
+anvil-embed / anvil-state / anvil-metrics / anvil-validate / anvil-agent
+
+** 依存グラフ
+
+#+begin_example
+anvil-state ─┬─→ anvil-http ─→ anvil-browser
+             ├─→ anvil-metrics
+             └─→ anvil-embed ←──── anvil-content
+anvil-offload ─→ anvil-agent ←┬── anvil-state
+                              ├── anvil-metrics
+                              └── anvil-browser (crawler 例)
+anvil-validate ┈┈→ file-batch / buffer-save
+#+end_example
+
+** Phase 構築順序
+
+| Phase | 内容                            | 依存                         | 理由                                       |
+|-------+---------------------------------+------------------------------+--------------------------------------------|
+| A     | ~anvil-browser~ MVP             | (runtime: agent-browser CLI) | 25x token 節約が今日から。primitive 抽出は B で |
+| B     | ~anvil-state~ (KV/checkpoint)   | SQLite                       | A の cache / 2 人目 caller が出たら extract |
+| C1    | ~anvil-http~ (fetch + ETag)     | anvil-state                  | 静的 HTML/JSON は browser 不要             |
+| C2    | ~anvil-metrics~                 | anvil-state                  | tool 増える前に instrumentation            |
+| D1    | ~anvil-content~ (unified extract) | anvil-pdf, anvil-xlsx       | pdf/xlsx/html/docx の uniform interface   |
+| D2    | ~anvil-embed~ (semantic search) | anvil-state, anvil-content   | 重い backend 設計 (ollama/OpenAI 選択可)  |
+| E     | ~anvil-validate~                | なし (hook framework)        | autonomy を広げる前に安全網               |
+| F     | ~anvil-agent~ (capstone)        | anvil-state, offload, metrics, validate | 全部揃ってから cron で自律 task |
+
+各 phase の詳細は着手時点で個別 doc (08-state.org / 09-http.org …)
+として切り出す。
+
+** 各 primitive の概要
+
+*** anvil-state
+
+- SQLite backed KV store、scoped namespace
+- API: ~(anvil-state-set KEY VAL &key ns ttl)~ / ~(anvil-state-get KEY
+  &key ns)~ / ~(anvil-state-delete KEY &key ns)~
+- Phase A の browser cache / offload checkpoint cursor の永続化を
+  バックエンドする
+
+*** anvil-http
+
+- ~url-retrieve~ 薄い wrapper + ETag/mtime cache + robots.txt 尊重 +
+  timeout / retry
+- MCP tool: ~http-fetch URL [--if-newer-than MTIME]~
+- Maxun REST 連携や公開 docs 監視の foundation
+
+*** anvil-metrics
+
+- SQLite の event log table: ~metric-event (ts, tool-id, elapsed-ms,
+  ok, error)~
+- ~M-x anvil-metrics-dashboard~ で tabulated-list UI (worker-ui の兄弟)
+- "tool X が月 N 回呼ばれている" を root cause として可視化
+
+*** anvil-content
+
+- pdf / xlsx / html / docx / epub の uniform text+structure 抽出
+- 既存 anvil-pdf (pymupdf) / anvil-xlsx (openpyxl) を統合
+- anvil-embed の入力側 source
+
+*** anvil-embed
+
+- embedding backend plug-in (ollama / OpenAI / 任意)
+- SQLite に vector 格納、cosine top-k
+- MCP tool: ~semantic-search QUERY [--source SRC --top-k K]~
+- Phase D なので backend 設計 doc を別立て
+
+*** anvil-validate
+
+- pre-save / pre-commit の hook framework
+- ~(anvil-validate-register #'MY-CHECK-FN)~ で任意の
+  ~(path -> warnings-list)~ 関数を登録
+- file-batch / buffer-save が dispatch 前に collect して warnings 集約
+
+*** anvil-agent
+
+- offload + cron + state + metrics を束ねた autonomous task loop
+- API: ~(anvil-agent-run TASK-FN &key budget resume-from)~
+- 夜間 batch / background research の generic 実行環境
+- user は init.org で「具体 task」を登録するのみ
+
+** 「anvil に入れる基準」 (published package として)
+
+- 複数 workflow から使い回される
+- tool の primitive / framework (特定 domain tool ではない)
+- user data を *形式として* 扱う (業界固有ルールを含まない)
+- 「誰の仕事でも有用」のテスト: GitHub で他人がこの tool を欲しがるか?
+
+この 4 条件を満たさないものは ~init.org~ composition 層に隔離。
+
+* Review Questions (RESOLVED 2026-04-17)
+
+初回レビューで決定した項目:
+
+- [X] Phase A の session 管理 → **singleton + ~--session-name~ 固定**。
+      Phase A' で pool 化の予告は残す
+- [X] ~browser-capture~ の template → **string OR function の両対応**
+      (`:type '(choice string function)`)。Emacs 慣例 (org-capture-templates
+      と同じ)。MVP 実装コストは ~10 行
+- [X] Maxun 連携 → **Phase C1 (anvil-http ship) まで延期**。anvil-http が
+      ない状態で examples/ を書いても primitive 不足で中身が薄い。
+      Phase C1 着手時に ~examples/scheduled-web-scraping.org~ を追加
+- [X] agent-browser serve mode 実機確認 → **無し**。代替として
+      ~--session-name~ による state 永続化機構があり、これを採用
+
+* Implementation Plan — Phase A
+
+1. *Week 0 day 0*: 本 doc レビュー・確定
+2. *Week 0 day 1-2*: ~anvil-browser.el~ に ~browser-fetch~ + ~browser-close~
+   のみ実装。単純 open → snapshot をループでテスト
+3. *Week 0 day 3*: ~browser-interact~ 追加。action plist の dispatch
+4. *Week 1 day 1*: ~browser-capture~ 追加。template + tags 処理
+5. *Week 1 day 2*: ~browser-screenshot~ 追加
+6. *Week 1 day 3*: tests/anvil-browser-test.el (mock CLI で unit 5 本 +
+   live 1 本 skip-unless executable-find)
+7. *Week 1 day 4*: README + docstring final pass
+8. *Week 1 day 5*: merge + tag
+
+目安で 1-2 週間 (実工数 2-3 日、レビュー待ち込み)。
+
+* References
+
+- agent-browser 公式: https://agent-browser.dev/
+- agent-browser GitHub: https://github.com/vercel-labs/agent-browser
+- agent-browser 導入ガイド: ~capture/web/agent-browser-setup-guide.org~
+  (2026-04-16)
+- Maxun (比較対象): https://github.com/getmaxun/maxun
+- Maxun 要約: ~capture/web/web_20260417_github_maxun_nocode_scraper.org~
+- 先行 offload 設計: [[file:03-offload-framework.org][Doc 03 Offload Framework]]
+- 先行 disk-first 設計: [[file:05-disk-first.org][Doc 05 Disk-First]]
+- Claude in Chrome の棲み分け議論: 2026-04-17 session ログ

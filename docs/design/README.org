@@ -40,6 +40,7 @@ Anvil の現行アーキテクチャ (Architecture B) は、purpose 別に 4 層
 | 04 | [[file:04-pty-broker.org][PTY Broker + Headless UI]]    | なし        | 大       | 中     |
 | 05 | [[file:05-disk-first.org][Disk-First Policy]]           | なし        | 小       | 高     |
 | 06 | [[file:06-code-transform-tools.org][Code Transform Tools]]        | なし        | 小       | 中     |
+| 07 | [[file:07-browser-framework.org][Browser Framework + Vision]]   | なし (A)    | 小 (A)   | 高     |
 
 * Status Legend
 
