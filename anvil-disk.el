@@ -147,7 +147,12 @@ pass :force t to override"
     (let ((coding-system-for-write 'utf-8-unix))
       ;; Divergence already checked + force guard applied above; Emacs'
       ;; supersession prompt is redundant and errors out in batch mode.
+      ;; Silence BOTH the public and the internal userlock helper —
+      ;; Emacs 29+ routes `write-region' through the internal variant
+      ;; which throws "Cannot resolve conflict in batch mode" directly.
       (cl-letf (((symbol-function 'ask-user-about-supersession-threat)
+                 #'ignore)
+                ((symbol-function 'userlock--ask-user-about-supersession-threat)
                  #'ignore))
         (write-region content nil abs nil 'silent)))
     (list :file          abs
