@@ -658,6 +658,14 @@ Config file location:
 | Windows (regular) | =%APPDATA%\Claude\claude_desktop_config.json=                                               |
 | Windows (UWP)     | =%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json= |
 
+Anvil currently registers tools under *two* MCP server-ids
+internally — =anvil= (eval / IDE) and =emacs-eval= (file, org,
+buffer, worker, ...). Most clients show one tool list per
+=mcpServers= entry, so you need *two entries* pointing at the
+same script with different =--server-id= values to expose every
+tool. (A future release will collapse these into a single
+server-id; for now, two entries is the supported setup.)
+
 *** macOS / Linux
 
 #+begin_src json
@@ -670,13 +678,24 @@ Config file location:
         "--init-function=anvil-enable",
         "--stop-function=anvil-disable"
       ]
+    },
+    "anvil-emacs-eval": {
+      "command": "/path/to/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--server-id=emacs-eval"
+      ]
     }
   }
 }
 #+end_src
 
+The second entry connects to the already-running daemon and
+exposes the file/org/buffer/worker tools. =--init-function= is
+only needed on one entry — the first connection enables anvil
+and registers tools under both server-ids.
+
 If your Emacs daemon uses a non-default socket directory, add
-=--socket=/path/to/server= to the =args= array.
+=--socket=/path/to/server= to the =args= of *both* entries.
 
 *** Windows
 
@@ -693,6 +712,13 @@ Windows needs Git Bash to execute the shell script:
         "--init-function=anvil-enable",
         "--stop-function=anvil-disable"
       ]
+    },
+    "anvil-emacs-eval": {
+      "command": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": [
+        "C:/Users/<you>/.emacs.d/anvil-stdio.sh",
+        "--server-id=emacs-eval"
+      ]
     }
   }
 }
@@ -704,7 +730,8 @@ Restart Claude Desktop after editing the config.
 
 The CLI stores its config in =~/.claude.json= mixed with chat
 history and other state — *do not overwrite the whole file*.
-Use the =claude mcp add= command to add only the server entry:
+Use the =claude mcp add= command to add the server entries.
+Run *both* commands to expose all tools:
 
 #+begin_src sh
 claude mcp add -s user -t stdio anvil -- \
@@ -712,6 +739,10 @@ claude mcp add -s user -t stdio anvil -- \
   --server-id=anvil \
   --init-function=anvil-enable \
   --stop-function=anvil-disable
+
+claude mcp add -s user -t stdio anvil-emacs-eval -- \
+  ~/.emacs.d/anvil-stdio.sh \
+  --server-id=emacs-eval
 #+end_src
 
 On Windows, replace the script path with the Git Bash invocation

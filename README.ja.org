@@ -632,6 +632,14 @@ M-x anvil-server-install
 | Windows (通常)    | =%APPDATA%\Claude\claude_desktop_config.json=                                               |
 | Windows (UWP)     | =%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json= |
 
+Anvil は現在、内部的にツールを *2つの MCP server-id* に分けて
+登録しています — =anvil=（eval / IDE 系）と =emacs-eval=（file,
+org, buffer, worker など）。多くのクライアントは =mcpServers=
+エントリ1つあたり1つのツールリストしか表示しないため、すべての
+ツールを公開するには、同じスクリプトを別々の =--server-id= 値で
+指す *2エントリ* が必要です。（将来のリリースでは server-id を
+1つに統合する予定。当面は2エントリ構成がサポート設定です。）
+
 *** macOS / Linux
 
 #+begin_src json
@@ -644,13 +652,24 @@ M-x anvil-server-install
         "--init-function=anvil-enable",
         "--stop-function=anvil-disable"
       ]
+    },
+    "anvil-emacs-eval": {
+      "command": "/path/to/.emacs.d/anvil-stdio.sh",
+      "args": [
+        "--server-id=emacs-eval"
+      ]
     }
   }
 }
 #+end_src
 
+2つ目のエントリは既に起動中のデーモンに接続し、file/org/buffer/
+worker 系ツールを公開します。=--init-function= は1つのエントリに
+だけ指定すればOK — 最初の接続で anvil が enable され、両方の
+server-id にツールが登録されます。
+
 Emacs デーモンがデフォルト以外のソケットディレクトリを使用している場合は、
-=args= 配列に =--socket=/path/to/server= を追加してください。
+*両方* のエントリの =args= に =--socket=/path/to/server= を追加してください。
 
 *** Windows
 
@@ -667,6 +686,13 @@ Windows では Git Bash がシェルスクリプトの実行に必要です:
         "--init-function=anvil-enable",
         "--stop-function=anvil-disable"
       ]
+    },
+    "anvil-emacs-eval": {
+      "command": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "args": [
+        "C:/Users/<you>/.emacs.d/anvil-stdio.sh",
+        "--server-id=emacs-eval"
+      ]
     }
   }
 }
@@ -677,8 +703,9 @@ Windows では Git Bash がシェルスクリプトの実行に必要です:
 ** Claude Code (CLI)
 
 CLI の設定は =~/.claude.json= にチャット履歴などと混在して保存されています。
-*ファイル全体を上書きしないでください*。=claude mcp add= コマンドでサーバエントリだけを
-追加します:
+*ファイル全体を上書きしないでください*。=claude mcp add= コマンドで
+サーバエントリを追加します。すべてのツールを公開するには *両方* の
+コマンドを実行してください:
 
 #+begin_src sh
 claude mcp add -s user -t stdio anvil -- \
@@ -686,6 +713,10 @@ claude mcp add -s user -t stdio anvil -- \
   --server-id=anvil \
   --init-function=anvil-enable \
   --stop-function=anvil-disable
+
+claude mcp add -s user -t stdio anvil-emacs-eval -- \
+  ~/.emacs.d/anvil-stdio.sh \
+  --server-id=emacs-eval
 #+end_src
 
 Windows の場合は、スクリプトパスを上記の Git Bash 呼び出し形式に置き換えてください
