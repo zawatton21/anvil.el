@@ -1704,6 +1704,151 @@ allowed at submit time) would emit `unanimous' vacuously."
             :matrix matrix
             :tasks results))))
 
+;;;; --- Phase 4b: meta-LLM judge --------------------------------------------
+
+(defcustom anvil-orchestrator-judge-default-provider 'claude
+  "Default provider used by `anvil-orchestrator-judge-consensus'.
+Must be a registered provider symbol.  Pick one capable of
+synthesis (claude, gemini).  Ollama is viable but plain-text
+summaries may be lower quality."
+  :type 'symbol
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-judge-prompt-template
+  "You are adjudicating responses from multiple AI assistants to a single question.
+
+ORIGINAL QUESTION:
+%s
+
+CANDIDATE RESPONSES:
+%s
+
+Produce a single synthesized answer that captures the best of these candidates.  Begin with the answer itself, then add a brief rationale (max 3 sentences) noting agreement and disagreement between candidates."
+  "Template for the judge prompt.
+Two %s placeholders are filled in order: (1) the original prompt,
+(2) the formatted candidate block.  Override to change tone or to
+request a structured output (e.g. JSON)."
+  :type 'string
+  :group 'anvil-orchestrator)
+
+(defun anvil-orchestrator--judge-format-candidates (tasks)
+  "Format TASKS (slim plist list) into a numbered candidate block."
+  (let (acc (i 0))
+    (dolist (t0 tasks)
+      (setq i (1+ i))
+      (push (format "%d. [provider: %s, status: %s]\n%s"
+                    i
+                    (or (plist-get t0 :provider) "?")
+                    (or (plist-get t0 :status) "?")
+                    (or (plist-get t0 :summary)
+                        (plist-get t0 :error)
+                        "(no output)"))
+            acc))
+    (mapconcat #'identity (nreverse acc) "\n\n")))
+
+(defun anvil-orchestrator--judge-build-prompt (original-prompt tasks)
+  "Build the full judge prompt from ORIGINAL-PROMPT + TASKS."
+  (format anvil-orchestrator-judge-prompt-template
+          (or original-prompt "")
+          (anvil-orchestrator--judge-format-candidates tasks)))
+
+(defun anvil-orchestrator--judge-original-prompt (meta)
+  "Return the original prompt for the consensus META, or nil.
+Walks the fan-out task ids until one yields a :prompt."
+  (let ((task-ids (plist-get meta :task-ids))
+        found)
+    (catch 'done
+      (dolist (id task-ids)
+        (let ((task (anvil-orchestrator--task-get id)))
+          (when (and task (plist-get task :prompt))
+            (setq found (plist-get task :prompt))
+            (throw 'done t)))))
+    found))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-judge-consensus
+    (consensus-id &key judge judge-model extra wait
+                  (max-wait-sec 1800) timeout-sec)
+  "Submit a meta-LLM judge task for CONSENSUS-ID.
+Requires the fan-out batch to be terminal (pass :WAIT t to block
+until then).  :JUDGE defaults to
+`anvil-orchestrator-judge-default-provider'.  :EXTRA, when
+non-nil, is appended after the rendered candidate block to adjust
+adjudication instructions without redefining the template.
+
+Returns (:consensus-id STR :judge-task-id STR :judge-batch-id STR
+         :judge-provider SYM :judge-model STRING-or-NIL)."
+  (let ((meta (gethash consensus-id anvil-orchestrator--consensus-groups)))
+    (unless meta
+      (user-error "judge: unknown consensus-id %s" consensus-id))
+    (let* ((batch-id (plist-get meta :batch-id))
+           (results  (anvil-orchestrator-collect
+                      batch-id :wait wait :max-wait-sec max-wait-sec)))
+      (unless (anvil-orchestrator--batch-terminal-p batch-id)
+        (user-error
+         "judge: consensus %s batch %s is not terminal (pass :wait t)"
+         consensus-id batch-id))
+      (let* ((prov   (or judge anvil-orchestrator-judge-default-provider))
+             (_check (unless (anvil-orchestrator--provider prov)
+                       (user-error "judge: unknown provider %S" prov)))
+             (orig   (anvil-orchestrator--judge-original-prompt meta))
+             (core   (anvil-orchestrator--judge-build-prompt orig results))
+             (prompt (if (and extra (stringp extra)
+                              (not (string-empty-p extra)))
+                         (concat core "\n\n" extra)
+                       core))
+             (task   (append
+                      (list :name (format "consensus-judge-%s"
+                                          (substring consensus-id 0 8))
+                            :provider prov
+                            :prompt prompt)
+                      (and judge-model (list :model judge-model))
+                      (and timeout-sec (list :timeout-sec timeout-sec))))
+             (new-batch (anvil-orchestrator-submit (list task)))
+             (task-id   (car (gethash new-batch
+                                      anvil-orchestrator--batches)))
+             (updated   meta))
+        (ignore _check)
+        (setq updated (plist-put updated :judge-task-id task-id))
+        (setq updated (plist-put updated :judge-batch-id new-batch))
+        (setq updated (plist-put updated :judge-provider prov))
+        (setq updated (plist-put updated :judge-model judge-model))
+        (setq updated (plist-put updated :judge-submitted-at (float-time)))
+        (puthash consensus-id updated anvil-orchestrator--consensus-groups)
+        (anvil-orchestrator--consensus-persist consensus-id updated)
+        (list :consensus-id   consensus-id
+              :judge-task-id  task-id
+              :judge-batch-id new-batch
+              :judge-provider prov
+              :judge-model    judge-model)))))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-judge-collect
+    (consensus-id &key wait (max-wait-sec 1800))
+  "Return the judge task plist for CONSENSUS-ID.
+Result: (:consensus-id :judge-task-id :judge-provider :judge PLIST).
+Errors when no judge has been submitted for the consensus."
+  (let ((meta (gethash consensus-id anvil-orchestrator--consensus-groups)))
+    (unless meta
+      (user-error "judge-collect: unknown consensus-id %s" consensus-id))
+    (let ((judge-id    (plist-get meta :judge-task-id))
+          (judge-batch (plist-get meta :judge-batch-id)))
+      (unless judge-id
+        (user-error
+         "judge-collect: no judge submitted for consensus %s" consensus-id))
+      (when (and wait judge-batch)
+        (let ((deadline (+ (float-time) max-wait-sec)))
+          (while (and (not (anvil-orchestrator--batch-terminal-p judge-batch))
+                      (< (float-time) deadline))
+            (accept-process-output nil 0.1))))
+      (let ((task (anvil-orchestrator--task-get judge-id)))
+        (list :consensus-id   consensus-id
+              :judge-task-id  judge-id
+              :judge-provider (plist-get meta :judge-provider)
+              :judge          (and task
+                                   (anvil-orchestrator--task-summary-plist
+                                    task)))))))
+
 ;;;; --- MCP tool handlers -------------------------------------------------
 
 (defun anvil-orchestrator--parse-tasks-json (tasks-json)
@@ -1838,6 +1983,54 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (let ((w (and wait (not (member wait '("" "nil" "false" "0"))))))
      (anvil-orchestrator-consensus-collect consensus_id :wait w))))
+
+(defun anvil-orchestrator--tool-consensus-judge
+    (consensus_id &optional judge judge_model extra wait timeout_sec)
+  "Submit a meta-LLM judge task for CONSENSUS_ID and return the id.
+
+MCP Parameters:
+  consensus_id - Consensus id returned by orchestrator-consensus-submit.
+  judge        - Judge provider symbol-name string (e.g. \"claude\").
+                 Defaults to `anvil-orchestrator-judge-default-provider'.
+  judge_model  - Optional model override for the judge task.
+  extra        - Optional instruction appended after the rendered
+                 candidate block (e.g. \"Answer in <= 120 words.\").
+  wait         - When truthy (\"t\"/\"true\"/non-empty), block until
+                 the fan-out batch reaches terminal state before
+                 dispatching the judge.
+  timeout_sec  - Optional judge-task wall-clock cap in seconds.
+
+Returns (:consensus-id :judge-task-id :judge-batch-id
+         :judge-provider :judge-model)."
+  (anvil-server-with-error-handling
+   (let* ((judge-sym (and judge (stringp judge)
+                          (not (string-empty-p judge))
+                          (intern judge)))
+          (model     (and judge_model (stringp judge_model)
+                          (not (string-empty-p judge_model))
+                          judge_model))
+          (extra-str (and extra (stringp extra)
+                          (not (string-empty-p extra))
+                          extra))
+          (w         (and wait (not (member wait '("" "nil" "false" "0")))))
+          (tsec      (and timeout_sec (stringp timeout_sec)
+                          (not (string-empty-p timeout_sec))
+                          (string-to-number timeout_sec))))
+     (anvil-orchestrator-judge-consensus
+      consensus_id :judge judge-sym :judge-model model
+      :extra extra-str :wait w :timeout-sec tsec))))
+
+(defun anvil-orchestrator--tool-consensus-judge-collect
+    (consensus_id &optional wait)
+  "Return judge task summary for CONSENSUS_ID.
+
+MCP Parameters:
+  consensus_id - Consensus id string.
+  wait         - When truthy, block until judge task reaches a
+                 terminal state."
+  (anvil-server-with-error-handling
+   (let ((w (and wait (not (member wait '("" "nil" "false" "0"))))))
+     (anvil-orchestrator-judge-collect consensus_id :wait w))))
 
 ;;;; --- dashboard ----------------------------------------------------------
 
@@ -2007,6 +2200,28 @@ via `orchestrator-consensus-collect' to get a verdict (unanimous
 :verdict (unanimous / divergent), :min-similarity, pairwise
 :matrix, and the per-task slim plists.  Pass wait=\"t\" to block
 until every fan-out task reaches a terminal state."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-consensus-judge
+   :id "orchestrator-consensus-judge"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Run a meta-LLM judge (Phase 4b) over a consensus batch.  The
+fan-out batch must be terminal (or pass wait=\"t\" to block
+first).  The judge prompt is built from the original question +
+each provider's summary and submitted as a single new task.
+Returns the judge-task-id; poll with
+`orchestrator-consensus-judge-collect'.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-consensus-judge-collect
+   :id "orchestrator-consensus-judge-collect"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the judge task summary for a consensus id.  Pass
+wait=\"t\" to block until the judge task reaches a terminal
+state."
    :read-only t))
 
 (defun anvil-orchestrator--unregister-tools ()
@@ -2014,7 +2229,9 @@ until every fan-out task reaches a terminal state."
                 "orchestrator-collect" "orchestrator-cancel"
                 "orchestrator-retry"
                 "orchestrator-consensus-submit"
-                "orchestrator-consensus-collect"))
+                "orchestrator-consensus-collect"
+                "orchestrator-consensus-judge"
+                "orchestrator-consensus-judge-collect"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload

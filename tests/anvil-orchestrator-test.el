@@ -1257,6 +1257,151 @@ value (the batch-id) as its RESULT argument."
                          :key (lambda (t0) (plist-get t0 :provider)))))
         (should (equal "m-a" (plist-get a :model)))))))
 
+;;;; --- Phase 4b: meta-LLM judge -------------------------------------------
+
+(ert-deftest anvil-orchestrator-test-judge-format-candidates ()
+  "`--judge-format-candidates' numbers entries and labels provider."
+  (let* ((tasks (list
+                 (list :provider 'claude :status 'done :summary "A1")
+                 (list :provider 'gemini :status 'done :summary "B1")))
+         (out (anvil-orchestrator--judge-format-candidates tasks)))
+    (should (string-match-p "1\\. \\[provider: claude" out))
+    (should (string-match-p "2\\. \\[provider: gemini" out))
+    (should (string-match-p "A1" out))
+    (should (string-match-p "B1" out))))
+
+(ert-deftest anvil-orchestrator-test-judge-format-handles-no-output ()
+  "`(no output)' fallback when both :summary and :error are nil."
+  (let ((out (anvil-orchestrator--judge-format-candidates
+              (list (list :provider 'x :status 'failed)))))
+    (should (string-match-p "(no output)" out))))
+
+(ert-deftest anvil-orchestrator-test-judge-build-prompt-fills-template ()
+  "Default template substitutes prompt then candidates."
+  (let* ((out (anvil-orchestrator--judge-build-prompt
+               "What is 1 + 1?"
+               (list (list :provider 'claude :status 'done :summary "2"))))
+         (qidx (string-match-p "What is 1 \\+ 1\\?" out))
+         (cidx (string-match-p "1\\. \\[provider: claude" out)))
+    (should qidx)
+    (should cidx)
+    ;; Question must appear before the candidate block.
+    (should (< qidx cidx))))
+
+(ert-deftest anvil-orchestrator-test-judge-unknown-consensus ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-judge-consensus "no-such-id")
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-judge-rejects-non-terminal ()
+  "Judge errors when the fan-out batch is not terminal and :wait is nil."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-slow 5)
+    (anvil-orchestrator-test--register-named 'tprov-b "beta")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "slow q" :providers '(slow tprov-b))))
+      ;; slow provider sleeps 5s → not terminal yet.
+      (should-error
+       (anvil-orchestrator-judge-consensus
+        (plist-get res :consensus-id))
+       :type 'user-error))))
+
+(ert-deftest anvil-orchestrator-test-judge-submits-new-task ()
+  "Happy path: after fan-out completes, judge submits a new single-task batch."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "alpha answer")
+    (anvil-orchestrator-test--register-named 'tprov-b "beta answer")
+    ;; Register a judge provider whose summary we can assert on.
+    (anvil-orchestrator-test--register-named 'tjudge "synth result")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "unify" :providers '(tprov-a tprov-b))))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get res :batch-id) 10)
+      (let* ((j (anvil-orchestrator-judge-consensus
+                 (plist-get res :consensus-id) :judge 'tjudge))
+             (jid (plist-get j :judge-task-id))
+             (jb  (plist-get j :judge-batch-id)))
+        (should (stringp jid))
+        (should (stringp jb))
+        (should (eq 'tjudge (plist-get j :judge-provider)))
+        (anvil-orchestrator-test--wait-batch jb 10)
+        (let* ((coll (anvil-orchestrator-judge-collect
+                      (plist-get res :consensus-id)))
+               (jplist (plist-get coll :judge)))
+          (should (eq 'done (plist-get jplist :status)))
+          (should (equal "synth result" (plist-get jplist :summary)))
+          (should (eq 'tjudge (plist-get coll :judge-provider))))))))
+
+(ert-deftest anvil-orchestrator-test-judge-prompt-embeds-summaries ()
+  "Judge task's prompt contains each candidate summary verbatim."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "alpha answer")
+    (anvil-orchestrator-test--register-named 'tprov-b "beta answer")
+    (anvil-orchestrator-test--register-named 'tjudge "synth")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "explain the diff" :providers '(tprov-a tprov-b))))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get res :batch-id) 10)
+      (let* ((j (anvil-orchestrator-judge-consensus
+                 (plist-get res :consensus-id) :judge 'tjudge))
+             (jt (anvil-orchestrator--task-get
+                  (plist-get j :judge-task-id)))
+             (prompt (plist-get jt :prompt)))
+        (should (string-match-p "explain the diff" prompt))
+        (should (string-match-p "alpha answer" prompt))
+        (should (string-match-p "beta answer"  prompt))))))
+
+(ert-deftest anvil-orchestrator-test-judge-extra-appended ()
+  "`:extra' is appended verbatim after the rendered candidate block."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "a")
+    (anvil-orchestrator-test--register-named 'tprov-b "b")
+    (anvil-orchestrator-test--register-named 'tjudge "s")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "q" :providers '(tprov-a tprov-b))))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get res :batch-id) 10)
+      (let* ((j (anvil-orchestrator-judge-consensus
+                 (plist-get res :consensus-id)
+                 :judge 'tjudge
+                 :extra "ANSWER IN JSON"))
+             (jt (anvil-orchestrator--task-get
+                  (plist-get j :judge-task-id))))
+        (should (string-match-p "ANSWER IN JSON"
+                                (plist-get jt :prompt)))))))
+
+(ert-deftest anvil-orchestrator-test-judge-collect-without-submit ()
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "a")
+    (anvil-orchestrator-test--register-named 'tprov-b "b")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "q" :providers '(tprov-a tprov-b))))
+      (should-error
+       (anvil-orchestrator-judge-collect
+        (plist-get res :consensus-id))
+       :type 'user-error))))
+
+(ert-deftest anvil-orchestrator-test-judge-mcp-submit-collect ()
+  "MCP wrappers drive the full judge cycle."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "x")
+    (anvil-orchestrator-test--register-named 'tprov-b "y")
+    (anvil-orchestrator-test--register-named 'tjudge "judged")
+    (let* ((sub (anvil-orchestrator--tool-consensus-submit
+                 "q" "[\"tprov-a\",\"tprov-b\"]" nil))
+           (cid (plist-get sub :consensus-id)))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get sub :batch-id) 10)
+      (let* ((jret (anvil-orchestrator--tool-consensus-judge
+                    cid "tjudge" nil nil nil nil))
+             (jb (plist-get jret :judge-batch-id)))
+        (should (stringp (plist-get jret :judge-task-id)))
+        (anvil-orchestrator-test--wait-batch jb 10)
+        (let* ((coll (anvil-orchestrator--tool-consensus-judge-collect cid))
+               (jplist (plist-get coll :judge)))
+          (should (equal "judged" (plist-get jplist :summary))))))))
+
 ;;;; --- live smoke test ---------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-live-claude ()
