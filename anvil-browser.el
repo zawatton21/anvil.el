@@ -120,6 +120,50 @@ rendered string.  The dual-type pattern mirrors
   :type '(choice string function)
   :group 'anvil-browser)
 
+;;;; --- Phase A' auth primitives (login wall bypass) ----------------------
+
+(defcustom anvil-browser-user-agent nil
+  "Default value for agent-browser's --user-agent flag.
+String or nil (no UA override).  Useful against UA-sniffing
+blocks; not sufficient on its own for modern JS challenges."
+  :type '(choice (const :tag "Don't override" nil) string)
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-profile nil
+  "Default value for agent-browser's --profile flag.
+String or nil.  A Chrome profile name (e.g. \"Default\") reuses
+an already-authenticated profile and is the primary mechanism
+for accessing login-walled sites (X, Reddit, private web UIs).
+An absolute directory path creates / reuses a persistent custom
+profile."
+  :type '(choice (const :tag "Fresh profile" nil) string)
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-auto-connect nil
+  "When non-nil, pass --auto-connect to agent-browser so it
+attaches to a running Chrome instance instead of spawning a
+fresh one.  Cookies / state are inherited with no profile-lock
+contention — the simplest path when the user already has Chrome
+open and logged in."
+  :type 'boolean
+  :group 'anvil-browser)
+
+(defcustom anvil-browser-session-presets nil
+  "Alist of named auth presets for `browser-*' tools.
+
+Each entry is (NAME . PLIST) where PLIST may contain any of
+:profile, :user-agent, :auto-connect, :session-name.  When a
+tool is called with the matching NAME, the preset values
+override the corresponding global defcustoms for that call.
+
+Example:
+  \\='((\"reddit\" :profile \"Default\")
+    (\"x\"      :auto-connect t)
+    (\"bot\"    :user-agent \"Mozilla/5.0 (compatible; anvil-bot)\"))"
+  :type '(alist :key-type string
+                :value-type (plist :value-type sexp))
+  :group 'anvil-browser)
+
 ;;;; --- internal state -----------------------------------------------------
 
 (defconst anvil-browser--state-ns "browser"
@@ -142,27 +186,89 @@ rendered string.  The dual-type pattern mirrors
        "anvil-browser: '%s' not found on exec-path — install via 'npm install -g agent-browser'"
        anvil-browser-cli)))
 
-(defun anvil-browser--cache-key (url selector)
-  "Build the `anvil-state' key for URL + SELECTOR.
-Selectors are serialized as `URL\\0SELECTOR' so an empty selector
-produces a distinct key from any non-empty one."
-  (format "%s\0%s" url (or selector "")))
+(defun anvil-browser--resolve-auth-config (preset)
+  "Resolve auth config plist for PRESET, falling back to defcustoms.
+PRESET is a string name that must exist in
+`anvil-browser-session-presets' (when non-nil / non-empty).
+Returns a plist with :profile :user-agent :auto-connect
+:session-name keys, each either a string/boolean or nil.
+Signals `user-error' on unknown preset name."
+  (let* ((preset-plist
+          (cond
+           ((or (null preset) (and (stringp preset)
+                                   (string-empty-p preset)))
+            nil)
+           ((stringp preset)
+            (let ((entry (assoc preset anvil-browser-session-presets)))
+              (unless entry
+                (user-error
+                 "anvil-browser: unknown preset %S (known: %S)"
+                 preset
+                 (mapcar #'car anvil-browser-session-presets)))
+              (cdr entry)))
+           (t (user-error
+               "anvil-browser: preset must be a string or nil, got %S"
+               preset))))
+         (resolve (lambda (key default)
+                    (if (plist-member preset-plist key)
+                        (plist-get preset-plist key)
+                      default))))
+    (list :profile      (funcall resolve :profile      anvil-browser-profile)
+          :user-agent   (funcall resolve :user-agent   anvil-browser-user-agent)
+          :auto-connect (funcall resolve :auto-connect anvil-browser-auto-connect)
+          :session-name (funcall resolve :session-name nil))))
 
-(defun anvil-browser--cache-get (url selector)
-  "Return the cached snapshot text for URL+SELECTOR or nil.
+(defun anvil-browser--build-cli-args (auth session-override)
+  "Compose the agent-browser CLI args for AUTH + SESSION-OVERRIDE.
+AUTH is the plist returned by `anvil-browser--resolve-auth-config'.
+SESSION-OVERRIDE is the tool's `session' argument (highest
+priority).  Returns a list of strings ending with the
+batch-mode terminator \\='(\"batch\" \"--json\") so the caller
+can send JSON on stdin."
+  (let* ((session-name (or session-override
+                           (plist-get auth :session-name)
+                           anvil-browser-session-name))
+         (ua      (plist-get auth :user-agent))
+         (profile (plist-get auth :profile))
+         (auto    (plist-get auth :auto-connect))
+         (args    (list "--session-name" session-name)))
+    (when (and (stringp ua) (not (string-empty-p ua)))
+      (setq args (append args (list "--user-agent" ua))))
+    (when (and (stringp profile) (not (string-empty-p profile)))
+      (setq args (append args (list "--profile" profile))))
+    (when auto
+      (setq args (append args (list "--auto-connect"))))
+    (append args (list "batch" "--json"))))
+
+(defun anvil-browser--cache-key (url selector &optional auth)
+  "Build the `anvil-state' key for URL + SELECTOR (+ optional AUTH).
+Serialized as `URL\\0SELECTOR\\0PROFILE\\0UA' so an empty
+selector produces a distinct key from any non-empty one, and
+authenticated fetches (non-nil profile / UA) do not collide with
+anonymous ones.  Session-name is intentionally excluded — it
+governs cookie persistence but two sessions with the same
+profile should hit the same cache entry."
+  (format "%s\0%s\0%s\0%s"
+          url
+          (or selector "")
+          (or (plist-get auth :profile) "")
+          (or (plist-get auth :user-agent) "")))
+
+(defun anvil-browser--cache-get (url selector &optional auth)
+  "Return the cached snapshot text for URL+SELECTOR (+ AUTH) or nil.
 Looks the entry up in `anvil-state' under the \"browser\"
 namespace.  TTL is enforced by `anvil-state' via lazy expiry."
   (when (and (numberp anvil-browser-cache-ttl-sec)
              (> anvil-browser-cache-ttl-sec 0))
-    (anvil-state-get (anvil-browser--cache-key url selector)
+    (anvil-state-get (anvil-browser--cache-key url selector auth)
                      :ns anvil-browser--state-ns)))
 
-(defun anvil-browser--cache-put (url selector snapshot)
-  "Store SNAPSHOT text for URL+SELECTOR with the configured TTL.
+(defun anvil-browser--cache-put (url selector snapshot &optional auth)
+  "Store SNAPSHOT text for URL+SELECTOR (+ AUTH) with the configured TTL.
 No-op when caching is disabled."
   (when (and (numberp anvil-browser-cache-ttl-sec)
              (> anvil-browser-cache-ttl-sec 0))
-    (anvil-state-set (anvil-browser--cache-key url selector)
+    (anvil-state-set (anvil-browser--cache-key url selector auth)
                      snapshot
                      :ns anvil-browser--state-ns
                      :ttl anvil-browser-cache-ttl-sec)))
@@ -220,13 +326,15 @@ JSON parsing."
    "\n*Process [^\n]* \\(finished\\|exited[^\n]*\\)\n*\\'"
    "" text))
 
-(defun anvil-browser--run-batch (commands &optional session)
+(defun anvil-browser--run-batch (commands &optional session auth)
   "Spawn agent-browser with COMMANDS piped as JSON on stdin.
 
 COMMANDS is a list of string lists, e.g.
   ((\"open\" \"https://example.com\") (\"snapshot\" \"-i\" \"-c\")).
 
-SESSION overrides `anvil-browser-session-name'.
+SESSION overrides `anvil-browser-session-name'.  AUTH is the
+resolved auth-config plist from `anvil-browser--resolve-auth-config'
+(nil ⇒ no preset, fall back to defcustoms only).
 
 Returns the parsed JSON output (a list of per-command result
 plists).  Non-zero exit is tolerated when the CLI still produced
@@ -237,8 +345,8 @@ per-entry `:success' via `anvil-browser--check-all-success' when
 they need strict behavior.  Errors on timeout or when no parseable
 JSON comes back."
   (let* ((cli (anvil-browser--cli-path))
-         (session-name (or session anvil-browser-session-name))
-         (args (list "--session-name" session-name "batch" "--json"))
+         (auth-or-default (or auth (anvil-browser--resolve-auth-config nil)))
+         (args (anvil-browser--build-cli-args auth-or-default session))
          (payload (anvil-browser--json-encode-commands commands))
          (stdout-buf (generate-new-buffer " *anvil-browser-stdout*"))
          (stderr-buf (generate-new-buffer " *anvil-browser-stderr*"))
@@ -361,7 +469,7 @@ Empty input returns the empty string."
 
 ;;;; --- MCP tool handlers --------------------------------------------------
 
-(defun anvil-browser--tool-fetch (url &optional selector session)
+(defun anvil-browser--tool-fetch (url &optional selector session preset)
   "Fetch URL and return a compact accessibility-tree snapshot.
 
 MCP Parameters:
@@ -372,6 +480,10 @@ MCP Parameters:
   session  - Optional --session-name override for persisting
              cookies / localStorage separately from the default
              session.
+  preset   - Optional auth preset name from
+             `anvil-browser-session-presets'.  Overrides the
+             global profile / user-agent / auto-connect
+             defcustoms for this call.
 
 Returns the accessibility tree text produced by
 `agent-browser snapshot -i -c'.  Same-URL calls within
@@ -381,7 +493,8 @@ in-memory cache.
 Token cost is typically 25x smaller than a raw DOM dump."
   (anvil-server-with-error-handling
    (let* ((sel (and (stringp selector) (not (string-empty-p selector)) selector))
-          (cached (anvil-browser--cache-get url sel))
+          (auth (anvil-browser--resolve-auth-config preset))
+          (cached (anvil-browser--cache-get url sel auth))
           (start (float-time)))
      (anvil-browser--metrics-bump :fetches)
      (if cached
@@ -395,10 +508,10 @@ Token cost is typically 25x smaller than a raw DOM dump."
                   (results (anvil-browser--check-all-success
                             (anvil-browser--run-batch
                              (list (list "open" url) snap-cmd)
-                             session)))
+                             session auth)))
                   (text (or (anvil-browser--last-snapshot results)
                             (error "anvil-browser: no snapshot in batch output"))))
-             (anvil-browser--cache-put url sel text)
+             (anvil-browser--cache-put url sel text auth)
              (anvil-browser--metrics-log
               url (round (* 1000 (- (float-time) start))) nil)
              text)
@@ -431,7 +544,7 @@ Each entry is one agent-browser batch command, e.g.
               cmd)
             parsed)))
 
-(defun anvil-browser--tool-interact (url actions &optional session)
+(defun anvil-browser--tool-interact (url actions &optional session preset)
   "Open URL, run each action in ACTIONS, and return the final snapshot.
 
 MCP Parameters:
@@ -441,6 +554,8 @@ MCP Parameters:
             Commands match the agent-browser CLI verbs
             (click / fill / press / eval / etc.).
   session - Optional --session-name override.
+  preset  - Optional auth preset name from
+            `anvil-browser-session-presets'.
 
 The implementation prepends an `open' and appends a final
 `snapshot -i -c' so the return value is always the post-action
@@ -450,12 +565,13 @@ tree.  All actions share one Chrome session to preserve DOM state."
           (batch (append (list (list "open" url))
                          parsed
                          (list '("snapshot" "-i" "-c"))))
+          (auth (anvil-browser--resolve-auth-config preset))
           (results (anvil-browser--check-all-success
-                    (anvil-browser--run-batch batch session))))
+                    (anvil-browser--run-batch batch session auth))))
      (or (anvil-browser--last-snapshot results)
          (error "anvil-browser: interact produced no snapshot")))))
 
-(defun anvil-browser--tool-capture (url &optional title tags session)
+(defun anvil-browser--tool-capture (url &optional title tags session preset)
   "Fetch URL, render `anvil-browser-capture-template', and save to
 `anvil-browser-capture-dir'.
 
@@ -467,10 +583,12 @@ MCP Parameters:
             words (\"ai automation\") or a ready-made org tag
             string (\":ai:automation:\").
   session - Optional --session-name override.
+  preset  - Optional auth preset name from
+            `anvil-browser-session-presets'.
 
 Returns the absolute path of the saved file."
   (anvil-server-with-error-handling
-   (let* ((snapshot (anvil-browser--tool-fetch url nil session))
+   (let* ((snapshot (anvil-browser--tool-fetch url nil session preset))
           (resolved-title (if (and (stringp title)
                                    (not (string-empty-p title)))
                               title
@@ -489,7 +607,7 @@ Returns the absolute path of the saved file."
          (write-region (point-min) (point-max) path nil 'silent)))
      path)))
 
-(defun anvil-browser--tool-screenshot (url &optional region session)
+(defun anvil-browser--tool-screenshot (url &optional region session preset)
   "Open URL and save a screenshot to a temp PNG file.
 
 MCP Parameters:
@@ -498,6 +616,8 @@ MCP Parameters:
             is scoped to that element (equivalent to
             `agent-browser screenshot SELECTOR PATH').
   session - Optional --session-name override.
+  preset  - Optional auth preset name from
+            `anvil-browser-session-presets'.
 
 Returns the absolute path of the PNG file.  Caller owns cleanup."
   (anvil-server-with-error-handling
@@ -508,10 +628,11 @@ Returns the absolute path of the PNG file.  Caller owns cleanup."
           (shot-cmd (if sel
                         (list "screenshot" sel out)
                       (list "screenshot" out)))
+          (auth (anvil-browser--resolve-auth-config preset))
           (results (anvil-browser--check-all-success
                     (anvil-browser--run-batch
                      (list (list "open" url) shot-cmd)
-                     session))))
+                     session auth))))
      (ignore results)
      out)))
 
@@ -559,6 +680,12 @@ in-memory fetch cache."
                    (or (ignore-errors (anvil-browser--cli-path))
                        "(not found)")))
     (princ (format "Session   : %s\n" anvil-browser-session-name))
+    (princ (format "Profile   : %s\n" (or anvil-browser-profile "(none)")))
+    (princ (format "User-Agent: %s\n" (or anvil-browser-user-agent "(none)")))
+    (princ (format "AutoConn  : %s\n" (if anvil-browser-auto-connect "on" "off")))
+    (princ (format "Presets   : %s\n"
+                   (or (mapconcat #'car anvil-browser-session-presets ", ")
+                       "(none)")))
     (princ (format "Cache TTL : %s sec  (entries: %d)\n"
                    anvil-browser-cache-ttl-sec
                    (anvil-browser--cache-count)))

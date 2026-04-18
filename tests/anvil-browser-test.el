@@ -24,6 +24,9 @@
 (defvar anvil-browser-test--last-session nil
   "Record of the last SESSION value passed to the stubbed runner.")
 
+(defvar anvil-browser-test--last-auth nil
+  "Record of the last AUTH plist passed to the stubbed runner.")
+
 (defun anvil-browser-test--stub-result-for (commands)
   "Produce a fake `agent-browser batch --json' result list for COMMANDS.
 Each entry mirrors the real CLI output shape — `:command',
@@ -55,6 +58,11 @@ do not leak between runs.  The stub records arguments in
   (declare (indent 0))
   `(let ((anvil-browser-test--last-commands nil)
          (anvil-browser-test--last-session nil)
+         (anvil-browser-test--last-auth nil)
+         (anvil-browser-user-agent nil)
+         (anvil-browser-profile nil)
+         (anvil-browser-auto-connect nil)
+         (anvil-browser-session-presets nil)
          (anvil-state-db-path (make-temp-file "anvil-browser-st-" nil ".db"))
          (anvil-state--db nil)
          (anvil-browser--metrics (list :fetches 0 :cache-hits 0
@@ -63,9 +71,10 @@ do not leak between runs.  The stub records arguments in
          (progn
            (anvil-state-enable)
            (cl-letf (((symbol-function 'anvil-browser--run-batch)
-                      (lambda (commands &optional session)
+                      (lambda (commands &optional session auth)
                         (setq anvil-browser-test--last-commands commands)
                         (setq anvil-browser-test--last-session session)
+                        (setq anvil-browser-test--last-auth auth)
                         (anvil-browser-test--stub-result-for commands)))
                      ((symbol-function 'anvil-browser--cli-path)
                       (lambda () "/stub/agent-browser")))
@@ -188,6 +197,91 @@ do not leak between runs.  The stub records arguments in
                   "%TITLE%|%DATE%|%URL%|%TAGS%|%CONTENT%|%OTHER%"
                   (list :title "A" :date "2026" :url "U"
                         :tags ":t:" :content "C")))))
+
+;;;; --- Phase A' auth primitives --------------------------------------------
+
+(ert-deftest anvil-browser-test-cli-args-user-agent ()
+  "`--user-agent' flag appears in CLI args when the defcustom is set."
+  (let ((anvil-browser-user-agent "Mozilla/5.0 (compatible; anvil-bot)")
+        (anvil-browser-profile nil)
+        (anvil-browser-auto-connect nil))
+    (let ((args (anvil-browser--build-cli-args
+                 (anvil-browser--resolve-auth-config nil)
+                 nil)))
+      (should (member "--user-agent" args))
+      (should (member "Mozilla/5.0 (compatible; anvil-bot)" args)))))
+
+(ert-deftest anvil-browser-test-cli-args-profile ()
+  "`--profile' flag appears in CLI args when the defcustom is set."
+  (let ((anvil-browser-user-agent nil)
+        (anvil-browser-profile "Default")
+        (anvil-browser-auto-connect nil))
+    (let ((args (anvil-browser--build-cli-args
+                 (anvil-browser--resolve-auth-config nil)
+                 nil)))
+      (should (member "--profile" args))
+      (should (member "Default" args)))))
+
+(ert-deftest anvil-browser-test-cli-args-auto-connect ()
+  "`--auto-connect' appears as a bare flag (no value) when enabled."
+  (let ((anvil-browser-user-agent nil)
+        (anvil-browser-profile nil)
+        (anvil-browser-auto-connect t))
+    (let ((args (anvil-browser--build-cli-args
+                 (anvil-browser--resolve-auth-config nil)
+                 nil)))
+      (should (member "--auto-connect" args))
+      ;; Immediately followed by "batch" not a value.
+      (let ((tail (member "--auto-connect" args)))
+        (should (equal "batch" (cadr tail)))))))
+
+(ert-deftest anvil-browser-test-preset-overrides-globals ()
+  "A preset plist overrides the corresponding global defcustoms."
+  (let ((anvil-browser-profile "GlobalProfile")
+        (anvil-browser-user-agent "GlobalUA")
+        (anvil-browser-auto-connect nil)
+        (anvil-browser-session-presets
+         '(("reddit" :profile "Default" :auto-connect t))))
+    (let ((args (anvil-browser--build-cli-args
+                 (anvil-browser--resolve-auth-config "reddit")
+                 nil)))
+      ;; Preset wins.
+      (should (member "Default" args))
+      (should-not (member "GlobalProfile" args))
+      (should (member "--auto-connect" args))
+      ;; Unspecified key falls back to global.
+      (should (member "GlobalUA" args)))))
+
+(ert-deftest anvil-browser-test-preset-unknown-errors ()
+  "Unknown preset name signals `user-error'."
+  (let ((anvil-browser-session-presets '(("reddit" :profile "Default"))))
+    (should-error
+     (anvil-browser--resolve-auth-config "no-such")
+     :type 'user-error)))
+
+(ert-deftest anvil-browser-test-cache-key-includes-auth ()
+  "Cache key differentiates identical URL+SELECTOR under distinct auth."
+  (let* ((auth-a (list :profile "A" :user-agent "UA1"))
+         (auth-b (list :profile "B" :user-agent "UA1"))
+         (auth-c (list :profile "A" :user-agent "UA2"))
+         (auth-nil nil))
+    (should-not
+     (equal (anvil-browser--cache-key "https://x" nil auth-a)
+            (anvil-browser--cache-key "https://x" nil auth-b)))
+    (should-not
+     (equal (anvil-browser--cache-key "https://x" nil auth-a)
+            (anvil-browser--cache-key "https://x" nil auth-c)))
+    (should-not
+     (equal (anvil-browser--cache-key "https://x" nil auth-a)
+            (anvil-browser--cache-key "https://x" nil auth-nil)))))
+
+(ert-deftest anvil-browser-test-fetch-preset-forwarded-to-runner ()
+  "`browser-fetch' passes the resolved auth plist through to the runner."
+  (anvil-browser-test--with-stub
+    (setq anvil-browser-session-presets '(("work" :profile "Work")))
+    (anvil-browser--tool-fetch "https://example.com" nil nil "work")
+    (should (equal "Work"
+                   (plist-get anvil-browser-test--last-auth :profile)))))
 
 ;;;; --- live smoke test ----------------------------------------------------
 
