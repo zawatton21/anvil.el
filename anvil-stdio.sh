@@ -178,10 +178,12 @@ while read -r line; do
 	# loses its `-print-nonl ' prefix and emacsclient prints it as
 	#   *ERROR*: Unknown message: <tail>
 	# interleaved with the legitimate base64 payload.  Strip those
-	# injection markers and rejoin so `base64 -d' sees clean input.
+	# injection markers AND the trailing `\r' (MSYS emits CRLF per
+	# frame, and GNU `base64 -d' silently truncates at invalid chars)
+	# then rejoin so `base64 -d' sees clean single-line input.
 	# (No-op on Linux/macOS where one frame fits in one read.)
 	base64_response=$(printf '%s' "$base64_response" \
-		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); print}')
+		| awk 'BEGIN{ORS=""} {sub(/^\*ERROR\*: Unknown message: /, ""); sub(/\r$/, ""); print}')
 
 	# Decode the base64 content
 	formatted_response=$(echo -n "$base64_response" | base64 -d)
