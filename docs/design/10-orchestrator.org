@@ -1,0 +1,686 @@
+#+title: AI CLI Orchestrator — Multi-Provider Parallel Task Dispatch for PDCA Loops
+#+date: 2026-04-18
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+~APPROVED~ (2026-04-18) — Review Questions Q1-Q12 すべて resolved
+(Q4/Q7 は subscription 前提で調整)。Phase 1a 着手可能。anvil-http
+(Doc 09) の後に続く上位レイヤー。
+
+* Goal
+
+複数の agentic AI CLI (claude / aider / gemini / codex / ollama) を
+**並列サブプロセス** として spawn し、親セッション (対話中の Claude Code)
+は「task-id と最終サマリ」だけ見て PDCA を回す層を提供する。
+
+ユーザーの狙い (2026-04-18 対話より):
+
+1. **親の context 純度** — 細かい task 毎の prompt / intermediate output が
+   対話中の Claude に積もらない。20 サブタスクでも親は "status: done"
+   レベルのみ消費
+2. **PDCA 高速化** — Plan → N 並列 Execute → ユーザーが統合確認 → 次 Plan
+   のループを、親セッションを長時間 hot に保たずに回す
+3. **cron / 自動化** — ユーザーが Claude を閉じても走る、夜間 batch 可
+4. **per-task CLAUDE.md** — 「最小時間で完了」を system prompt に注入し、
+   各サブ agent が無駄な探索を省く
+5. **multi-provider** — 難易度に応じて cheap model (Gemini Flash / Haiku
+   / Ollama) に route、Anthropic rate limit も回避
+
+** Agent tool との位置付け
+
+Claude の built-in *Task* (Agent) tool は既に sub-agent 並列 dispatch を
+提供しているが、以下の軸で anvil-orchestrator が足りない穴を埋める:
+
+| 軸                                | Agent tool                  | anvil-orchestrator            |
+|-----------------------------------+-----------------------------+-------------------------------|
+| 並列度                            | 1 message 内の batch call   | pool size 可変、queue あり    |
+| 親 context 消費                   | prompt + summary が残る     | task-id のみ                  |
+| 親セッション要否                  | 必要                        | 不要 (cron / fire-and-forget) |
+| provider 選択                     | Claude only                 | claude / aider / gemini / 他  |
+| per-task CLAUDE.md                | 親 dir を継承               | 任意 (worktree / scratch dir) |
+| budget cap                        | 無し                        | =--max-budget-usd= per task   |
+| 実装コスト                        | 0 (既存)                    | 中                            |
+| 実機 integration                  | 完成                        | 構築要                        |
+
+両者は排他でなく *補完*: 素早い in-session 並列は Agent、長時間 /
+親 context を汚したくない / automation は anvil-orchestrator。
+
+* Problem
+
+** 現状の限界
+
+対話中の Claude Code から 20 個の独立 task を実行する現実的選択肢:
+
+1. *直列 tool call* — 200 秒 @ 10 秒/task、context に全 20 task の prompt
+   + result が積層
+2. *Agent tool の batch* — 20 並列 ~ 10-20 秒、context に 20 × (prompt +
+   summary) が残留。1 summary ~1KB なら 20 × 1KB = 20KB 親消費
+3. *手動で別端末に claude CLI 起動 × 20* — OS level で完全並列・context
+   隔離、だが Emacs と統合されておらず status/集約/キャンセルがバラバラ
+
+3 が「実現してほしい UX」だが、手動運用は現実的でない。anvil が
+pool / state / dashboard / 集約 を面倒みる層として欲しい。
+
+** multi-provider への需要
+
+2026-04 時点で安価な選択肢が増えた:
+
+- Gemini 2.5 Flash: 入力 1M tokens 対応、Claude Opus の ~5% 価格
+- Ollama ローカル: 完全無料 (電気代のみ)、 privacy-safe
+- Haiku: 簡単な抽出は十分
+- OpenAI GPT-5-mini: 構造化 output 得意
+
+全 task を Claude Opus で処理するのは経済的に非合理。task 難易度で
+provider を動的に切替える仕組みが要る。
+
+** output 非対称性
+
+各 CLI の stdout format が異なる:
+
+- =claude --output-format stream-json=: NDJSON (行毎 JSON)
+- =aider=: plain text + diff + commit message
+- =gemini -p=: markdown
+- =ollama run=: plain text
+
+provider 毎に parse / normalize する adapter 層が必須。Day 1 から抽象
+しないと後付けで泥臭くなる (Doc 07 browser で同じ反省あり)。
+
+* Proposed Design
+
+** Module boundary
+
+- 新規ファイル: =anvil-orchestrator.el=
+- 依存 (hard):
+  - =anvil-server= — MCP tool 登録
+  - =anvil-state= — task state / history の永続化
+- 依存 (soft):
+  - =anvil-worker= — 参考 pattern (3-lane pool / UI)
+  - =anvil-cron= — scheduled dispatch
+  - =anvil-git= — worktree helpers (Phase 1b+)
+- 公開 MCP tool: server-id は =emacs-eval= に合流
+
+** Provider abstraction (Day 1 必須)
+
+Provider は plist descriptor として登録する:
+
+#+begin_src elisp
+(anvil-orchestrator-register-provider
+ 'claude
+ :cli "claude"
+ :version-check (lambda () ...)                ; executable-find 等
+ :build-cmd #'anvil-orchestrator--claude-build-cmd
+ :parse-output #'anvil-orchestrator--claude-parse-stream-json
+ :supports-tool-use t
+ :supports-worktree t                          ; --worktree <name>
+ :supports-budget t                            ; --max-budget-usd
+ :supports-system-prompt-append t              ; --append-system-prompt
+ :default-model "sonnet"
+ :cost-estimator #'anvil-orchestrator--claude-cost)  ; usage JSON → USD
+#+end_src
+
+Phase 1 で提供する built-in provider:
+
+| id        | CLI          | tool use | worktree | budget | system prompt append | 備考                      |
+|-----------+--------------+----------+----------+--------+----------------------+---------------------------|
+| claude    | =claude=     | ○        | ○ native | ○ native | ○                    | Phase 1a 本命             |
+| aider     | =aider=      | ○        | ○ native | △ 推定  | △ prompt prepend    | Phase 2: multi-vendor 窓口 |
+| gemini    | =gemini=     | ○ (CLI次第) | anvil側 | × 推定  | △                    | Phase 3+                  |
+| ollama    | =ollama=     | × (plain) | anvil側 | 無料    | ○ =SYSTEM=           | Phase 3+: 無料ローカル     |
+| codex     | =codex=      | TBD      | TBD      | TBD    | TBD                  | Phase 4+ (要調査)         |
+
+Provider が sub-feature を持たない時は anvil 側で代替:
+- =worktree= 無し → anvil 側で =git worktree add= して =:cwd= 設定
+- =budget= 無し → anvil 側で wall-clock timeout + 推定 cost で cut off
+
+** Public Elisp API
+
+#+begin_src elisp
+;; 設定
+;; 主要な上限 — MAX plan subscription ユーザー想定で concurrency /
+;; timeout / batch size を primary limit、金額 cap は backstop 扱い
+(defcustom anvil-orchestrator-concurrency 3
+  "Global cap on simultaneously running tasks.
+MAX plan の 5-hour cap を守るため既定 3。夜間 batch 等で上げる時は
+明示的に let-bind or setq すること。" :type 'integer)
+
+(defcustom anvil-orchestrator-per-provider-concurrency
+  '((claude . 3) (gemini . 4) (ollama . 2) (aider . 2))
+  "Per-provider concurrency cap alist."
+  :type '(alist :key-type symbol :value-type integer))
+
+(defcustom anvil-orchestrator-timeout-sec-default 600
+  "Per-task wall-clock cap (seconds).  10 分を超える task は overflow
+の兆候と捉え自動 fail させる。" :type 'integer)
+
+(defcustom anvil-orchestrator-batch-max-tasks 20
+  "Maximum number of tasks accepted in a single submit batch.
+MAX plan ユーザーの保護上限。large batch は明示的に上げる前提。"
+  :type 'integer)
+
+(defcustom anvil-orchestrator-budget-usd-default 1.00
+  "Per-task `--max-budget-usd' backstop (claude native or emulated).
+API key providers では hard cap、subscription では honor されるか
+不明だが失敗しても無害な最終砦として保持。" :type 'number)
+
+(defcustom anvil-orchestrator-batch-budget-usd-total 10.00
+  "Hard cap on cumulative per-batch budget (sum of per-task caps).
+超過する submit は `user-error' で refuse。" :type 'number)
+
+(defcustom anvil-orchestrator-work-dir
+  (expand-file-name "anvil-orchestrator" user-emacs-directory)
+  "Parent dir for per-task scratch / worktree / log files.")
+
+(defcustom anvil-orchestrator-system-prompt-append
+  "You are running as a sub-task inside anvil-orchestrator.
+Complete the requested work with the minimum number of tool calls.
+Produce a short final summary (<= 300 chars) of what you did and
+the git SHA of any commit you made, then stop."
+  "Default --append-system-prompt injected into every sub-task.
+Individual tasks can override via :system-prompt-append."
+  :type 'string)
+
+;; 中核 API
+(anvil-orchestrator-submit TASKS)
+  ;; TASKS: list of task plists. Each plist:
+  ;;   :name            STRING   (required, unique within batch)
+  ;;   :provider        SYMBOL   (required, e.g. 'claude)
+  ;;   :model           STRING   (optional, per-provider default)
+  ;;   :prompt          STRING   (required, the user prompt)
+  ;;   :cwd             PATH     (optional, default: new worktree / scratch)
+  ;;   :env             ALIST    (optional, extra env vars)
+  ;;   :allowed-tools   STRING   (claude-only: --allowedTools value)
+  ;;   :permission-mode SYMBOL   (claude-only: acceptEdits / plan / ...)
+  ;;   :budget-usd      NUMBER   (override default)
+  ;;   :timeout-sec     INTEGER  (wall-clock cap, default 600)
+  ;;   :system-prompt-append STRING (override global default)
+  ;;   :depends-on      LIST     (other :name within batch — DAG, Phase 1b)
+  ;;   :on-complete     FUNCTION (optional, (lambda (result) ...))
+  ;;
+  ;; Returns: batch-id UUID
+  ;;   Tasks queue up; run asynchronously.  `anvil-orchestrator-status'
+  ;;   and `-collect' poll.
+
+(anvil-orchestrator-status BATCH-ID-OR-TASK-ID)
+  ;; Returns: plist — for batch: (:total N :done N :running N :failed N
+  ;;                              :tasks (...))
+  ;;                   for task:  (:name :status :elapsed-ms :cost-usd
+  ;;                               :summary :commit-sha :error)
+  ;; status ∈ 'queued / 'running / 'done / 'failed / 'cancelled
+
+(anvil-orchestrator-collect BATCH-ID &key wait)
+  ;; Returns the full result plist list.  :wait t blocks until all
+  ;; tasks are done or failed (with spinner-style metrics-log updates).
+
+(anvil-orchestrator-cancel TASK-ID)
+  ;; SIGTERM then SIGKILL after 2s grace.  Returns t on success.
+
+(anvil-orchestrator-retry TASK-ID)
+  ;; Re-spawn with same plist.  Useful after transient failure.
+
+(anvil-orchestrator-dashboard)
+  ;; `tabulated-list-mode' UI (兄弟: anvil-worker dashboard)
+#+end_src
+
+** Public MCP tools
+
+| id                    | 引数                                    | 戻り値                      | 備考                             |
+|-----------------------+-----------------------------------------+-----------------------------+----------------------------------|
+| ~orchestrator-submit~ | tasks (JSON array)                      | batch_id (uuid)             | fire-and-forget、非 blocking     |
+| ~orchestrator-status~ | id (batch or task)                      | status plist                | 軽量 polling 用                  |
+| ~orchestrator-collect~| batch_id, wait?                         | results (array)             | wait=true で同期取得             |
+| ~orchestrator-cancel~ | task_id                                 | ok (bool)                   |                                   |
+| ~orchestrator-retry~  | task_id                                 | new_task_id                 |                                   |
+
+全 tool は =summary= と =commit-sha= のみを既定で返す (=body_mode 'full= で
+stdout 全文も開く — Phase 1c、Doc 09 の body-overflow と同形)。
+
+** Task lifecycle (state machine)
+
+#+begin_example
+  submit
+    ↓
+  [queued] ─────── cancel ──→ [cancelled]
+    ↓
+  [running] ───── timeout ──→ [failed: timeout]
+    ├─ exit 0 ──→ [done]
+    └─ exit ≠0 ──→ [failed: exit]
+#+end_example
+
+各遷移で anvil-state ns="orchestrator" に以下を書き込み (daemon 再起動で
+復元可能):
+
+#+begin_src elisp
+(:id UUID
+ :batch-id UUID
+ :name STR
+ :provider SYM
+ :model STR
+ :prompt STR            ; 大きい場合は path に回避 (Phase 1c)
+ :cwd PATH
+ :status SYM            ; queued/running/done/failed/cancelled
+ :submitted-at FLOAT-TIME
+ :started-at FLOAT-TIME
+ :finished-at FLOAT-TIME
+ :elapsed-ms INT
+ :exit-code INT
+ :stdout-path PATH      ; disk 書き出し、親は読まない限り見ない
+ :stderr-path PATH
+ :summary STR           ; <= 300 chars、最終 message
+ :commit-sha STR-OR-NIL ; worktree 内で commit した時
+ :cost-usd FLOAT
+ :cost-tokens PLIST     ; (:input N :output N :cache-read N)
+ :error STR-OR-NIL)
+#+end_src
+
+** Pool manager
+
+anvil-worker の 3-lane pool (memory
+=project_anvil_worker_phase1.md=) に酷似するが、**run する物が外部 CLI
+subprocess** である点が違う:
+
+- 全 provider 共通の global cap (=anvil-orchestrator-concurrency=)
+- provider 別 cap (=...-per-provider-concurrency=)
+- queue: FIFO、depends-on が満たされた task から pop
+- spawn: =make-process= (not synchronous) + sentinel + stdout/stderr を
+  disk path にリダイレクト (親 Emacs buffer を肥大させない)
+- exit 時: parse-output で summary / cost / commit-sha 抽出、state 更新
+
+1 task = 1 subprocess。pool を持つのではなく on-demand spawn (Claude CLI
+は各呼び出しで context を cold start するので pooling しても speed-up
+しない、memory =feedback_subprocess_tangle_pattern.md= と同原理)。
+
+** Worktree 隔離 (Phase 1b で強化)
+
+複数 task が同一 repo を同時触ると merge conflict 地獄。既定で =:cwd=
+が repo 内なら自動で =git worktree add= する:
+
+- claude native: =--worktree <task-name>= 使用、CLI が面倒見る
+- aider native: 同様
+- 他: anvil 側で =git worktree add ../.anvil-orchestrator/<uuid> HEAD=
+  → task 完了後に user review → manual merge (Phase 1b では auto-merge
+  しない、review は人間の責務)
+
+=:cwd= が明示された場合は worktree 作らず、そのまま使う (user 責務)。
+
+** Budget / cost tracking (subscription 前提)
+
+anvil の主要利用者は Claude MAX plan ($200/mo) subscription の想定。
+この前提で実制限は:
+
+- *primary limit*: concurrency × timeout × batch size (= MAX plan の
+  5-hour window 消費量)
+- *secondary limit*: =--max-budget-usd= per task / batch 合計 (API key
+  providers では hard cap、subscription では honor 不定だが backstop)
+
+concurrency=3 × timeout=10min × batch=20 = 最悪 67 分実行 ≈ MAX plan
+5h window の 22% 消費想定。安全ライン。
+
+cost tracking:
+1. submit 時: 推定モデル価格 × prompt 文字数で粗い推定、batch 合計が
+   =anvil-orchestrator-batch-budget-usd-total= (既定 $10) 超なら refuse
+2. wall-clock timeout で hard cut (primary defense)
+3. claude native =--max-budget-usd= を task の =:budget-usd= で指定
+   (secondary defense)
+4. exit 後 parse-output で actual cost を抽出 (stream-json の usage
+   blocks)、履歴として state に蓄積
+
+** CLAUDE.md 戦略 (per-task context)
+
+ユーザー要望の「最小時間で完了」directive は 3 通り実装できる:
+
+*** 案 A: =--append-system-prompt= (既定採用)
+
+=anvil-orchestrator-system-prompt-append= を全 task に inject。
+完成された既定値は上の defcustom 参照。provider が =-system-prompt-append=
+をサポートしない場合は user prompt の先頭に prepend (aider など)。
+
+*** 案 B: per-cwd CLAUDE.md
+
+task の cwd に scratch CLAUDE.md を書き出し、そこに directive を置く。
+claude CLI は cwd + 上位を scan して読むため自然に反映される。
+
+*案 B の問題点*: user の通常 CLAUDE.md も同時に読み込まれる
+(cwd が repo 内の場合)。directive が矛盾する可能性。
+
+*** 案 C: =--bare= で CLAUDE.md 完全無効化 + =--append-system-prompt=
+
+Most hermetic。user CLAUDE.md を一切読まない、汚れた親 state の影響ゼロ。
+ただし anvil/Cowork 固有 convention (点検トラッカー等) が効かなくなる
+→ task が「ゼロから考える」ので効率落ちる。
+
+**既定は案 A**。per-task で =:bare t= を指定した時のみ案 C に切替。
+
+** Dashboard UI
+
+=M-x anvil-orchestrator-dashboard= で tabulated-list:
+
+#+begin_example
+ID        Batch  Prov    Model    Status    Elap   Cost    CWD              Summary
+abc123..  b1     claude  opus     running   23s    $0.04   anvil/wt-abc...  (in progress)
+def456..  b1     gemini  flash    done       8s    $0.00   scratch/...      Added logging
+ghi789..  b1     claude  haiku    queued     —     —       —                (pending)
+#+end_example
+
+keys: RET 詳細 (stdout/stderr buffer), k cancel, r retry, d dismiss,
+g refresh, b 切替 batch フィルタ。
+
+** 親セッションからの利用パターン (PDCA loop)
+
+#+begin_src
+User (対話中):
+  "以下 5 箇所に同じ感じの docstring を足して。並列で。"
+  → Claude (parent):
+      orchestrator-submit [5 tasks, claude-haiku, :worktree t]
+      return batch_id=b1
+  → "5 task を dispatch しました。~2 分で集約報告します。"
+
+(User は他の作業に移る or Claude セッション閉じる)
+
+Claude (parent): orchestrator-status b1  → 5/5 done
+  → orchestrator-collect b1 --wait false  → 5 summaries
+  → "5/5 完了、全て成功。各 worktree の commit SHA は ..."
+
+User:
+  "3 番目だけ違うアプローチで。abc... の worktree を残して他は merge。"
+#+end_src
+
+親 context に残るのは 5 × (task-id + 300-char summary) = ~2KB 程度。
+同じ work を Agent tool で inline 並列化すると親に 5 × full tool
+output (~5-30KB 程度) が残る。
+
+* Efficiency levers (Phase 1 MVP で入れる)
+
+Doc 09 と同様、効率レバーを Day 1 から組み込む。
+
+*** Lever 1: parent context purity via summary-only default
+
+=orchestrator-collect= は既定で =:summary :commit-sha :status :cost-usd= の
+軽量 plist のみ返す。full stdout は =:body_mode 'full= opt-in。
+期待 token 削減: 20 tasks で parent 30-100KB → 2-3KB (~95%)。
+
+*** Lever 2: provider routing による cost 最適化
+
+task の "cognitive load" を provider/model にマップする helper:
+
+#+begin_src elisp
+(defcustom anvil-orchestrator-auto-route t
+  "When t, `submit' picks provider/model by task heuristics." :type 'boolean)
+
+(defun anvil-orchestrator--auto-route (prompt)
+  "Return (provider . model) for PROMPT.
+Heuristics:
+- prompt < 200 chars and no tool-use verbs → haiku / gemini-flash
+- has git / refactor / file edit → claude sonnet
+- has 'reason / design / propose' → claude opus
+- numerical / extraction only → haiku or ollama qwen")
+#+end_src
+
+期待 cost 削減: 簡単 task を haiku/flash/ollama に逃すと、Opus 全開
+比 50-90% 削減。
+
+*** Lever 3: batch budget cap
+
+=:budget-batch-usd= で batch 全体の hard cap。超過予測で dry-run 拒否
+→ user に見直し要求。20 tasks × $0.10 想定で $2.00 を上限、実測
+$0.50 で収まれば OK。
+
+*** Lever 4: worktree isolation で merge conflict ゼロ
+
+Phase 1b で native =--worktree= 利用。各 task が別 worktree で commit、
+user が手動 review + merge する。N 並列で同 repo を触っても安全。
+
+*** Lever 5: fire-and-forget + cron integration (Phase 1b+)
+
+submit 後、親 Claude セッションを閉じても走る。anvil-cron から夜間
+batch dispatch 可。実機 integration のコアは:
+=(anvil-cron-schedule "daily-00:00" (lambda () (anvil-orchestrator-submit ...)))=
+
+** 効率の合計目安
+
+| シナリオ                             | 従来                | orchestrator          | 削減 |
+|--------------------------------------+---------------------+-----------------------+------|
+| 親 context に残る 20 task 情報       | 30-100KB (Agent)    | 2-3KB (summary only)  | ~95% |
+| 20 task の挙動変換 latency           | ~300s (直列)        | ~40s (pool 4 並列)    | ~87% |
+| 簡単 task 20 件の cost               | $0.80 (Opus 一律)   | $0.10 (Flash routing) | ~87% |
+| merge conflict の頻度                | 3-5 / batch (同 cwd) | 0 (worktree 隔離)     | 100% |
+| Claude セッション閉じた後の進行      | 止まる              | 継続 (cron)           | ∞    |
+
+* Non-goals (Phase 1)
+
+- **cross-model consensus / voting** — 同 task を 2+ provider で叩いて
+  diff 採用、は Phase 4。MVP の complexity を抑える
+- **自動 merge** — worktree の commit を master に自動 ff-merge、は入れない。
+  user review が正
+- **web UI / dashboard server** — Emacs tabulated-list で十分。web は
+  overkill
+- **Anthropic 特有の feature (vision / PDF / citations)** — 各 provider
+  native flag を素通しするだけ、anvil 側で統一 UI は作らない
+- **MCP server 配下の sub-MCP server** — Emacs を MCP server として別
+  Emacs に expose、は混乱の元。外部 MCP server を sub-task が *使う* のは OK
+- **task 間 prompt templating / variable interpolation** — template engine
+  は init.org 層で。anvil は string そのまま渡すのみ
+- **failure auto-retry** — 1 回 fail したら user に見せる。自動 retry は
+  quiet failure の温床
+- **cost per-token 精密計算** — provider 公式 pricing API を叩くのは
+  Phase 3+。MVP は docstring に静的価格表を持つ
+
+* Migration / Backward Compatibility
+
+- 新規モジュール。既存 tool 挙動変更なし
+- =anvil-optional-modules= に =orchestrator= を追加、=anvil-enable= で有効化
+- Phase 1 は claude CLI hard 依存、他 provider は Phase 2+ で optional
+
+* Risks
+
+- *API rate limit*
+  → per-provider concurrency cap を低め (3-4) で始める。claude native の
+    =--fallback-model= を活用
+- *billing 逃走*
+  → =:budget-usd= per task + batch total cap の 2 段階。dry-run で推定
+    cost 表示してから submit
+- *git worktree が肥大*
+  → =anvil-orchestrator-work-dir= 下に一括、完了 batch は =-gc= サブ
+    コマンドで勝仕事 (Phase 1b+)
+- *sub-task が親 repo に leak*
+  → worktree 隔離を既定 on、=:cwd= 明示時のみ opt-out
+- *stdout/stderr 爆量*
+  → disk path リダイレクト。親 Emacs buffer は開かない
+- *claude CLI の flag 変更*
+  → provider descriptor の =build-cmd= を 1 箇所に寄せる。Claude 公式の
+    API 安定性に依存、breaking change 時は anvil の bump で対応
+- *task が途中で人間の判断を求める (permission prompt)*
+  → =--permission-mode acceptEdits= 既定、=:permission-mode 'plan= で
+    dry-run、=bypassPermissions= は明示 opt-in のみ
+- *親子間の deadlock*
+  → 親 Claude が submit した batch を Claude 自身が待つと deadlock 可能性。
+    Q11 (下記 Review Question) で決定。既定案: submit は常に async、
+    collect --wait は main thread block するので親が call しない運用
+
+* Platform Notes
+
+** Windows
+
+- =claude.exe= / =aider.exe= が PATH 上にあれば動く。MSYS 側の
+  =which claude= が不安定な事があるので =executable-find= で解決
+- worktree path の native vs MSYS 変換は anvil-git (既存) に任せる
+- =temporary-file-directory= への stdout/stderr リダイレクトは native 側
+  =%TEMP%= で問題なし
+
+** macOS / Linux
+
+- 特記なし
+
+* Success Metrics
+
+軸 1: *機能* (単発 + 並列)
+
+- claude CLI 1 task を submit → status → collect まで完走
+- 5 task batch を provider=claude で並列、4 並列で 5 完走
+- 5 task batch を aider middleware 経由で多 provider ミックス (Phase 2)
+
+軸 2: *効率 (本 doc の目玉)*
+
+- 20 task batch で親 context に残る情報 **2-3KB 以下** (summary-only)
+- 従来 Agent tool 比 親 context **90%+ 削減**
+- provider routing で 20 簡単 task の cost **50%+ 削減** (Opus 固定比)
+
+軸 3: *実用性*
+
+- Claude CLI セッションを閉じて 1h 後、=anvil-orchestrator-status= で
+  batch が done になっていること (cron / fire-and-forget 動作確認)
+- 20 並列で merge conflict ゼロ (worktree 隔離検証)
+
+* Review Questions (RESOLVED 2026-04-18)
+
+初回レビューで確定した項目。Q4 / Q7 は MAX plan subscription 前提で
+調整、他は既定案採用。
+
+- [X] *Q1: provider 抽象の適用範囲 (Phase 1)* →
+  **Claude のみ native 対応、adapter I/F は defstruct で定義だけ
+  しておく**。Phase 2 で aider middleware 追加 → Phase 3+ で gemini /
+  ollama 個別 adapter
+
+- [X] *Q2: task identity — UUID / user-name* →
+  **UUID 内部用、user-name は表示・参照用のみ**。=:name= 必須
+  (同 batch 内 unique)、=:id= は自動生成
+
+- [X] *Q3: worktree isolation 既定 on/off* →
+  **on** (=:cwd= が repo 内かつ未指定 and provider native
+  worktree 対応)。=:no-worktree t= で opt-out
+
+- [X] *Q4: budget / concurrency モデル (改訂)* →
+  **MAX plan subscription 前提で primary limit は concurrency ×
+  timeout × batch size、金額 cap は backstop**。
+
+  既定値:
+  - =anvil-orchestrator-concurrency= = 3
+  - =anvil-orchestrator-timeout-sec-default= = 600 (10 min)
+  - =anvil-orchestrator-batch-max-tasks= = 20
+  - =anvil-orchestrator-budget-usd-default= = $1.00 (per-task backstop)
+  - =anvil-orchestrator-batch-budget-usd-total= = $10.00 (batch 合計 backstop)
+
+  concurrency=3 × timeout=10m × batch=20 = 最悪 67 分 ≈ MAX plan 5h
+  window の 22%。夜間大規模 batch は明示的 override 前提
+
+- [X] *Q5: CLAUDE.md 戦略 (案 A / B / C)* →
+  **案 A — =--append-system-prompt= で全 task 共通 directive**。
+  CLAUDE.md は CWD scope で自然に分離される: anvil.el dev は
+  =~/Notes/dev/anvil.el/= CWD で Cowork CLAUDE.md に届かない、
+  Cowork 業務は =~/Cowork/Notes/...= CWD で自然に読まれる。
+  =:bare t= で案 C 切替可
+
+- [X] *Q6: 親セッションからの blocking collect (=--wait t=)* →
+  **許可するが docstring で避けるよう案内**。親が block すると
+  user が他 task に移れない。fire-and-forget 推奨
+
+- [X] *Q7: 失敗 task の retry (改訂 — 自動+手動ハイブリッド)* →
+  **429 / 5xx / network glitch は自動 retry (既定 2 回、exponential
+  backoff)、code error / 4xx / timeout は手動のみ**。
+
+  新規 defcustom:
+  - =anvil-orchestrator-auto-retry-on= = '(429 500 502 503 504)
+    (HTTP status or symbol 'network)
+  - =anvil-orchestrator-auto-retry-max= = 2
+
+  per-task =:auto-retry nil= で opt-out。auto-retry 尽きても
+  =M-x orchestrator-retry TASK-ID= でいつでも手動再開可
+
+- [X] *Q8: task 間 DAG (depends-on) の Phase* →
+  **Phase 1b**。Phase 1a は flat batch のみ (並列独立 task)
+
+- [X] *Q9: stdout / stderr の既定 size cap* →
+  **task あたり 1MB、超えたら tail 256KB + head 256KB を保持、
+  中抜き**。disk path は生データ保存、= anvil-http overflow と同設計
+
+- [X] *Q10: anvil-cron 連携の Phase* →
+  **Phase 2**。anvil-cron + orchestrator を組み合わせるサンプル
+  1 つ =examples/nightly-batch.org= で示す
+
+- [X] *Q11: 親 Claude が自分を submit → 無限ループ防衛* →
+  **sub-task の =ANVIL_IN_ORCHESTRATOR=1= env を立て、再 submit
+  検知したら refuse**。深さ 1 に制限
+
+- [X] *Q12: =--bare= mode で MCP server / anvil tools は使えるか* →
+  **使えない。=--bare= の本旨は "軽量 headless"**。anvil tools
+  を使わせたい sub-task は non-bare + =--mcp-config= で明示 subset 渡す
+
+* Phase 分解
+
+Phase 1 は 3 sub-phase に分割。Doc 09 同様 1 PR = 1 sub-phase 粒度。
+
+| Phase | 内容                                                  | 依存            | 工数 |
+|-------+-------------------------------------------------------+-----------------+------|
+| 1a    | claude provider + flat batch + dashboard + state 永続 | anvil-state     | 大   |
+| 1b    | worktree 隔離 + depends-on DAG + stdout overflow      | 1a, anvil-git   | 中   |
+| 2     | aider middleware (multi-vendor 経路 1 本で)           | 1b              | 中   |
+| 2b    | anvil-cron 連携 + example                             | 2, anvil-cron   | 小   |
+| 3     | gemini native adapter                                 | 2               | 中   |
+| 3b    | ollama native adapter (無料ローカル)                  | 3               | 中   |
+| 4     | cross-model consensus (同 task を 2 provider で diff)  | 3               | 中   |
+
+Phase 1a 単体で「Claude CLI ユーザーが Emacs から多並列 dispatch」の
+価値が届く。multi-vendor は Phase 2 (aider) で一気に解決。
+
+* Implementation Plan (sub-phase 別)
+
+** Phase 1a — claude-only MVP (所要 5-7 日)
+
+1. =anvil-orchestrator.el= スケルトン + provider defstruct + claude provider
+   registration (executable-find ベース)
+2. =anvil-orchestrator--spawn= (=make-process= + sentinel + stream-json
+   output path リダイレクト)
+3. =anvil-orchestrator--claude-parse-stream-json= (最終 message + usage +
+   cost 抽出)
+4. =anvil-orchestrator-submit= + internal queue + pool
+   (=anvil-orchestrator-concurrency=)
+5. =anvil-orchestrator-status= / =-collect= / =-cancel= / =-retry=
+6. anvil-state ns="orchestrator" persist、daemon 再起動跨ぎで status 復元
+7. MCP tool 4 本登録 (submit / status / collect / cancel)
+8. =M-x anvil-orchestrator-dashboard= (tabulated-list)
+9. ERT 12-16 tests (mock claude via dummy CLI script、live 1 本 skip-unless
+   =ANVIL_ALLOW_LIVE=)
+10. README / docstring / merge + tag
+
+** Phase 1b — worktree / DAG / overflow (所要 3-4 日)
+
+1. worktree 自動作成 (claude native =--worktree= / anvil-git fallback)
+2. =:depends-on= DAG 評価、topological queue
+3. stdout/stderr overflow (Doc 09 と同 pattern)
+4. ERT +6
+
+** Phase 2 — aider middleware (所要 2-3 日)
+
+1. aider provider descriptor (=aider --model <vendor/model> --message ...=)
+2. output parser (diff + commit + summary)
+3. test against OpenAI/Gemini/Claude 3 provider via aider
+
+** Phase 2b — anvil-cron 連携 (所要 1-2 日)
+
+1. =examples/nightly-orchestrator.org= — 夜間 batch 発火の完全例
+2. anvil-cron hook に orchestrator dispatch を書けるか確認
+
+** Phase 3 / 3b / 4 — 後続
+
+別 doc or 本 doc 更新で。
+
+合計 Phase 1a-2b で 11-16 日目安。
+
+* References
+
+- Doc 03 offload framework: [[file:03-offload-framework.org][03-offload-framework.org]]
+  (subprocess spawn + sentinel pattern)
+- Doc 01 worker pool: [[file:01-worker-pool-v2.org][01-worker-pool-v2.org]]
+  (3-lane pool + classifier + tabulated-list UI — 強い参考 pattern)
+- Doc 08 state: [[file:08-state.org][08-state.org]]
+  (task state / history 永続化の backing)
+- Doc 09 http: [[file:09-http.org][09-http.org]]
+  (body overflow / MCP tool パターン、本 doc と同じ時期 ship)
+- Claude CLI 公式 flag list: =claude --help= (2026-04 時点):
+  =--print= / =--output-format stream-json= / =--worktree= / =--max-budget-usd=
+  / =--append-system-prompt= / =--bare= / =--permission-mode= /
+  =--no-session-persistence= / =--fallback-model=
+- aider project: https://aider.chat/ (multi-vendor middleware 候補)
+- 2026-04-18 対話ログ: Claude/他 AI 並列 dispatch 構想 (本 doc 起点)
+- 既存 memory: =project_anvil_worker_phase1.md=
+  (本 doc の pool / UI / persist 設計の下敷き)
