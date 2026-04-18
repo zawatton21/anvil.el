@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -34,8 +34,18 @@
   live skip in anvil-orchestrator-test.el (355 total across the
   suite, 2 live skips).
 
-Phase 3/3b (gemini / ollama native), 4 (consensus) は design
-残し。Review Questions Q1-Q12 resolved 状態キープ。
+- Phase 3 (commit 629aec4, branch feat/orchestrator-phase-3): gemini
+  native provider with =-m MODEL -p PROMPT= argv, plain-text tail
+  summary parser with log-prefix filtering, per-model price table
+  (gemini-2.5-pro / 2.5-flash / 2.0-flash / 1.5-pro / 1.5-flash),
+  optional =--yolo= auto-accept for tool use.  Worktree falls back
+  to the anvil-side generic path; budget falls back to wall-clock
+  timeout.  ERT +8 (= 58 pass / 1 live skip in
+  anvil-orchestrator-test.el, 369 total across the suite, 2 live
+  skips).
+
+Phase 3b (ollama native), 4 (consensus) は design 残し。Review
+Questions Q1-Q12 resolved 状態キープ。
 
 * Goal
 
