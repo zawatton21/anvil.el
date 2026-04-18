@@ -1072,7 +1072,7 @@ MCP Parameters:
           (lim (if (and limit (not (string-empty-p limit)))
                    (string-to-number limit)
                  nil)))
-      (anvil-file-read path off lim))))
+      (format "%S" (anvil-file-read path off lim)))))
 
 (defun anvil-file--tool-append (path content)
   "Append CONTENT to end of file at PATH.
