@@ -1081,6 +1081,182 @@ value (the batch-id) as its RESULT argument."
                "[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}"
                result)))))
 
+;;;; --- Phase 4: consensus -------------------------------------------------
+
+(defun anvil-orchestrator-test--consensus-stream-json (summary)
+  "Build a stream-json payload whose `:result' decodes to SUMMARY."
+  (format
+   "{\"type\":\"assistant\",\"message\":{\"content\":\"working\"}}\n{\"type\":\"result\",\"result\":%s,\"total_cost_usd\":0.001,\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"cache_read_input_tokens\":0}}"
+   (json-encode summary)))
+
+(defun anvil-orchestrator-test--register-named (name summary)
+  "Register a fake provider NAME whose output is SUMMARY (plain text)."
+  (let ((payload (anvil-orchestrator-test--consensus-stream-json summary)))
+    (anvil-orchestrator-register-provider
+     name
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (anvil-test-fixtures-stub-cmd payload 0))
+     :parse-output #'anvil-orchestrator--claude-parse-output
+     :supports-tool-use             t
+     :supports-worktree             nil
+     :supports-budget               nil
+     :supports-system-prompt-append nil
+     :default-model                 "stub"
+     :cost-estimator (lambda (_task) 0.0))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-identical ()
+  "Identical line-sets yield similarity 1.0."
+  (should (= 1.0 (anvil-orchestrator--jaccard-similarity
+                  "alpha\nbeta\ngamma"
+                  "alpha\nbeta\ngamma"))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-disjoint ()
+  "Completely disjoint line-sets yield similarity 0.0."
+  (should (= 0.0 (anvil-orchestrator--jaccard-similarity
+                  "alpha\nbeta"
+                  "x\ny\nz"))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-partial ()
+  "Overlap of 2 / union 4 → 0.5."
+  (should (= 0.5 (anvil-orchestrator--jaccard-similarity
+                  "alpha\nbeta\ngamma"
+                  "alpha\ngamma\nepsilon"))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-both-empty-is-one ()
+  "Vacuously identical empties collapse to 1.0."
+  (should (= 1.0 (anvil-orchestrator--jaccard-similarity "" ""))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-one-empty-is-zero ()
+  "Exactly one empty side is 0.0."
+  (should (= 0.0 (anvil-orchestrator--jaccard-similarity "alpha\nbeta" "")))
+  (should (= 0.0 (anvil-orchestrator--jaccard-similarity "" "alpha\nbeta"))))
+
+(ert-deftest anvil-orchestrator-test-jaccard-ignores-blank-lines ()
+  "Trims & drops empty lines; duplicate lines collapsed."
+  (should (= 1.0 (anvil-orchestrator--jaccard-similarity
+                  "  alpha \n\n  beta  "
+                  "alpha\nbeta\nalpha"))))
+
+(ert-deftest anvil-orchestrator-test-consensus-submit-rejects-empty-prompt ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-submit-consensus
+      :prompt "" :providers '(test test))
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-consensus-submit-rejects-single ()
+  "Require >= 2 providers (else consensus is moot)."
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-submit-consensus
+      :prompt "hi" :providers '(test))
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-consensus-submit-rejects-unknown-provider ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-submit-consensus
+      :prompt "hi" :providers '(test no-such))
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-consensus-submit-fans-out ()
+  "Consensus submit creates N tasks with identical prompt + one batch."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "alpha")
+    (anvil-orchestrator-test--register-named 'tprov-b "beta")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "explain foo" :providers '(tprov-a tprov-b)))
+           (consensus-id (plist-get res :consensus-id))
+           (batch-id     (plist-get res :batch-id))
+           (task-ids     (plist-get res :task-ids)))
+      (should (stringp consensus-id))
+      (should (stringp batch-id))
+      (should (= 2 (length task-ids)))
+      ;; Both fan-out tasks share the same prompt.
+      (dolist (tid task-ids)
+        (let ((task (anvil-orchestrator--task-get tid)))
+          (should (equal "explain foo" (plist-get task :prompt)))))
+      ;; Consensus metadata was persisted.
+      (should (gethash consensus-id
+                       anvil-orchestrator--consensus-groups)))))
+
+(ert-deftest anvil-orchestrator-test-consensus-submit-applies-overrides ()
+  "Per-provider :model overrides flow into the corresponding task."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "alpha")
+    (anvil-orchestrator-test--register-named 'tprov-b "beta")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "x"
+                 :providers '(tprov-a tprov-b)
+                 :overrides '((tprov-a . (:model "m-a"))
+                              (tprov-b . (:model "m-b")))))
+           (task-ids (plist-get res :task-ids))
+           (tasks    (mapcar #'anvil-orchestrator--task-get task-ids)))
+      (let ((a (cl-find 'tprov-a tasks
+                        :key (lambda (t0) (plist-get t0 :provider))))
+            (b (cl-find 'tprov-b tasks
+                        :key (lambda (t0) (plist-get t0 :provider)))))
+        (should (equal "m-a" (plist-get a :model)))
+        (should (equal "m-b" (plist-get b :model)))))))
+
+(ert-deftest anvil-orchestrator-test-consensus-collect-unanimous ()
+  "Identical summaries → verdict 'unanimous and min-similarity 1.0."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "same result")
+    (anvil-orchestrator-test--register-named 'tprov-b "same result")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "q" :providers '(tprov-a tprov-b))))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get res :batch-id) 10)
+      (let ((v (anvil-orchestrator-consensus-collect
+                (plist-get res :consensus-id))))
+        (should (eq 'unanimous (plist-get v :verdict)))
+        (should (= 1.0 (plist-get v :min-similarity)))
+        (should (= 1 (length (plist-get v :matrix))))
+        (should (= 2 (length (plist-get v :tasks))))))))
+
+(ert-deftest anvil-orchestrator-test-consensus-collect-divergent ()
+  "Disjoint summaries → verdict 'divergent."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "apple pear")
+    (anvil-orchestrator-test--register-named 'tprov-b "carrot onion")
+    (let* ((res (anvil-orchestrator-submit-consensus
+                 :prompt "q" :providers '(tprov-a tprov-b))))
+      (anvil-orchestrator-test--wait-batch
+       (plist-get res :batch-id) 10)
+      (let ((v (anvil-orchestrator-consensus-collect
+                (plist-get res :consensus-id))))
+        (should (eq 'divergent (plist-get v :verdict)))
+        (should (= 0.0 (plist-get v :min-similarity)))))))
+
+(ert-deftest anvil-orchestrator-test-consensus-collect-unknown ()
+  (anvil-orchestrator-test--with-fresh
+    (should-error
+     (anvil-orchestrator-consensus-collect "no-such-id")
+     :type 'user-error)))
+
+(ert-deftest anvil-orchestrator-test-consensus-mcp-submit ()
+  "MCP wrapper parses providers JSON + overrides JSON and fans out."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-named 'tprov-a "same")
+    (anvil-orchestrator-test--register-named 'tprov-b "same")
+    (let* ((out (anvil-orchestrator--tool-consensus-submit
+                 "ping"
+                 "[\"tprov-a\",\"tprov-b\"]"
+                 "{\"tprov-a\":{\"model\":\"m-a\"}}"))
+           (consensus-id (plist-get out :consensus-id))
+           (batch-id     (plist-get out :batch-id)))
+      (should (stringp consensus-id))
+      (should (stringp batch-id))
+      (should (= 2 (length (plist-get out :task-ids))))
+      (let* ((task-ids (plist-get out :task-ids))
+             (a (cl-find 'tprov-a
+                         (mapcar #'anvil-orchestrator--task-get task-ids)
+                         :key (lambda (t0) (plist-get t0 :provider)))))
+        (should (equal "m-a" (plist-get a :model)))))))
+
 ;;;; --- live smoke test ---------------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-live-claude ()

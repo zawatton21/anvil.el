@@ -1537,6 +1537,173 @@ loop so the Emacs UI stays responsive."
       (anvil-orchestrator--pump)
       new-id)))
 
+;;;; --- Phase 4: cross-model consensus --------------------------------------
+
+(defcustom anvil-orchestrator-consensus-threshold 0.5
+  "Minimum pairwise Jaccard similarity for a consensus to be `unanimous'.
+When any pairwise similarity drops below this, the verdict becomes
+`divergent'.  Range: 0.0 (completely different) to 1.0 (identical)."
+  :type 'number
+  :group 'anvil-orchestrator)
+
+(defconst anvil-orchestrator--consensus-state-ns "orchestrator-consensus"
+  "anvil-state namespace used for persisted consensus metadata.")
+
+(defvar anvil-orchestrator--consensus-groups (make-hash-table :test 'equal)
+  "Map consensus-id -> plist (:batch-id :providers :task-ids :created-at).")
+
+(defun anvil-orchestrator--consensus-persist (consensus-id meta)
+  "Persist META for CONSENSUS-ID to anvil-state."
+  (anvil-state-set consensus-id meta
+                   :ns anvil-orchestrator--consensus-state-ns))
+
+(defun anvil-orchestrator--restore-consensus-from-state ()
+  "Re-hydrate consensus metadata from anvil-state into memory."
+  (clrhash anvil-orchestrator--consensus-groups)
+  (condition-case _err
+      (let ((rows (ignore-errors
+                    (sqlite-select
+                     (anvil-state--db)
+                     "SELECT k, v FROM kv WHERE ns = ?1"
+                     (list anvil-orchestrator--consensus-state-ns)))))
+        (dolist (row rows)
+          (let* ((cid  (car row))
+                 (meta (ignore-errors
+                         (anvil-state--deserialize (cadr row)))))
+            (when (and cid meta (listp meta))
+              (puthash cid meta anvil-orchestrator--consensus-groups)))))
+    (error nil)))
+
+(defun anvil-orchestrator--jaccard-similarity (text-a text-b)
+  "Return Jaccard similarity (0.0-1.0) between TEXT-A and TEXT-B.
+Compared as the set of trimmed non-empty lines.  Both empty
+returns 1.0 (vacuously identical); exactly one empty returns 0.0."
+  (cl-labels ((lineset (s)
+                (let (acc)
+                  (dolist (ln (split-string (or s "") "\n"))
+                    (let ((t0 (string-trim ln)))
+                      (unless (string-empty-p t0)
+                        (push t0 acc))))
+                  (delete-dups acc))))
+    (let ((a (lineset text-a))
+          (b (lineset text-b)))
+      (cond
+       ((and (null a) (null b)) 1.0)
+       ((or  (null a) (null b)) 0.0)
+       (t
+        (let* ((inter (cl-count-if (lambda (x) (member x b)) a))
+               (union (- (+ (length a) (length b)) inter)))
+          (if (zerop union) 1.0 (/ (float inter) union))))))))
+
+(defun anvil-orchestrator--consensus-build-tasks (prompt providers overrides defaults)
+  "Build a fan-out task list from PROMPT across PROVIDERS.
+OVERRIDES is an alist ((provider . (:key val ...))).  DEFAULTS
+is a plist of fields (e.g. :timeout-sec) applied as trailing
+fallbacks per task (each per-provider override wins over a default)."
+  (let (tasks)
+    (dolist (p providers)
+      (let* ((per-p (cdr (assq p overrides)))
+             (task  (append (list :name (format "consensus-%s" p)
+                                  :provider p
+                                  :prompt prompt)
+                            per-p defaults)))
+        (push task tasks)))
+    (nreverse tasks)))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-submit-consensus
+    (&key prompt providers overrides timeout-sec budget-usd)
+  "Dispatch PROMPT to each provider in PROVIDERS and return a plist.
+Result: (:consensus-id STR :batch-id STR :providers (SYM...) :task-ids (STR...)).
+
+PROVIDERS must be a list of registered provider symbols with
+length >= 2.  OVERRIDES is an alist ((provider . (:key val ...)))
+whose per-provider plist is merged into the corresponding task
+(e.g. per-provider :model).  TIMEOUT-SEC and BUDGET-USD apply as
+defaults for every fan-out task unless already set in OVERRIDES."
+  (unless (and (stringp prompt) (not (string-empty-p prompt)))
+    (user-error "consensus: prompt must be a non-empty string"))
+  (unless (and (listp providers) (>= (length providers) 2))
+    (user-error "consensus: providers must be a list of length >= 2"))
+  (dolist (p providers)
+    (unless (anvil-orchestrator--provider p)
+      (user-error "consensus: unknown provider %S" p)))
+  (let* ((consensus-id (anvil-orchestrator--uuid))
+         (defaults (append
+                    (and timeout-sec (list :timeout-sec timeout-sec))
+                    (and budget-usd  (list :budget-usd budget-usd))))
+         (tasks    (anvil-orchestrator--consensus-build-tasks
+                    prompt providers overrides defaults))
+         (batch-id (anvil-orchestrator-submit tasks))
+         (task-ids (gethash batch-id anvil-orchestrator--batches))
+         (meta     (list :batch-id batch-id
+                         :providers providers
+                         :task-ids task-ids
+                         :created-at (float-time))))
+    (puthash consensus-id meta anvil-orchestrator--consensus-groups)
+    (anvil-orchestrator--consensus-persist consensus-id meta)
+    (list :consensus-id consensus-id
+          :batch-id batch-id
+          :providers providers
+          :task-ids task-ids)))
+
+(defun anvil-orchestrator--consensus-similarity-matrix (tasks)
+  "Return an alist ((\"PROV_A x PROV_B\" . SCORE) ...) for TASKS.
+TASKS is a list of slim task plists.  Each unordered pair is
+compared by summary text; pairs with identical provider symbols
+still emit one entry using their positional index."
+  (let (result
+        (n (length tasks))
+        (v (apply #'vector tasks)))
+    (cl-loop
+     for i below n do
+     (cl-loop
+      for j from (1+ i) below n do
+      (let* ((a (aref v i))
+             (b (aref v j))
+             (pa (plist-get a :provider))
+             (pb (plist-get b :provider))
+             (key (if (eq pa pb)
+                      (format "%s[%d] x %s[%d]" pa i pb j)
+                    (format "%s x %s" pa pb)))
+             (score (anvil-orchestrator--jaccard-similarity
+                     (or (plist-get a :summary) "")
+                     (or (plist-get b :summary) ""))))
+        (push (cons key score) result))))
+    (nreverse result)))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-consensus-collect
+    (consensus-id &key wait (max-wait-sec 1800))
+  "Collect all tasks for CONSENSUS-ID and return a verdict plist.
+Result: (:consensus-id STR :batch-id STR :verdict SYM
+         :min-similarity FLOAT :matrix ALIST :tasks (PLIST...)).
+
+VERDICT is `unanimous' when every pairwise Jaccard similarity is
+>= `anvil-orchestrator-consensus-threshold' AND all tasks reached
+`done'; otherwise `divergent'.  Single-provider consensus (not
+allowed at submit time) would emit `unanimous' vacuously."
+  (let ((meta (gethash consensus-id anvil-orchestrator--consensus-groups)))
+    (unless meta
+      (user-error "consensus: unknown consensus-id %s" consensus-id))
+    (let* ((batch-id (plist-get meta :batch-id))
+           (results  (anvil-orchestrator-collect
+                      batch-id :wait wait :max-wait-sec max-wait-sec))
+           (matrix   (anvil-orchestrator--consensus-similarity-matrix results))
+           (min-sim  (if matrix (apply #'min (mapcar #'cdr matrix)) 1.0))
+           (all-done (cl-every (lambda (r) (eq (plist-get r :status) 'done))
+                               results))
+           (verdict  (if (and all-done
+                              (>= min-sim anvil-orchestrator-consensus-threshold))
+                         'unanimous
+                       'divergent)))
+      (list :consensus-id consensus-id
+            :batch-id batch-id
+            :verdict verdict
+            :min-similarity min-sim
+            :matrix matrix
+            :tasks results))))
+
 ;;;; --- MCP tool handlers -------------------------------------------------
 
 (defun anvil-orchestrator--parse-tasks-json (tasks-json)
@@ -1604,6 +1771,73 @@ MCP Parameters:
   task_id - Task id string to retry."
   (anvil-server-with-error-handling
    (list :new-task-id (anvil-orchestrator-retry task_id))))
+
+(defun anvil-orchestrator--parse-providers-json (providers-json)
+  "Parse PROVIDERS-JSON (JSON string array) into a list of provider symbols."
+  (unless (and (stringp providers-json) (not (string-empty-p providers-json)))
+    (user-error "orchestrator-consensus-submit: providers must be a non-empty JSON array string"))
+  (let ((parsed (json-parse-string providers-json
+                                   :array-type 'list
+                                   :object-type 'plist
+                                   :null-object nil
+                                   :false-object nil)))
+    (unless (listp parsed)
+      (user-error "orchestrator-consensus-submit: providers JSON must parse to an array"))
+    (mapcar (lambda (s)
+              (cond
+               ((symbolp s) s)
+               ((stringp s) (intern s))
+               (t (user-error "orchestrator-consensus-submit: provider %S must be string or symbol" s))))
+            parsed)))
+
+(defun anvil-orchestrator--parse-overrides-json (overrides-json)
+  "Parse OVERRIDES-JSON (object of provider->plist) into an alist."
+  (when (and overrides-json (stringp overrides-json)
+             (not (string-empty-p overrides-json)))
+    (let ((parsed (json-parse-string overrides-json
+                                     :object-type 'plist
+                                     :array-type 'list
+                                     :null-object nil
+                                     :false-object nil)))
+      (cl-loop for (k v) on parsed by #'cddr
+               collect (cons (intern (substring (symbol-name k) 1)) v)))))
+
+(defun anvil-orchestrator--tool-consensus-submit
+    (prompt providers &optional overrides timeout_sec budget_usd)
+  "Dispatch PROMPT to each provider and return a consensus plist.
+
+MCP Parameters:
+  prompt      - Prompt string sent to every provider.
+  providers   - JSON array of provider names (e.g. [\"claude\",\"gemini\"]).
+  overrides   - Optional JSON object of per-provider plist fields, e.g.
+                {\"claude\":{\"model\":\"claude-opus-4-7\"},\"gemini\":{}}.
+  timeout_sec - Optional per-task timeout seconds (string).
+  budget_usd  - Optional per-task budget USD (string).
+
+Returns (:consensus-id STR :batch-id STR :providers LIST :task-ids LIST)."
+  (anvil-server-with-error-handling
+   (let* ((provs (anvil-orchestrator--parse-providers-json providers))
+          (over  (anvil-orchestrator--parse-overrides-json overrides))
+          (tsec  (and timeout_sec (stringp timeout_sec)
+                      (not (string-empty-p timeout_sec))
+                      (string-to-number timeout_sec)))
+          (busd  (and budget_usd  (stringp budget_usd)
+                      (not (string-empty-p budget_usd))
+                      (string-to-number budget_usd))))
+     (anvil-orchestrator-submit-consensus
+      :prompt prompt :providers provs :overrides over
+      :timeout-sec tsec :budget-usd busd))))
+
+(defun anvil-orchestrator--tool-consensus-collect (consensus_id &optional wait)
+  "Collect verdict for CONSENSUS_ID.
+
+MCP Parameters:
+  consensus_id - Consensus id string returned by orchestrator-consensus-submit.
+  wait         - When truthy (\"t\"/\"true\"/non-empty), block until all
+                 fan-out tasks reach a terminal state."
+  (anvil-server-with-error-handling
+   (let ((w (and wait (not (member wait '("" "nil" "false" "0"))))))
+     (anvil-orchestrator-consensus-collect consensus_id :wait w))))
 
 ;;;; --- dashboard ----------------------------------------------------------
 
@@ -1752,12 +1986,35 @@ block until every task reaches a terminal state (done / failed
    :description
    "Re-submit a task under a new id (same batch, same prompt /
 provider / model).  Useful after a manual cancel or a
-non-auto-retryable failure."))
+non-auto-retryable failure.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-consensus-submit
+   :id "orchestrator-consensus-submit"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Dispatch the same prompt to >= 2 providers (cross-model
+consensus).  Returns a consensus id + batch id + task ids.  Poll
+via `orchestrator-consensus-collect' to get a verdict (unanimous
+/ divergent) based on pairwise Jaccard similarity of summaries.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-consensus-collect
+   :id "orchestrator-consensus-collect"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the consensus verdict for a consensus id.  Includes
+:verdict (unanimous / divergent), :min-similarity, pairwise
+:matrix, and the per-task slim plists.  Pass wait=\"t\" to block
+until every fan-out task reaches a terminal state."
+   :read-only t))
 
 (defun anvil-orchestrator--unregister-tools ()
   (dolist (id '("orchestrator-submit" "orchestrator-status"
                 "orchestrator-collect" "orchestrator-cancel"
-                "orchestrator-retry"))
+                "orchestrator-retry"
+                "orchestrator-consensus-submit"
+                "orchestrator-consensus-collect"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload
@@ -1766,6 +2023,7 @@ non-auto-retryable failure."))
   (interactive)
   (anvil-state-enable)
   (anvil-orchestrator--restore-from-state)
+  (anvil-orchestrator--restore-consensus-from-state)
   (anvil-orchestrator--register-tools)
   (anvil-orchestrator--ensure-pump-timer))
 
