@@ -541,6 +541,135 @@ maps stderr HTTP / network errors to auto-retry codes."
  :default-model                 "openai/gpt-4o-mini"
  :cost-estimator #'anvil-orchestrator--aider-cost)
 
+;;;; --- gemini provider (Phase 3, built-in) -------------------------------
+
+(defcustom anvil-orchestrator-gemini-default-model "gemini-2.5-flash"
+  "Default `gemini --model' value when a task omits :model.
+Google gemini-cli model names: `gemini-2.5-pro', `gemini-2.5-flash',
+`gemini-2.0-flash'."
+  :type 'string
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-gemini-extra-args nil
+  "Extra argv appended verbatim to every `gemini' invocation."
+  :type '(repeat string)
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-gemini-yolo nil
+  "When non-nil, append `--yolo' to auto-accept tool invocations.
+Equivalent to raising claude's permission mode to `bypassPermissions'.
+Off by default — enable explicitly when dispatching tool-using tasks."
+  :type 'boolean
+  :group 'anvil-orchestrator)
+
+(defun anvil-orchestrator--gemini-check ()
+  "Return t when the `gemini' CLI is on `exec-path'."
+  (if (executable-find "gemini") t
+    (error "anvil-orchestrator: `gemini' CLI not found on exec-path")))
+
+(defun anvil-orchestrator--gemini-cost (task)
+  "Rough pre-submit USD estimate for TASK under the gemini model.
+Gemini pricing is per-1M-tokens and much cheaper than Claude / GPT-4.
+Falls back to a flash-tier rate for unrecognised model strings."
+  (let* ((model  (or (plist-get task :model)
+                     anvil-orchestrator-gemini-default-model))
+         (prompt (or (plist-get task :prompt) ""))
+         (in-tok (/ (length prompt) 4.0))
+         (out-tok (* 2.0 in-tok))
+         (prices
+          (cond
+           ((string-match-p "2\\.5-pro"   model) '(:i 0.00000125 :o 0.00001))
+           ((string-match-p "2\\.5-flash" model) '(:i 0.0000003  :o 0.0000025))
+           ((string-match-p "2\\.0-flash" model) '(:i 0.0000001  :o 0.0000004))
+           ((string-match-p "1\\.5-pro"   model) '(:i 0.00000125 :o 0.000005))
+           ((string-match-p "1\\.5-flash" model) '(:i 0.000000075 :o 0.0000003))
+           (t                                    '(:i 0.0000003  :o 0.0000025)))))
+    (+ (* in-tok  (plist-get prices :i))
+       (* out-tok (plist-get prices :o)))))
+
+(defun anvil-orchestrator--gemini-build-cmd (task)
+  "Build the `gemini' command line for TASK plist.
+Uses `-p PROMPT' for single-shot non-interactive invocation and
+`-m MODEL' to select the model.  When
+`anvil-orchestrator-gemini-yolo' (or TASK `:yolo') is non-nil,
+`--yolo' is appended to auto-accept tool invocations.  Extra argv
+from `anvil-orchestrator-gemini-extra-args' follows."
+  (let* ((model   (or (plist-get task :model)
+                      anvil-orchestrator-gemini-default-model))
+         (prompt  (plist-get task :prompt))
+         (yolo    (or (plist-get task :yolo)
+                      anvil-orchestrator-gemini-yolo))
+         (cmd     (list (executable-find "gemini")
+                        "-m" model
+                        "-p" prompt)))
+    (setq cmd (anvil-orchestrator--argv-append-when
+               cmd yolo "--yolo"))
+    (if anvil-orchestrator-gemini-extra-args
+        (append cmd anvil-orchestrator-gemini-extra-args)
+      cmd)))
+
+(defconst anvil-orchestrator--gemini-skip-prefix-re
+  (concat "\\`\\(?:"
+          "Loaded cached credentials\\|"
+          "Data collection is\\|"
+          "Using model:\\|"
+          "Authenticating\\|"
+          "\\[DEBUG\\]\\|\\[INFO\\]"
+          "\\)")
+  "Prefixes identifying non-content gemini CLI log lines.
+Stripped by `anvil-orchestrator--gemini-parse-output' when
+building the tail summary.")
+
+(defun anvil-orchestrator--gemini-parse-output (stdout-path stderr-path exit-code)
+  "Parse gemini STDOUT-PATH plain text into a summary plist.
+Returns (:summary STR :cost-usd NIL :cost-tokens NIL
+:commit-sha NIL :auto-retry-code SYM).  The gemini CLI emits
+plain markdown; we take the tail up to ~4 KB, dropping empty
+lines and a small set of known log prefixes."
+  (let (summary)
+    (condition-case _err
+        (when (file-readable-p stdout-path)
+          (with-temp-buffer
+            (insert-file-contents stdout-path)
+            (let* ((sz (buffer-size))
+                   (tail-start (max (point-min) (- (point-max)
+                                                   (min sz 4096))))
+                   (lines nil))
+              (goto-char tail-start)
+              (while (not (eobp))
+                (let ((line (buffer-substring-no-properties
+                             (point) (line-end-position))))
+                  (unless (or (string-empty-p (string-trim line))
+                              (string-match-p
+                               anvil-orchestrator--gemini-skip-prefix-re
+                               line))
+                    (push line lines)))
+                (forward-line 1))
+              (when lines
+                (setq summary (mapconcat #'identity
+                                         (nreverse lines) "\n"))))))
+      (error nil))
+    (list :summary         (anvil-orchestrator--truncate-summary summary)
+          :cost-usd        nil
+          :cost-tokens     nil
+          :commit-sha      nil
+          :auto-retry-code (and (not summary)
+                                (anvil-orchestrator--stderr-retry-code
+                                 stderr-path exit-code)))))
+
+(anvil-orchestrator-register-provider
+ 'gemini
+ :cli "gemini"
+ :version-check #'anvil-orchestrator--gemini-check
+ :build-cmd     #'anvil-orchestrator--gemini-build-cmd
+ :parse-output  #'anvil-orchestrator--gemini-parse-output
+ :supports-tool-use             t
+ :supports-worktree             nil
+ :supports-budget               nil
+ :supports-system-prompt-append nil
+ :default-model                 "gemini-2.5-flash"
+ :cost-estimator #'anvil-orchestrator--gemini-cost)
+
 ;;;; --- UUID + internal state ---------------------------------------------
 
 (defun anvil-orchestrator--uuid ()

@@ -716,6 +716,155 @@ Registered under a distinct provider symbol so the built-in
         (should (string-match-p "requested tweak"
                                 (plist-get r :summary)))))))
 
+;;;; --- Phase 3: gemini provider ------------------------------------------
+
+(ert-deftest anvil-orchestrator-test-gemini-provider-registered ()
+  "Built-in `gemini' provider is registered on load."
+  (let ((prov (anvil-orchestrator--provider 'gemini)))
+    (should (anvil-orchestrator-provider-p prov))
+    (should (equal "gemini" (anvil-orchestrator-provider-cli prov)))
+    (should (anvil-orchestrator-provider-supports-tool-use prov))
+    (should-not (anvil-orchestrator-provider-supports-worktree prov))
+    (should-not (anvil-orchestrator-provider-supports-budget prov))
+    (should-not (anvil-orchestrator-provider-supports-system-prompt-append
+                 prov))
+    (should (equal "gemini-2.5-flash"
+                   (anvil-orchestrator-provider-default-model prov)))))
+
+(ert-deftest anvil-orchestrator-test-gemini-build-cmd-basic ()
+  "`gemini' build-cmd emits -m MODEL and -p PROMPT."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/gemini")))
+    (let ((cmd (anvil-orchestrator--gemini-build-cmd
+                (list :prompt "summarize readme"
+                      :model "gemini-2.5-pro"))))
+      (should (equal "/usr/bin/gemini"  (nth 0 cmd)))
+      (should (equal "-m"               (nth 1 cmd)))
+      (should (equal "gemini-2.5-pro"   (nth 2 cmd)))
+      (should (equal "-p"               (nth 3 cmd)))
+      (should (equal "summarize readme" (nth 4 cmd)))
+      (should-not (member "--yolo" cmd)))))
+
+(ert-deftest anvil-orchestrator-test-gemini-build-cmd-default-model ()
+  "`gemini' build-cmd falls back to `anvil-orchestrator-gemini-default-model'."
+  (let ((anvil-orchestrator-gemini-default-model "gemini-2.5-flash"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/gemini")))
+      (let ((cmd (anvil-orchestrator--gemini-build-cmd
+                  (list :prompt "x"))))
+        (should (member "gemini-2.5-flash" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-gemini-build-cmd-yolo ()
+  "`:yolo' in task (or defcustom) adds `--yolo' to argv."
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (_) "/usr/bin/gemini")))
+    (let ((cmd (anvil-orchestrator--gemini-build-cmd
+                (list :prompt "p" :model "gemini-2.5-flash" :yolo t))))
+      (should (member "--yolo" cmd)))
+    (let ((anvil-orchestrator-gemini-yolo t))
+      (let ((cmd (anvil-orchestrator--gemini-build-cmd
+                  (list :prompt "p" :model "gemini-2.5-flash"))))
+        (should (member "--yolo" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-gemini-build-cmd-extra-args ()
+  "`anvil-orchestrator-gemini-extra-args' is appended after flags."
+  (let ((anvil-orchestrator-gemini-extra-args '("--include-dir" "src/")))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/gemini")))
+      (let ((cmd (anvil-orchestrator--gemini-build-cmd
+                  (list :prompt "p" :model "gemini-2.5-flash"))))
+        (should (member "--include-dir" cmd))
+        (should (member "src/"          cmd))))))
+
+(ert-deftest anvil-orchestrator-test-gemini-parse-output-plain-text ()
+  "Parser extracts tail summary from gemini plain-text stdout."
+  (let ((path (make-temp-file "gemini-out-")))
+    (unwind-protect
+        (progn
+          (write-region
+           (concat
+            "Loaded cached credentials from ~/.gemini/oauth.json\n"
+            "Using model: gemini-2.5-flash\n"
+            "\n"
+            "The README describes an Emacs MCP orchestrator.\n"
+            "Key points: multi-provider, worktree isolation, cost tracking.\n")
+           nil path nil 'silent)
+          (let ((parsed (anvil-orchestrator--gemini-parse-output path nil 0)))
+            (should (stringp (plist-get parsed :summary)))
+            (should (string-match-p "orchestrator"
+                                    (plist-get parsed :summary)))
+            (should-not (string-match-p "Loaded cached"
+                                        (plist-get parsed :summary)))
+            (should-not (string-match-p "Using model:"
+                                        (plist-get parsed :summary)))
+            (should-not (plist-get parsed :cost-usd))
+            (should-not (plist-get parsed :commit-sha))))
+      (delete-file path))))
+
+(ert-deftest anvil-orchestrator-test-gemini-parse-output-retry-on-429 ()
+  "Parser maps 429 on stderr to :auto-retry-code 429 when no summary."
+  (let ((out (make-temp-file "gemini-out-"))
+        (err (make-temp-file "gemini-err-")))
+    (unwind-protect
+        (progn
+          (write-region "" nil out nil 'silent)
+          (write-region "HTTP 429 Too Many Requests\n" nil err nil 'silent)
+          (let ((parsed (anvil-orchestrator--gemini-parse-output out err 1)))
+            (should-not (plist-get parsed :summary))
+            (should (equal 429 (plist-get parsed :auto-retry-code)))))
+      (delete-file out)
+      (delete-file err))))
+
+(ert-deftest anvil-orchestrator-test-gemini-cost-estimator ()
+  "`anvil-orchestrator--gemini-cost' returns sensible per-model numbers."
+  (let ((small (anvil-orchestrator--gemini-cost
+                (list :prompt "hi" :model "gemini-2.5-flash")))
+        (big   (anvil-orchestrator--gemini-cost
+                (list :prompt (make-string 4000 ?x)
+                      :model "gemini-2.5-pro")))
+        (flash (anvil-orchestrator--gemini-cost
+                (list :prompt (make-string 4000 ?x)
+                      :model "gemini-2.0-flash"))))
+    (should (and (numberp small) (>= small 0) (< small 0.01)))
+    (should (and (numberp big)   (> big small)))
+    ;; 2.0-flash is strictly cheaper than 2.5-pro on same input.
+    (should (< flash big))))
+
+(ert-deftest anvil-orchestrator-test-gemini-end-to-end-stub ()
+  "End-to-end: stub gemini via sh routed through the gemini parser.
+Registered under a distinct provider symbol so the built-in
+`gemini' descriptor isn't overwritten for the rest of the suite."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-register-provider
+     'gemini-stub
+     :cli "sh"
+     :version-check (lambda () t)
+     :build-cmd (lambda (_task)
+                  (list "sh" "-c"
+                        (concat
+                         "printf 'Loaded cached credentials\\n"
+                         "Using model: gemini-2.5-flash\\n\\n"
+                         "Here is my summary.\\n"
+                         "It mentions the orchestrator module.\\n'")))
+     :parse-output #'anvil-orchestrator--gemini-parse-output
+     :supports-tool-use t
+     :supports-worktree nil
+     :default-model "gemini-2.5-flash"
+     :cost-estimator #'anvil-orchestrator--gemini-cost)
+    (let* ((batch (anvil-orchestrator-submit
+                   (list (list :name "gemini-stub"
+                               :provider 'gemini-stub
+                               :prompt   "summarize the readme"
+                               :no-worktree t)))))
+      (anvil-orchestrator-test--wait-batch batch 5)
+      (let ((r (car (anvil-orchestrator-collect batch))))
+        (should (eq 'done (plist-get r :status)))
+        (should (stringp (plist-get r :summary)))
+        (should (string-match-p "orchestrator module"
+                                (plist-get r :summary)))
+        (should-not (string-match-p "Loaded cached"
+                                    (plist-get r :summary)))))))
+
 ;;;; --- cron integration (Phase 2b) ---------------------------------------
 
 (require 'anvil-cron)
