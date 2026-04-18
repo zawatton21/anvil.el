@@ -4,6 +4,9 @@
 #+property: status DRAFT
 
 * STATUS
+  :PROPERTIES:
+  :ID:       019da322-e3df-7d21-acca-be1071940340
+  :END:
 
 - Phase A (anvil-browser MVP): ~SHIPPED~ (2026-04-18)
   — ~anvil-browser.el~ + ~tests/anvil-browser-test.el~ (11 テスト
@@ -11,6 +14,15 @@
   ~-capture~ / ~-screenshot~ / ~-close~) + in-memory cache +
   metrics + ~M-x anvil-browser-status~。~anvil-optional-modules~ に
   ~browser~ 追加で有効化
+- Phase A' (auth primitives): ~SHIPPED (develop branch)~ (2026-04-19)
+  — 4 defcustom (~anvil-browser-user-agent~, ~-profile~,
+  ~-auto-connect~, ~-session-presets~) + preset 解決 helper +
+  cache key widening + tool signature 拡張 (~preset~ optional
+  arg)。ERT +7 = 18/18 pass (no live test added; live smoke is
+  a manual confirmation step requiring an authenticated Chrome
+  profile).  Live smoke (Reddit / X) は user 実機で ~M-x
+  customize-variable anvil-browser-profile~ → ~"Default"~ 設定後に
+  ~browser-fetch~ を叩いて wall 突破を確認する運用
 - Phase B〜F: この doc 後半 "Next-Primitives Roadmap" で提案のみ、
   個別 doc は当該 phase 着手時に切り出す
 
@@ -464,6 +476,112 @@ anvil-validate ┈┈→ file-batch / buffer-save
 8. *Week 1 day 5*: merge + tag
 
 目安で 1-2 週間 (実工数 2-3 日、レビュー待ち込み)。
+
+* Phase A' — Auth primitives (login wall bypass)
+
+** Problem recap
+
+Phase A spawns =agent-browser= with a fresh Chrome profile and
+only threads =--session-name= into the CLI args.  Static pages
+work, but three categories fail in practice (2026-04-18 soak):
+
+- *Login walls* (X / Twitter) — ~4 KB of "Log in / Sign up"
+  markup served when unauthenticated
+- *Anti-bot challenges* (Reddit) — URL rewritten to
+  =?solution=...&js_challenge=1&token=...= with DOM stripped to
+  a single "File a ticket" link
+- *Authenticated internal web UIs* (company wiki / admin UIs) —
+  same pattern
+
+=agent-browser= itself has rich auth flags.  Phase A' plumbs
+them through.
+
+** Scope (4 defcustoms + preset mechanism)
+
+New defcustoms (default nil / off → zero behavior change):
+
+- =anvil-browser-user-agent= — forwarded as =--user-agent=.
+  Low value on its own for JS-challenge sites, useful against
+  UA-sniffing blocks
+- =anvil-browser-profile= — forwarded as =--profile= (Chrome
+  profile name or directory path).  *Primary mechanism for X /
+  Reddit breach* — reuses an already-authenticated Chrome
+  profile.
+- =anvil-browser-auto-connect= — forwarded as bare
+  =--auto-connect= flag.  Attaches to a running Chrome instance
+  so cookies/state are inherited without profile-lock
+  contention.  Lowest-friction path when the user already has
+  Chrome open.
+- =anvil-browser-session-presets= — alist of named bundles:
+  #+begin_src emacs-lisp
+    '(("reddit" :profile "Default")
+      ("x"      :auto-connect t)
+      ("bot"    :user-agent "Mozilla/5.0 (compatible; anvil-bot)"))
+  #+end_src
+  Preset values override the global defcustoms.
+
+Deferred to Phase A'' (not implemented now):
+- =--state= (JSON cookie file) — YAGNI, Demand-driven only
+- =--headers= (origin-scoped HTTP headers) — anvil-http is a
+  cleaner home for bearer-token auth
+
+** Tool signature additions
+
+Each existing MCP tool gains one optional =preset= parameter:
+
+- =browser-fetch (url selector session preset)=
+- =browser-interact (url actions session preset)=
+- =browser-capture (url title tags session preset)=
+- =browser-screenshot (url region session preset)=
+
+Unknown preset name → =user-error= with the known-name list.
+
+** Cache key widening
+
+Current: =URL \0 SELECTOR=.  Phase A':
+=URL \0 SELECTOR \0 PROFILE \0 UA= (profile/UA empty-string when
+nil).  Profile/UA differentiate authenticated vs anonymous
+fetches; session-name is intentionally excluded because it
+governs cookie persistence and two sessions with the same
+profile should hit the same cache entry.
+
+Old entries become stale on upgrade — acceptable because
+TTL-bounded (5 min default) and =browser-close= clears the
+namespace.
+
+** Tests (offline)
+
+6 pure unit tests covering argv composition and key widening —
+no live browser spawn:
+
+1. =--user-agent UA= appears when defcustom set
+2. =--profile= appears when set
+3. =--auto-connect= appears as bare flag when t
+4. preset plist wins over global defcustom
+5. unknown preset name signals user-error
+6. cache key widens with profile + UA
+
+Live smoke (manual, not CI): attempt Reddit / X fetch with
+=--profile Default= and confirm snapshot is real content, not
+the wall text.  Documented in STATUS.
+
+** Backward compatibility
+
+All new defcustoms default to nil/off; tool signatures widened
+only with *optional* trailing args → existing MCP clients and
+internal callers are source-compatible.
+
+** Implementation checklist
+
+1. Add 4 defcustoms + =anvil-browser--resolve-auth-config=
+   helper (preset lookup + global fallback).
+2. Add =anvil-browser--build-cli-args= helper — threads flags
+   into the existing argv builder at =--run-batch=.
+3. Widen =anvil-browser--cache-key=.
+4. Add =preset= arg to each tool handler + MCP input schema.
+5. 6 unit tests.
+6. Manual confirmation against Reddit + X, record outcome in
+   STATUS.
 
 * References
 
