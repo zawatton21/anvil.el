@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -55,8 +55,22 @@
   ERT +7 (= 65 pass / 1 live skip in anvil-orchestrator-test.el,
   376 total across the suite, 2 live skips).
 
-Phase 4 (cross-model consensus) は design 残し。Review Questions
-Q1-Q12 resolved 状態キープ。
+- Phase 4 (commit b3128d3, branch feat/orchestrator-phase-4):
+  cross-model consensus.  =anvil-orchestrator-submit-consensus=
+  fans a single prompt out to >= 2 providers; =-consensus-collect=
+  returns a verdict (=unanimous= vs =divergent=) derived from
+  pairwise Jaccard similarity of line-sets over task summaries.
+  Threshold defcustom (default 0.5), per-provider =:overrides=
+  alist for model / flags, shared =:timeout-sec= / =:budget-usd=
+  defaults.  2 MCP tools (orchestrator-consensus-submit /
+  -collect), anvil-state namespace =orchestrator-consensus= for
+  daemon-restart rehydration.  No meta-LLM judge (Phase 4b).
+  ERT +15 (= 80 pass / 1 live skip in anvil-orchestrator-test.el,
+  391 total across the suite, 2 live skips).
+
+Phase 4b (meta-LLM judge: submit outputs back to a 3rd provider
+for an adjudicated merge) は design 残し。Review Questions Q1-Q12
+resolved 状態キープ。
 
 * Goal
 
