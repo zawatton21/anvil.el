@@ -14,7 +14,7 @@
   + anvil-side fallback), =:depends-on= DAG with cycle / unknown-name
   detection + propagating failure semantics, stdout/stderr head +
   tail truncation at the 1 MB cap. ERT +12 (= 30 pass / 1 live skip)
-- Phase 2 (commit TBD, branch feat/orchestrator-phase-2): aider
+- Phase 2 (commit 23e9daf, branch feat/orchestrator-phase-2): aider
   provider (middleware to OpenAI / Anthropic / Gemini / Ollama)
   with =--message= non-interactive build-cmd, commit-SHA + tail
   summary parser, stderr 429/5xx retry-code mapping, vendor-keyed
