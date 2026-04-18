@@ -500,6 +500,7 @@ budget goes to reasoning about your code, not re-reading it.
 | =elisp=      | Agentic Elisp development tools (optional)     | —                |
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 | =state=      | Persistent SQLite-backed KV store (ns / TTL, opt.) | Emacs 29+        |
+| =http=       | GET/HEAD with ETag/TTL cache via `url-retrieve' (opt.) | Emacs 29+ (state) |
 
 * Quick Start
 

@@ -88,7 +88,9 @@ These are not loaded by default.  Available modules:
                 Doc 07 Phase A)
 - `state'     — Persistent SQLite-backed KV store shared across modules
                 (ns / TTL / Lisp prin1 values, requires Emacs 29+,
-                Doc 08 Phase 1)"
+                Doc 08 Phase 1)
+- `http'      — HTTP client via `url-retrieve-synchronously' with a
+                state-backed ETag/TTL cache (Doc 09 Phase 1a)"
   :type '(repeat symbol)
   :group 'anvil)
 

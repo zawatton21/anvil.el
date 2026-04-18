@@ -479,6 +479,7 @@ Anvil を使うと:
 | =elisp=      | エージェント向け Elisp 開発ツール（オプション）| —                |
 | =browser=    | agent-browser 経由の Web fetch / interact / capture / screenshot（オプション） | agent-browser CLI |
 | =state=      | モジュール共通の永続 SQLite KV ストア（ns / TTL、オプション） | Emacs 29+        |
+| =http=       | =url-retrieve= 経由の GET/HEAD、ETag/TTL cache（オプション） | Emacs 29+（state 依存） |
 
 * クイックスタート
 
