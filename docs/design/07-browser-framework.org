@@ -249,6 +249,7 @@ Phase A で意図的に *やらない* もの。後続 phase か init.org compos
 - 「電気法令サイトを定期 scan」等の user 固有 crawl robot — init.org で
   anvil-browser + anvil-cron を組み合わせる形
 - Maxun REST 連携 — anvil-http (Phase C1) 経由で init.org composition
+- UA / profile / 認証 preset — Phase A' に分離 (上記 Risks 節参照)
 
 * Migration / Backward Compatibility
 
@@ -273,6 +274,21 @@ Phase A で意図的に *やらない* もの。後続 phase か init.org compos
 - *cache の staleness*. TTL 5 分なのに重要ニュースを取りこぼす可能性。
   → TTL は defcustom、critical path は ~anvil-browser-cache-ttl-sec 0~ で
   無効化可能
+- *login-walled / anti-bot サイトが読めない*。2026-04-18 soak で検出:
+  - X.com (~x.com/USER/status/ID~) は anonymous 取得だと "Don't miss
+    what's happening — Log in / Sign up" の壁ページのみ (~4KB)
+  - Reddit (~reddit.com/r/.../comments/.../~) は URL が
+    ~?solution=...&js_challenge=1&token=...~ に書き換わり、DOM に
+    "File a ticket" 1 リンクしか残らない (JS challenge)
+  - 静的 blog / 官公庁 ページは問題なし (jmatsuzaki.com 15.8KB で正常、
+    67.6% token 削減達成)
+  → *Phase A には入れない*。Phase A' で以下を defcustom として足す予定:
+    - ~anvil-browser-user-agent~ — agent-browser ~--user-agent~ に転送
+    - ~anvil-browser-profile~ — agent-browser ~--profile~ (user の既存
+      logged-in Chrome profile を共有、X 向け)
+    - session preset 機構 — 業務毎に auth 済 cookie jar を使い分け
+  → それまでは Reddit は ~.json~ endpoint を anvil-http (Phase C1) で
+    直叩き、X は手動 capture という分担
 
 * Platform Notes
 
