@@ -198,6 +198,15 @@ batch command."
                (vconcat cmd))
              commands))))
 
+(defun anvil-browser--strip-sentinel-noise (text)
+  "Strip Emacs' default \"Process ... finished/exited\" lines from TEXT.
+`make-process' injects these into the stdout / stderr buffer even
+when we pass `:sentinel #\\='ignore'; they corrupt downstream
+JSON parsing."
+  (replace-regexp-in-string
+   "\n*Process [^\n]* \\(finished\\|exited[^\n]*\\)\n*\\'"
+   "" text))
+
 (defun anvil-browser--run-batch (commands &optional session)
   "Spawn agent-browser with COMMANDS piped as JSON on stdin.
 
@@ -207,7 +216,13 @@ COMMANDS is a list of string lists, e.g.
 SESSION overrides `anvil-browser-session-name'.
 
 Returns the parsed JSON output (a list of per-command result
-plists).  Errors on non-zero exit, timeout, or invalid JSON."
+plists).  Non-zero exit is tolerated when the CLI still produced
+a parseable JSON array — the batch may have had some commands
+fail while others returned useful output (e.g. an `open' blocked
+by the browser but a usable error snapshot).  Callers check
+per-entry `:success' via `anvil-browser--check-all-success' when
+they need strict behavior.  Errors on timeout or when no parseable
+JSON comes back."
   (let* ((cli (anvil-browser--cli-path))
          (session-name (or session anvil-browser-session-name))
          (args (list "--session-name" session-name "batch" "--json"))
@@ -240,12 +255,11 @@ plists).  Errors on non-zero exit, timeout, or invalid JSON."
               (delete-process proc)
               (error "anvil-browser: timeout after %ss (commands=%d)"
                      anvil-browser-timeout-sec (length commands))))
-          (let ((exit (process-exit-status proc))
-                (stdout (with-current-buffer stdout-buf (buffer-string)))
-                (stderr (with-current-buffer stderr-buf (buffer-string))))
-            (unless (eql exit 0)
-              (error "anvil-browser: exit %s: %s"
-                     exit (string-trim (or stderr stdout ""))))
+          (let* ((exit (process-exit-status proc))
+                 (stdout (anvil-browser--strip-sentinel-noise
+                          (with-current-buffer stdout-buf (buffer-string))))
+                 (stderr (anvil-browser--strip-sentinel-noise
+                          (with-current-buffer stderr-buf (buffer-string)))))
             (condition-case err
                 (json-parse-string stdout
                                    :object-type 'plist
@@ -253,8 +267,9 @@ plists).  Errors on non-zero exit, timeout, or invalid JSON."
                                    :null-object nil
                                    :false-object nil)
               (json-parse-error
-               (error "anvil-browser: could not parse CLI output: %s — %s"
-                      (error-message-string err)
+               (error "anvil-browser: exit %s, could not parse CLI output: %s — stderr=%s stdout=%s"
+                      exit (error-message-string err)
+                      (string-trim stderr)
                       (string-trim stdout))))))
       (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
       (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
@@ -487,14 +502,12 @@ Returns the absolute path of the PNG file.  Caller owns cleanup."
      (ignore results)
      out)))
 
-(defun anvil-browser--tool-close (&optional _ignored)
+(defun anvil-browser--tool-close ()
   "Close every live agent-browser session.
 
-MCP Parameters:
-  (none — the argument is accepted for schema compat and ignored)
-
 Delegates to `agent-browser close --all'.  Safe to call when no
-sessions exist; the CLI is a no-op in that case."
+sessions exist; the CLI is a no-op in that case.  Also clears the
+in-memory fetch cache."
   (anvil-server-with-error-handling
    (let* ((cli (anvil-browser--cli-path))
           (stdout-buf (generate-new-buffer " *anvil-browser-close*"))
