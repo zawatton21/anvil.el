@@ -1402,11 +1402,17 @@ via `anvil-orchestrator-status' or block via
          (ids     nil))
     (dolist (t0 coerced)
       (let* ((id (anvil-orchestrator--uuid))
-             (task (append (list :id           id
-                                 :batch-id     batch-id
-                                 :submitted-at now
-                                 :status       'queued)
-                           t0)))
+             ;; `copy-sequence' disconnects any shared tail that `append'
+             ;; left behind -- without it, plist-put on a new key uses
+             ;; setcdr to extend the tail in place, so tasks that shared
+             ;; a defaults list (e.g. consensus fan-out) clobber each
+             ;; other's elapsed-ms / cost-usd / started-at on finalize.
+             (task (copy-sequence
+                    (append (list :id           id
+                                  :batch-id     batch-id
+                                  :submitted-at now
+                                  :status       'queued)
+                            t0))))
         (anvil-orchestrator--persist task)
         (push id ids)
         (setq anvil-orchestrator--queue

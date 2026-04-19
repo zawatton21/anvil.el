@@ -1257,6 +1257,35 @@ value (the batch-id) as its RESULT argument."
                          :key (lambda (t0) (plist-get t0 :provider)))))
         (should (equal "m-a" (plist-get a :model)))))))
 
+;;;; --- shared-tail regression ---------------------------------------------
+
+(ert-deftest anvil-orchestrator-test-submit-breaks-shared-tail ()
+  "Tasks built via a shared `defaults' tail (consensus fan-out) must
+not clobber each other's per-task fields when plist-put appends a
+new key to the internal plist.  Guard: submit deep-enough-copies
+so post-finalize :elapsed-ms of task A does not appear on task B."
+  (anvil-orchestrator-test--with-fresh
+    (let* ((defaults '(:timeout-sec 60 :budget-usd 0.10))
+           (ids (anvil-orchestrator-submit
+                 (list (append (list :name "alpha" :provider 'test
+                                     :prompt "hi")
+                               defaults)
+                       (append (list :name "beta"  :provider 'test
+                                     :prompt "yo")
+                               defaults)))))
+      (should (stringp ids))
+      (let* ((task-ids (gethash ids anvil-orchestrator--batches))
+             (a (anvil-orchestrator--task-get (car task-ids)))
+             (b (anvil-orchestrator--task-get (cadr task-ids))))
+        ;; Mutate A's plist by adding a novel key.
+        (anvil-orchestrator--task-update (car task-ids)
+                                         :probe-only-on-a "A")
+        (let ((a2 (anvil-orchestrator--task-get (car task-ids)))
+              (b2 (anvil-orchestrator--task-get (cadr task-ids))))
+          (should (equal "A" (plist-get a2 :probe-only-on-a)))
+          (should (null (plist-get b2 :probe-only-on-a))))
+        (ignore a b)))))
+
 ;;;; --- Phase 4b: meta-LLM judge -------------------------------------------
 
 (ert-deftest anvil-orchestrator-test-judge-format-candidates ()
