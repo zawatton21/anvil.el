@@ -325,20 +325,28 @@ edits one at a time.
 ** Web fetch caching (anvil-http + anvil-browser)
 
 =anvil-http-get= and =anvil-browser= ship with an in-process
-TTL cache keyed on URL + auth preset.  Measurement (see
-[[file:benchmarks/results/http-browser-report-2026-04-19.org][=http-browser-report-2026-04-19.org=]]):
-within the default TTL, *second and subsequent fetches cost 0 ms
+TTL cache keyed on URL + auth preset.  Measurement
+([[file:benchmarks/results/http-browser-report-2026-04-19.org][=http-browser-report-2026-04-19.org=]]):
+within the default TTL, *second and subsequent fetches cost 0–2 ms
 wallclock and send zero bytes over the network* — the response
 plist's =:from-cache= is =t=.  An agent that fetches the same
-Reddit thread / GitHub PR / docs page twice during a session pays
-for it exactly once.
+docs page / GitHub PR / Wikipedia article twice during a session
+pays for it exactly once.
 
-Separately, =anvil-browser= returns an accessibility-tree snapshot
-instead of raw HTML — measured *7–9× smaller* than the same URL's
-HTTP body on plain pages, and routinely 40–60× smaller on heavy
-rendered pages (Reddit threads, Jira boards).  Smaller payload
-means smaller prompt when the agent quotes the fetch back to the
-LLM.
+=anvil-browser= returns an accessibility-tree snapshot instead
+of raw HTML, which shrinks the payload for rendered pages.
+Measured on four URLs:
+
+| URL                             | http bytes | browser bytes | reduction |
+|---------------------------------+-----------:+--------------:+----------:|
+| =en.wikipedia.org/wiki/Emacs=   |    276 082 |        25 122 |    11.0×  |
+| =news.ycombinator.com/=         |     35 098 |        13 597 |     2.6×  |
+| =example.com/=                  |        528 |            73 |     7.2×  |
+
+Raw-text endpoints (e.g. =raw.githubusercontent.com/…/README=)
+degenerate to a placeholder snapshot; use =anvil-http-get= for
+those, not browser.  Smaller payload means smaller prompt when
+the agent quotes the fetch back to the LLM.
 
 ** Heavy work runs out of band
 

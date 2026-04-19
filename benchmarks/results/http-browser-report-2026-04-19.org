@@ -4,44 +4,56 @@
 
 * Summary
 
-Small, targeted measurement of the token-saving cache behaviour in
-=anvil-http= (Doc 09) and =anvil-browser= (Doc 07), produced on the
-same Debian 13 daemon that ran the v1 orchestrator benchmark.
-Scope intentionally narrow: two representative URLs, three fetches
-each per tool, miss → hit → hit.
+Measurement of the cache behaviour and payload size of =anvil-http=
+(Doc 09) and =anvil-browser= (Doc 07), produced on the same Debian
+13 daemon that ran the v1 orchestrator benchmark.  v1 (n=1, two
+tiny URLs) was supplemented with a heavier re-run covering four
+representative pages; both CSVs live in this directory.
 
 ** Headline numbers
 
-- *Within TTL, second and third fetches cost 0 ms wallclock and
-  zero outbound bytes* for both =anvil-http= and =anvil-browser=.
-  The cache hit is served from in-process state; nothing leaves
-  the Emacs daemon.  =from-cache= flag on the response plist lets
-  a caller distinguish live from cached replies.
-- *=anvil-browser= payloads are roughly 7–9× smaller than raw
-  HTTP bodies* for the same URL because =agent-browser= renders
-  the page and returns an accessibility-tree snapshot instead of
-  the raw HTML.  For rendered-content URLs the ratio goes much
-  higher (a typical Reddit thread is 400 KB raw HTML vs ~8 KB
-  accessibility text).
+- *Within TTL, second and third fetches cost 0–2 ms wallclock and
+  send zero bytes over the network* for both =anvil-http= and
+  =anvil-browser=.  The cache hit is served from in-process state;
+  nothing leaves the Emacs daemon.  On small payloads the hit is
+  indistinguishable from 0 ms (measured as =0=), on 276 KB
+  Wikipedia content it is ~2 ms for the in-memory copy.  =from-
+  cache= on the response plist lets a caller distinguish live from
+  cached replies.
+- *=anvil-browser= payloads are smaller than raw HTTP bodies on
+  pages that actually render* — the ratio depends entirely on how
+  much boilerplate vs real content a page has.  Measured range on
+  four URLs: *2.6× to 11×*.  It is *not* universal; raw-text URLs
+  get essentially no reduction (the accessibility tree collapses
+  to a placeholder).
 
-| URL                           | http bytes | browser bytes | reduction |
-|-------------------------------+-----------:+--------------:+----------:|
-| =https://example.com/=        |        528 |            73 |    7.23×  |
-| =https://httpbin.org/json=    |        429 |            49 |    8.76×  |
+| URL                                          | http bytes | browser bytes | reduction |
+|----------------------------------------------+-----------:+--------------:+----------:|
+| =https://en.wikipedia.org/wiki/Emacs=        |   276 082  |       25 122  |   *11.0×* |
+| =https://news.ycombinator.com/=              |    35 098  |       13 597  |    2.58×  |
+| =https://example.com/=                       |       528  |           73  |    7.23×  |
+| =raw.githubusercontent.com/…/linux/README=   |     6 043  |           25  |     N/A   |
+
+Note the =raw.githubusercontent.com= row: agent-browser renders
+the page as =text/plain=, so the accessibility snapshot collapses
+to a 25-byte placeholder.  Browser is the wrong tool for raw-text
+endpoints — use =anvil-http-get= there.
 
 ** First-call latency (for context, not the point of the bench)
 
 Observed on the author's 1 Gbps home link, Debian 13, Emacs 30:
 
-| URL                        | http miss | browser miss |
-|----------------------------+----------:+-------------:|
-| =https://example.com/=     |     38 ms |       175 ms |
-| =https://httpbin.org/json= |    845 ms |       767 ms |
+| URL                                        | http miss | browser miss |
+|--------------------------------------------+----------:+-------------:|
+| =https://en.wikipedia.org/wiki/Emacs=      |   668 ms  |     1 382 ms |
+| =https://news.ycombinator.com/=            |   632 ms  |       870 ms |
+| =https://example.com/=                     |   185 ms  |       181 ms |
+| =raw.githubusercontent.com/…/linux/README= |   349 ms  |       269 ms |
 
-Browser is slower on static content (agent-browser renders a full
-Chromium) but closer-to-parity on JSON endpoints that still route
-through the network.  Latency is *not* the selling point of
-=anvil-browser=; the fan-out / cleaning / cache is.
+Browser adds a ~500–700 ms render premium on rendered content;
+parity or better on raw text / small pages because Chromium is
+already warm.  Latency is *not* the selling point of
+=anvil-browser=; the payload shrinkage + cache is.
 
 * Methodology
 
@@ -65,21 +77,31 @@ measurements with a live LLM are deferred to v1.1.
 
 * Caveats
 
-1. *n = 1 per cell.*  Two URLs × three iters × two tools = twelve
-   observations.  Variance is not characterised.  Next pass
-   should do n ≥ 3 per (URL, tool, iter) and include a third URL
-   with heavier content (Reddit thread or long Wikipedia article).
-2. *Cache semantics are TTL-based, not etag-based in this sample.*
-   =anvil-http= does honour ETags on a 304 response, but neither
-   =example.com= nor =httpbin.org/json= returned a useful ETag
-   during the bench window; measurement of the ETag code path is
-   deferred.
+1. *Miss-side iter count is 1 per URL.*  Cache-hit rows do get
+   three observations but the real variance-bearing measurement
+   is the miss, and we have one of those per (URL, tool).  A real
+   v1.1 pass should run n ≥ 3 fresh cache-clear cycles per URL so
+   the miss-side latency has a stddev.
+2. *Cache semantics are TTL-based, not ETag-based in this sample.*
+   =anvil-http= does honour ETags on a 304 response, but none of
+   the four URLs returned a useful ETag during the bench window;
+   measurement of the ETag code path is deferred.
 3. *The browser tool's output shape is *accessibility tree*, not
    "clean prose".*  The ratio table above is payload-size, not
    direct content-quality comparable to a rendered article body.
    Agents built on top of =browser-fetch= typically quote the
    snapshot back to the LLM, so payload size is still the right
-   proxy for token cost.
+   proxy for token cost — *when the URL is actually a rendered
+   page*.  The =raw.githubusercontent.com= row illustrates the
+   failure mode: plain-text endpoints degenerate to a placeholder
+   snapshot.
+4. *Two CSVs in =results/=.*  =http-browser-20260419-215046.csv=
+   is the v1 pilot (2 URLs, pre-heavy).
+   =http-browser-20260419-220737.csv= is the superseding heavy-URL
+   run (4 URLs).  Both are checked in — the pilot is preserved
+   because its numbers got quoted in the README before the heavy
+   pass shipped; keeping it stops a reader from wondering where
+   the 7.23× number came from.
 
 * Reproducing
 
