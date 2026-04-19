@@ -1,0 +1,17 @@
+{
+  "name": "anvil-pty-broker",
+  "version": "0.1.0",
+  "description": "node-pty TCP broker for anvil (Phase 1 MVP)",
+  "main": "anvil-pty-broker.js",
+  "bin": {
+    "anvil-pty-broker": "anvil-pty-broker.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  },
+  "private": true,
+  "license": "GPL-3.0-or-later"
+}

@@ -94,7 +94,11 @@ These are not loaded by default.  Available modules:
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more
                    providers in Phase 2+) with concurrency-capped
                    queue, state-persisted status, and a
-                   tabulated-list dashboard (Doc 10 Phase 1a)"
+                   tabulated-list dashboard (Doc 10 Phase 1a)
+- `pty-broker' — node-pty TCP broker for TUI programs; moves PTY
+                 handling out of the Emacs daemon to avoid filter
+                 starvation / ConPTY stdin quirks (Doc 04 Phase 1,
+                 requires node + `npm install node-pty')"
   :type '(repeat symbol)
   :group 'anvil)
 

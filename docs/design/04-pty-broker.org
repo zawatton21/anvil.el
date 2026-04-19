@@ -3,9 +3,11 @@
 #+property: status DRAFT
 
 * STATUS
-~APPROVED~ (2026-04-19) — Phase 1 実装着手可。~ccih-pty-broker~ (2026-04-12 MVP 済)
-の知見と ~feedback_eat_daemon_filter_starvation.md~ / ~feedback_conpty_headless_stdin_unidirectional.md~
-で確立した pattern を正式化。
+~Phase 1 SHIPPED~ (2026-04-19, develop branch) — Node broker (~pty-broker/anvil-pty-broker.js~)
++ Elisp client (~anvil-pty-broker.el~) + MCP tools (pty-spawn / pty-send / pty-kill /
+pty-list / pty-read) + 9 pure ERT + 3 live ERT (node-pty 必須、CI skip)。
+~ccih-pty-broker~ (2026-04-12 MVP) の知見と ~feedback_eat_daemon_filter_starvation.md~ /
+~feedback_conpty_headless_stdin_unidirectional.md~ で確立した pattern を正式化。
 
 ** Decisions
 
@@ -208,14 +210,17 @@ Part 2 が主戦略。Part 1 は「どうしても TUI が必要な場合」の 
 
 * Implementation Plan
 
-1. *Phase 1 — Broker MVP 正式化* (~1 週間)
-   Scope lock:
+1. *Phase 1 — Broker MVP 正式化* *SHIPPED* (2026-04-19)
    - ~pty-broker/anvil-pty-broker.js~ (Node): node-pty + net.createServer + JSON line protocol
-   - ~anvil-pty-broker.el~ (Elisp client): ~anvil-pty-enable~ / ~anvil-pty-spawn~ /
-     ~anvil-pty-send~ / ~anvil-pty-kill~ / ~anvil-pty-list~、timer-only I/O
-   - auth token 必須 (起動時生成 + env 経由)
-   - 単一 pty セッション / ~resize~ は Phase 2
-   - ERT: bash spawn → ~echo hello\n~ 受信 (subprocess 内で完結)、token 不一致で切断
+   - ~anvil-pty-broker.el~ (Elisp client): ~anvil-pty-broker-enable~ / ~anvil-pty-spawn~ /
+     ~anvil-pty-send~ / ~anvil-pty-kill~ / ~anvil-pty-list~ / ~anvil-pty-read~、filter は
+     append-only で starvation-safe、parse は ~run-at-time~ tick
+   - auth token 必須 (起動時 random 生成、process env 経由で node に渡す)
+   - MCP tools 登録: pty-spawn / pty-send / pty-kill / pty-list / pty-read
+   - Phase 1 は multi-pty capable (単一制限は設けない)、~resize~ / ANSI render は Phase 2+
+   - ERT: 9 pure (frame parse / drain / gen-token / tool coercion) +
+     3 live (bash spawn echo-marker、allowlist deny、enable/disable roundtrip)
+   - 許可コマンドは ~anvil-pty-broker-allowed-commands~ (デフォルト空 = spawn 不可)
 
 2. *Phase 2 — Multi-pty + resize + kill* (~3 日)
    - 複数 pty を同時管理
