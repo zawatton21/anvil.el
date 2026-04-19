@@ -1778,5 +1778,156 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
     (should (= 60000
                (anvil-orchestrator--compute-retry-delay-ms 2 nil 60000)))))
 
+;; --- gemma4 thinking-mode guard tests ---
+
+(ert-deftest anvil-orchestrator--gemma4-strip-removes-single-block ()
+  (let ((anvil-orchestrator-ollama-strip-thinking t))
+    (should
+     (equal "Actual answer."
+            (anvil-orchestrator--ollama-strip-thinking-block
+             "<think>reasoning here</think>\nActual answer.")))))
+
+(ert-deftest anvil-orchestrator--gemma4-strip-case-insensitive-multiline ()
+  (let ((anvil-orchestrator-ollama-strip-thinking t))
+    (should
+     (equal "Real answer."
+            (anvil-orchestrator--ollama-strip-thinking-block
+             "<THINK>line one\nline two</Think>Real answer.")))))
+
+(ert-deftest anvil-orchestrator--gemma4-strip-bypass-when-disabled ()
+  (let ((anvil-orchestrator-ollama-strip-thinking nil)
+        (input "<think>meta</think>answer"))
+    (should
+     (equal input
+            (anvil-orchestrator--ollama-strip-thinking-block input)))))
+
+;; --- observability stats tests ---
+
+(ert-deftest anvil-orchestrator--obs-stats-empty-table-zero-totals ()
+  (let ((anvil-orchestrator--tasks (make-hash-table :test 'equal)))
+    (let* ((stats (anvil-orchestrator-stats))
+           (by-status (plist-get stats :by-status)))
+      (should (= 0 (plist-get stats :total)))
+      (should (= 0.0 (plist-get stats :total-cost-usd)))
+      (should (null (plist-get stats :elapsed-ms-avg)))
+      (should (null (plist-get stats :elapsed-ms-p50)))
+      (should (null (plist-get stats :elapsed-ms-p95)))
+      (should (= 0 (plist-get by-status :done)))
+      (should (= 0 (plist-get by-status :failed)))
+      (should (= 0 (plist-get by-status :cancelled)))
+      (should (= 0 (plist-get by-status :running)))
+      (should (= 0 (plist-get by-status :queued)))
+      (should (null (plist-get stats :by-provider))))))
+
+(ert-deftest anvil-orchestrator--obs-stats-mixed-populated ()
+  (let ((anvil-orchestrator--tasks (make-hash-table :test 'equal)))
+    (let ((finished-at 1000.0))
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'done :provider 'claude :elapsed-ms 100
+                     :cost-usd 0.01 :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'done :provider 'claude :elapsed-ms 300
+                     :cost-usd 0.02 :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'failed :provider 'codex :elapsed-ms 200
+                     :cost-usd nil :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'cancelled :provider 'codex :elapsed-ms nil
+                     :cost-usd nil :finished-at finished-at)
+               anvil-orchestrator--tasks))
+    (let* ((stats (anvil-orchestrator-stats))
+           (by-status (plist-get stats :by-status))
+           (by-provider (plist-get stats :by-provider))
+           (claude (cdr (assoc 'claude by-provider)))
+           (codex (cdr (assoc 'codex by-provider))))
+      (should (= 4 (plist-get stats :total)))
+      (should (= 2 (plist-get by-status :done)))
+      (should (= 1 (plist-get by-status :failed)))
+      (should (= 1 (plist-get by-status :cancelled)))
+      (should (= 200 (plist-get stats :elapsed-ms-avg)))
+      (should (= 200 (plist-get stats :elapsed-ms-p50)))
+      (should (= 200 (plist-get stats :elapsed-ms-p95)))
+      (should (= 0.03 (plist-get stats :total-cost-usd)))
+      (should claude)
+      (should (= 2 (plist-get claude :total)))
+      (should (= 200 (plist-get claude :elapsed-ms-avg)))
+      (should (= 0.03 (plist-get claude :cost-usd-total)))
+      (should codex)
+      (should (= 2 (plist-get codex :total)))
+      (should (= 200 (plist-get codex :elapsed-ms-avg)))
+      (should (= 0.0 (plist-get codex :cost-usd-total))))))
+
+(ert-deftest anvil-orchestrator--obs-stats-provider-filter ()
+  (let ((anvil-orchestrator--tasks (make-hash-table :test 'equal)))
+    (let ((finished-at 1000.0))
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'done :provider 'claude :elapsed-ms 100
+                     :cost-usd 0.01 :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'done :provider 'claude :elapsed-ms 300
+                     :cost-usd 0.02 :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'failed :provider 'codex :elapsed-ms 200
+                     :cost-usd nil :finished-at finished-at)
+               anvil-orchestrator--tasks)
+      (puthash (anvil-orchestrator--uuid)
+               (list :status 'cancelled :provider 'codex :elapsed-ms nil
+                     :cost-usd nil :finished-at finished-at)
+               anvil-orchestrator--tasks))
+    (let* ((stats (anvil-orchestrator-stats :provider 'claude))
+           (by-status (plist-get stats :by-status))
+           (by-provider (plist-get stats :by-provider)))
+      (should (= 2 (plist-get stats :total)))
+      (should (= 1 (length by-provider)))
+      (should (eq 'claude (caar by-provider)))
+      (should (= 2 (plist-get by-status :done)))
+      (should (= 0 (plist-get by-status :failed)))
+      (should (= 0 (plist-get by-status :cancelled)))
+      (should (= 0 (plist-get by-status :running)))
+      (should (= 0 (plist-get by-status :queued))))))
+
+;; --- observability UI + MCP tests ---
+
+(ert-deftest anvil-orchestrator--obs-ui-format-stats-text-shape ()
+  (let ((text
+         (anvil-orchestrator--format-stats-text
+          '(:total 4
+            :by-status (:done 2 :failed 1 :cancelled 1 :running 0 :queued 0)
+            :by-provider ((claude :total 2 :done 2 :failed 0
+                                  :elapsed-ms-avg 200 :cost-usd-total 0.03)
+                          (codex :total 2 :done 0 :failed 1
+                                 :elapsed-ms-avg 200 :cost-usd-total 0.0))
+            :elapsed-ms-avg 200 :elapsed-ms-p50 200 :elapsed-ms-p95 300
+            :total-cost-usd 0.03 :since nil :provider nil))))
+    (should (stringp text))
+    (should-not (string-empty-p text))
+    (should (string-match-p (regexp-quote "Anvil Orchestrator stats") text))
+    (should (string-match-p (regexp-quote "total:") text))
+    (should (string-match-p (regexp-quote "claude") text))
+    (should (string-match-p (regexp-quote "codex") text))))
+
+(ert-deftest anvil-orchestrator--obs-ui-format-stats-text-nil-numerics ()
+  (let ((text
+         (anvil-orchestrator--format-stats-text
+          '(:total nil
+            :by-status (:done nil :failed nil :cancelled nil :running nil :queued nil)
+            :by-provider nil
+            :elapsed-ms-avg nil :elapsed-ms-p50 nil :elapsed-ms-p95 nil
+            :total-cost-usd nil :since nil :provider nil))))
+    (should (stringp text))
+    (should (string-match-p (regexp-quote "-") text))))
+
+(ert-deftest anvil-orchestrator--obs-ui-tool-stats-returns-stats ()
+  (cl-letf (((symbol-function 'anvil-orchestrator-stats)
+             (lambda (&rest _args)
+               '(:total 42))))
+    (should (equal '(:total 42)
+                   (anvil-orchestrator--tool-stats nil)))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

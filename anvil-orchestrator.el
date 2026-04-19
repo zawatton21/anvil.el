@@ -735,6 +735,11 @@ Useful for flags like `--keepalive 5m' or `--verbose'."
   :type '(repeat string)
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-ollama-strip-thinking t
+  "When non-nil, strip `<think>...</think>' blocks (case-insensitive, multi-line) from ollama stdout before building the task summary.  Set to nil to pass thinking output through verbatim."
+  :type 'boolean
+  :group 'anvil-orchestrator)
+
 (defun anvil-orchestrator--ollama-check ()
   "Return t when the `ollama' CLI is on `exec-path'."
   (if (executable-find "ollama") t
@@ -779,6 +784,26 @@ args."
 Stripped by `anvil-orchestrator--ollama-parse-output' when
 building the tail summary.")
 
+(defun anvil-orchestrator--ollama-strip-thinking-block (text)
+  "Strip ollama thinking-mode preamble blocks from TEXT.
+
+When `anvil-orchestrator-ollama-strip-thinking' is non-nil, remove
+all case-insensitive `<think>...</think>' substrings from TEXT using
+a multi-line regex match, then trim the result with `string-trim'.
+If TEXT is nil, or stripping is disabled, return TEXT unchanged.
+Return nil when the stripped and trimmed result is an empty string."
+  (if (or (null text)
+          (not anvil-orchestrator-ollama-strip-thinking))
+      text
+    (let* ((case-fold-search t)
+           (stripped
+            (replace-regexp-in-string
+             "<think>\\(?:.\\|\n\\)*?</think>" ""
+             text)))
+      (let ((trimmed (string-trim stripped)))
+        (unless (string-empty-p trimmed)
+          trimmed)))))
+
 (defun anvil-orchestrator--ollama-parse-output (stdout-path stderr-path exit-code)
   "Parse ollama STDOUT-PATH plain text into a summary plist.
 Returns (:summary STR :cost-usd NIL :cost-tokens NIL
@@ -807,7 +832,8 @@ Returns (:summary STR :cost-usd NIL :cost-tokens NIL
                 (setq summary (mapconcat #'identity
                                          (nreverse lines) "\n"))))))
       (error nil))
-    (list :summary         (anvil-orchestrator--truncate-summary summary)
+    (list :summary         (anvil-orchestrator--truncate-summary
+                            (anvil-orchestrator--ollama-strip-thinking-block summary))
           :cost-usd        nil
           :cost-tokens     nil
           :commit-sha      nil
@@ -2269,6 +2295,203 @@ MCP Parameters:
    (let ((w (and wait (not (member wait '("" "nil" "false" "0"))))))
      (anvil-orchestrator-judge-collect consensus_id :wait w))))
 
+;;;; --- observability -------------------------------------------------------
+
+(defun anvil-orchestrator--percentile (sorted-values pct)
+  "Return the PCT percentile from SORTED-VALUES.
+SORTED-VALUES must already be sorted ascending.  PCT is an integer
+between 0 and 100 inclusive.  Return nil when SORTED-VALUES is empty.
+Otherwise return the value at index
+`(floor (* (/ pct 100.0) (1- n)))', where N is the list length."
+  (when sorted-values
+    (let* ((n (length sorted-values))
+           (idx (floor (* (/ pct 100.0) (1- n)))))
+      (nth idx sorted-values))))
+
+(defun anvil-orchestrator-stats (&rest args)
+  "Aggregate observability statistics from `anvil-orchestrator--tasks'.
+
+Accepted keyword ARGS: `:since' (float-time cutoff) and `:provider'
+(provider symbol).  Both filter tasks; see helpers for semantics.
+Returns a plist with keys :total, :by-status, :by-provider,
+:elapsed-ms-avg, :elapsed-ms-p50, :elapsed-ms-p95, :total-cost-usd,
+:since, :provider."
+  (let* ((since (plist-get args :since))
+         (provider-filter (plist-get args :provider))
+         (total 0)
+         (done 0)
+         (failed 0)
+         (cancelled 0)
+         (running 0)
+         (queued 0)
+         (elapsed-values nil)
+         (elapsed-sum 0)
+         (elapsed-count 0)
+         (total-cost 0.0)
+         (provider-stats (make-hash-table :test 'eq)))
+    (cl-labels
+        ((round-cost (value)
+           (/ (round (* value 1000000)) 1000000.0))
+         (mean-or-nil (sum count)
+           (when (> count 0)
+             (round (/ (float sum) count)))))
+      (maphash
+       (lambda (_id task)
+         (let ((task-provider (plist-get task :provider))
+               (task-finished-at (plist-get task :finished-at)))
+           (when (and (or (null provider-filter)
+                          (eq task-provider provider-filter))
+                      (or (not (numberp since))
+                          (and (numberp task-finished-at)
+                               (>= task-finished-at since))))
+             (cl-incf total)
+             (pcase (plist-get task :status)
+               ('done (cl-incf done))
+               ('failed (cl-incf failed))
+               ('cancelled (cl-incf cancelled))
+               ('running (cl-incf running))
+               ('queued (cl-incf queued)))
+             (let ((elapsed-ms (plist-get task :elapsed-ms)))
+               (when (integerp elapsed-ms)
+                 (push elapsed-ms elapsed-values)
+                 (cl-incf elapsed-sum elapsed-ms)
+                 (cl-incf elapsed-count)))
+             (let ((cost-usd (plist-get task :cost-usd)))
+               (when (numberp cost-usd)
+                 (setq total-cost (+ total-cost cost-usd))))
+             (let* ((bucket (or (gethash task-provider provider-stats)
+                                (list :total 0
+                                      :done 0
+                                      :failed 0
+                                      :elapsed-ms-sum 0
+                                      :elapsed-ms-count 0
+                                      :cost-usd-total 0.0)))
+                    (bucket-elapsed-ms (plist-get task :elapsed-ms))
+                    (bucket-cost-usd (plist-get task :cost-usd)))
+               (setq bucket (plist-put bucket :total (1+ (plist-get bucket :total))))
+               (when (eq (plist-get task :status) 'done)
+                 (setq bucket (plist-put bucket :done (1+ (plist-get bucket :done)))))
+               (when (eq (plist-get task :status) 'failed)
+                 (setq bucket (plist-put bucket :failed (1+ (plist-get bucket :failed)))))
+               (when (integerp bucket-elapsed-ms)
+                 (setq bucket
+                       (plist-put bucket :elapsed-ms-sum
+                                  (+ (plist-get bucket :elapsed-ms-sum) bucket-elapsed-ms)))
+                 (setq bucket
+                       (plist-put bucket :elapsed-ms-count
+                                  (1+ (plist-get bucket :elapsed-ms-count)))))
+               (when (numberp bucket-cost-usd)
+                 (setq bucket
+                       (plist-put bucket :cost-usd-total
+                                  (+ (plist-get bucket :cost-usd-total) bucket-cost-usd))))
+               (puthash task-provider bucket provider-stats)))))
+       anvil-orchestrator--tasks)
+      (let* ((sorted-elapsed (sort elapsed-values #'<))
+             (by-provider nil))
+        (maphash
+         (lambda (prov bucket)
+           (push
+            (cons prov
+                  (list :total (plist-get bucket :total)
+                        :done (plist-get bucket :done)
+                        :failed (plist-get bucket :failed)
+                        :elapsed-ms-avg
+                        (mean-or-nil (plist-get bucket :elapsed-ms-sum)
+                                     (plist-get bucket :elapsed-ms-count))
+                        :cost-usd-total
+                        (round-cost (plist-get bucket :cost-usd-total))))
+            by-provider))
+         provider-stats)
+        (setq by-provider
+              (sort by-provider
+                    (lambda (a b)
+                      (string< (symbol-name (car a))
+                               (symbol-name (car b))))))
+        (list :total total
+              :by-status (list :done done
+                               :failed failed
+                               :cancelled cancelled
+                               :running running
+                               :queued queued)
+              :by-provider by-provider
+              :elapsed-ms-avg (mean-or-nil elapsed-sum elapsed-count)
+              :elapsed-ms-p50 (anvil-orchestrator--percentile sorted-elapsed 50)
+              :elapsed-ms-p95 (anvil-orchestrator--percentile sorted-elapsed 95)
+              :total-cost-usd (round-cost total-cost)
+              :since since
+              :provider provider-filter)))))
+
+(defun anvil-orchestrator--format-stats-text (stats)
+  "Return a human-readable multi-line stats summary for STATS.
+Nil numeric values render as \"-\".  Cost values render with four
+decimal places, or \"-\" when nil or zero."
+  (cl-labels
+      ((fmt-num (v)
+         (if (numberp v) (number-to-string v) "-"))
+       (fmt-cost (v)
+         (if (and (numberp v) (/= v 0.0))
+             (format "%.4f" v)
+           "-"))
+       (provider-line (entry)
+         (let* ((provider (car entry))
+                (plist (cdr entry))
+                (cost (or (plist-get plist :cost-usd-total)
+                          (plist-get plist :total-cost-usd))))
+           (format "  %s  total=%s  done=%s  failed=%s  avg-ms=%s  cost=%s"
+                   provider
+                   (fmt-num (plist-get plist :total))
+                   (fmt-num (plist-get plist :done))
+                   (fmt-num (plist-get plist :failed))
+                   (fmt-num (plist-get plist :elapsed-ms-avg))
+                   (fmt-cost cost)))))
+    (let* ((by-status (plist-get stats :by-status))
+           (by-provider (plist-get stats :by-provider))
+           (lines (list
+                   "Anvil Orchestrator stats"
+                   "------------------------"
+                   (format "total:      %s"
+                           (fmt-num (plist-get stats :total)))
+                   (format "by-status:  done=%s failed=%s cancelled=%s running=%s queued=%s"
+                           (fmt-num (plist-get by-status :done))
+                           (fmt-num (plist-get by-status :failed))
+                           (fmt-num (plist-get by-status :cancelled))
+                           (fmt-num (plist-get by-status :running))
+                           (fmt-num (plist-get by-status :queued)))
+                   (format "elapsed-ms: avg=%s p50=%s p95=%s"
+                           (fmt-num (plist-get stats :elapsed-ms-avg))
+                           (fmt-num (plist-get stats :elapsed-ms-p50))
+                           (fmt-num (plist-get stats :elapsed-ms-p95)))
+                   (format "cost-usd:   %s"
+                           (fmt-cost (plist-get stats :total-cost-usd)))
+                   ""
+                   "by-provider:")))
+      (when by-provider
+        (setq lines
+              (append lines
+                      (mapcar #'provider-line by-provider))))
+      (string-join lines "\n"))))
+
+;;;###autoload
+(defun anvil-orchestrator-stats-dashboard ()
+  "Show the orchestrator stats dashboard in a reusable special-mode buffer."
+  (interactive)
+  (let ((buffer (get-buffer-create "*Anvil Orchestrator Stats*"))
+        (text (anvil-orchestrator--format-stats-text
+               (anvil-orchestrator-stats))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert text)
+        (goto-char (point-min))
+        (special-mode)))
+    (pop-to-buffer buffer)))
+
+(defun anvil-orchestrator--tool-stats (_args)
+  "MCP wrapper for `anvil-orchestrator-stats'.
+The server layer performs JSON serialisation; this function
+returns the stats plist verbatim."
+  (anvil-orchestrator-stats))
+
 ;;;; --- dashboard ----------------------------------------------------------
 
 (defvar anvil-orchestrator-dashboard-mode-map
@@ -2464,6 +2687,16 @@ Returns the judge-task-id; poll with
    "Return the judge task summary for a consensus id.  Pass
 wait=\"t\" to block until the judge task reaches a terminal
 state."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-stats
+   :id "orchestrator-stats"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return aggregated task statistics from the in-memory task table:
+totals, per-status counts, per-provider breakdown, elapsed-ms avg/
+p50/p95, and total cost-usd sum.  Read-only snapshot."
    :read-only t))
 
 (defun anvil-orchestrator--unregister-tools ()
@@ -2473,7 +2706,8 @@ state."
                 "orchestrator-consensus-submit"
                 "orchestrator-consensus-collect"
                 "orchestrator-consensus-judge"
-                "orchestrator-consensus-judge-collect"))
+                "orchestrator-consensus-judge-collect"
+                "orchestrator-stats"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload
