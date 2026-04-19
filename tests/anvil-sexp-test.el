@@ -502,5 +502,182 @@
        (should-not (plist-get plan :applied-at))))))
 
 
+;;;; --- Phase 2a: project-scope rename ------------------------------------
+
+(defvar anvil-sexp-test--phase2a-sample "\
+;;; p2a.el --- fixture -*- lexical-binding: t; -*-
+
+;;; Commentary:
+;; A fixture for Phase 2a rename / replace-call tests.
+
+;;; Code:
+
+(defvar p2a-counter 0
+  \"Count of calls to p2a-hello.\")
+
+(defun p2a-hello (name)
+  \"Greet NAME via p2a-format.  Increments p2a-counter.\"
+  (setq p2a-counter (1+ p2a-counter))
+  (p2a-format \"Hello, %s!\" name))
+
+(defun p2a-format (fmt &rest args)
+  \"Wrapper over format.  The string token \\\"p2a-format\\\" here must be skipped.\"
+  (apply #'format fmt args))
+
+(defvar p2a-handlers
+  (list #'p2a-hello #'p2a-format)
+  \"List of handlers.\")
+
+(when (fboundp 'p2a-hello)
+  (p2a-hello \"test\"))
+
+(provide 'p2a)
+;;; p2a.el ends here
+")
+
+(defun anvil-sexp-test--with-phase2a-dir (fn)
+  "Write the Phase 2a sample into a temp dir, call FN with dir + file."
+  (let* ((dir (make-temp-file "anvil-sexp-p2a-" t))
+         (file (expand-file-name "p2a.el" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert anvil-sexp-test--phase2a-sample))
+          (funcall fn dir file))
+      (when (file-directory-p dir) (delete-directory dir t)))))
+
+(ert-deftest anvil-sexp-test-rename-preview-counts-hits ()
+  "rename-symbol preview returns a plan whose ops count matches the fixture."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let ((plan (anvil-sexp--tool-rename-symbol
+                  "p2a-hello" "p2a-hi" nil file)))
+       (let ((ops (plist-get plan :ops)))
+         ;; Expected: defun-name 1, #'p2a-hello 1, 'p2a-hello in fboundp 1,
+         ;; (p2a-hello ...) call 1 => 4.  The docstring mention is excluded.
+         (should (= 4 (length ops))))
+       (should (null (plist-get plan :applied-at)))))))
+
+(ert-deftest anvil-sexp-test-rename-excludes-strings-and-comments ()
+  "rename-symbol must not touch occurrences inside strings/comments."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let ((plan (anvil-sexp--tool-rename-symbol
+                  "p2a-format" "p2a-fmt" nil file)))
+       (anvil-sexp--apply-plan plan))
+     (let ((after (with-temp-buffer (insert-file-contents file)
+                                    (buffer-string))))
+       ;; The defun's name is rewritten.
+       (should-not (string-match-p "(defun p2a-format" after))
+       (should (string-match-p "(defun p2a-fmt" after))
+       ;; The string-literal mention of p2a-format inside the
+       ;; docstring ("The string token \"p2a-format\" here...") must
+       ;; be left alone.  We grep for the surrounding docstring
+       ;; context to avoid the backslash-escape trap.
+       (should (string-match-p "The string token.*p2a-format" after))
+       ;; The first docstring ("Greet NAME via p2a-format...") also
+       ;; preserves its free-text mention.
+       (should (string-match-p "Greet NAME via p2a-format" after))))))
+
+(ert-deftest anvil-sexp-test-rename-kind-filter-call-only ()
+  "rename-symbol kinds=\"call\" touches only operator-position sites."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let* ((plan (anvil-sexp--tool-rename-symbol
+                   "p2a-hello" "p2a-hi" "call" file))
+            (ops (plist-get plan :ops)))
+       (should (= 1 (length ops)))
+       (should (equal (plist-get (car ops) :replacement) "p2a-hi"))))))
+
+(ert-deftest anvil-sexp-test-rename-apply-writes-file ()
+  "rename-symbol apply=t actually writes the expected replacements."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (anvil-sexp--tool-rename-symbol
+      "p2a-hello" "p2a-hi" nil file "t")
+     (let ((after (with-temp-buffer
+                    (insert-file-contents file)
+                    (buffer-string))))
+       (should (string-match-p "(defun p2a-hi " after))
+       (should (string-match-p "(p2a-hi \"test\")" after))
+       (should (string-match-p "#'p2a-hi" after))
+       (should (string-match-p "'p2a-hi" after))))))
+
+(ert-deftest anvil-sexp-test-rename-apply-json-false-is-noop ()
+  "apply=:json-false must not write; preview-safety invariant."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let ((before (with-temp-buffer (insert-file-contents file)
+                                     (buffer-string))))
+       (anvil-sexp--tool-rename-symbol
+        "p2a-hello" "p2a-hi" nil file :json-false)
+       (let ((after (with-temp-buffer (insert-file-contents file)
+                                      (buffer-string))))
+         (should (equal before after)))))))
+
+(ert-deftest anvil-sexp-test-rename-refuses-empty ()
+  "rename-symbol refuses empty OLD or NEW."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (should-error (anvil-sexp--tool-rename-symbol
+                    "" "x" nil file)
+                   :type 'anvil-server-tool-error)
+     (should-error (anvil-sexp--tool-rename-symbol
+                    "p2a-hello" "" nil file)
+                   :type 'anvil-server-tool-error))))
+
+(ert-deftest anvil-sexp-test-replace-call-positional ()
+  "replace-call substitutes %1 into the template using the call's arg."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let* ((plan (anvil-sexp--tool-replace-call
+                   "p2a-hello" "(message \"hi %1\")" file))
+            (ops (plist-get plan :ops)))
+       (should (= 1 (length ops)))
+       (should (string-match-p
+                "^(message \"hi \"test\"\")$\\|^(message \"hi \\\\\"test\\\\\"\")$\\|hi"
+                (plist-get (car ops) :replacement)))))))
+
+(ert-deftest anvil-sexp-test-replace-call-template-over-arity ()
+  "replace-call skips sites whose call has fewer args than the template needs."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let ((plan (anvil-sexp--tool-replace-call
+                  "p2a-hello" "(pair %1 %2)" file)))
+       (should (listp (plist-get plan :ops)))
+       (should (= 0 (length (plist-get plan :ops))))))))
+
+(ert-deftest anvil-sexp-test-project-root-default ()
+  "Project root walks up to the nearest git repo."
+  (let* ((file (locate-library "anvil-sexp"))
+         (root (anvil-sexp--project-root (file-name-directory file))))
+    (should (stringp root))
+    (should (file-directory-p root))
+    (should (file-exists-p (expand-file-name ".git" root)))))
+
+(ert-deftest anvil-sexp-test-resolve-scope-shapes ()
+  "resolve-scope accepts list / CSV / file / directory / \"project\" defaults."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (should (equal (anvil-sexp--resolve-scope (list file)) (list file)))
+     (should (member file (anvil-sexp--resolve-scope file)))
+     (should (member file (anvil-sexp--resolve-scope dir)))
+     (should (member file
+                     (anvil-sexp--resolve-scope (concat file "," file)))))))
+
+(ert-deftest anvil-sexp-test-public-phase2a-api-fboundp ()
+  "Phase 2a public entry points are defined."
+  (should (fboundp 'anvil-sexp-rename-symbol))
+  (should (fboundp 'anvil-sexp-replace-call)))
+
+
 (provide 'anvil-sexp-test)
 ;;; anvil-sexp-test.el ends here

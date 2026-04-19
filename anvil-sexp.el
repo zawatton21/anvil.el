@@ -486,6 +486,344 @@ POINT lies outside any sexp."
             (anvil-sexp--maybe-apply plan apply))))))))
 
 
+;;;; --- phase 2a: project-scope rename / replace-call -----------------------
+
+;; Reader-only backend.  Each .el file in scope is parsed via
+;; `anvil-sexp--read-file' to get the top-level forms with their byte
+;; ranges, and each range is text-scanned for the target symbol with
+;; `syntax-ppss' filtering out strings and comments.  A future
+;; Phase 2b will swap the resolver for Doc 11 `anvil-defs-references'
+;; with no public API change.
+
+(defgroup anvil-sexp-project nil
+  "Project-scope settings for `anvil-sexp' Phase 2a rename."
+  :group 'anvil-sexp)
+
+(defcustom anvil-sexp-project-exclude-patterns
+  '("/\\.git/"
+    "/\\.claude/"
+    "/node_modules/"
+    "/tests/fixtures/"
+    "/worktrees/"
+    "/dist/"
+    "/build/"
+    "\\.elc\\'")
+  "Regexps of file paths to exclude from project-wide sexp scans."
+  :type '(repeat regexp)
+  :group 'anvil-sexp-project)
+
+(defun anvil-sexp--project-root (&optional hint)
+  "Return the project root containing HINT (or `default-directory').
+Uses the nearest `.git' ancestor; falls back to HINT itself."
+  (let ((d (expand-file-name (or hint default-directory))))
+    (or (ignore-errors
+          (locate-dominating-file d ".git"))
+        (file-name-directory d))))
+
+(defun anvil-sexp--project-el-files (root)
+  "List .el source files under ROOT, respecting
+`anvil-sexp-project-exclude-patterns'."
+  (let ((all (directory-files-recursively root "\\.el\\'" nil)))
+    (cl-remove-if
+     (lambda (f)
+       (cl-some (lambda (re) (string-match-p re f))
+                anvil-sexp-project-exclude-patterns))
+     all)))
+
+(defun anvil-sexp--scan-symbol-refs (file name)
+  "Return a list of reference plists for NAME in FILE.
+Each entry is (:kind KIND :start POS :end POS) where KIND is one
+of `defun-name', `call', `quote', or `symbol'.  Strings and
+comments are skipped via `syntax-ppss'.  Phase 2a approximation:
+`var' and `defun-name' collapse into either `defun-name' (when
+the site is the second slot of a known defining form — detected
+via the form's parsed metadata) or `symbol' otherwise; Phase 2b
+will refine via the Doc 11 index."
+  (let ((sym-name (if (symbolp name) (symbol-name name) name))
+        (target-sym (if (symbolp name) name (intern name))))
+    (anvil-sexp--with-elisp-syntax
+     (lambda ()
+       (insert-file-contents file)
+       (let* ((forms (anvil-sexp--read-current-buffer))
+              (regex (concat "\\_<" (regexp-quote sym-name) "\\_>"))
+              (defun-name-positions (make-hash-table :test 'eql))
+              (hits nil))
+         ;; Pass 1: mark defun-name positions via the sexp metadata.
+         (dolist (f forms)
+           (when (eq (plist-get f :name) target-sym)
+             (save-excursion
+               (goto-char (plist-get f :form-start))
+               (when (looking-at-p "(")
+                 (forward-char 1)
+                 (forward-comment most-positive-fixnum)
+                 ;; Skip operator token.
+                 (when (ignore-errors (forward-sexp) t)
+                   (forward-comment most-positive-fixnum)
+                   (let ((tok-start (point)))
+                     ;; The name may be either bare SYMBOL or a
+                     ;; (SYMBOL :option ...) list for cl-defstruct-
+                     ;; style forms.  Accept either prefix.
+                     (when (or (looking-at (regexp-quote sym-name))
+                               (and (looking-at-p "(")
+                                    (save-excursion
+                                      (forward-char 1)
+                                      (forward-comment most-positive-fixnum)
+                                      (looking-at (regexp-quote sym-name)))))
+                       (let ((match-beg (if (looking-at-p "(")
+                                            (save-excursion
+                                              (forward-char 1)
+                                              (forward-comment
+                                               most-positive-fixnum)
+                                              (point))
+                                          tok-start)))
+                         (puthash match-beg t defun-name-positions)
+                         (push (list :kind 'defun-name
+                                     :start match-beg
+                                     :end (+ match-beg (length sym-name)))
+                               hits)))))))))
+         ;; Pass 2: general text scan, classify via char-before and
+         ;; enclosing-list car.  Skip positions already counted as
+         ;; defun-name.
+         ;;
+         ;; NOTE: `syntax-ppss' with an explicit POS moves point to
+         ;; POS as a side effect (the underlying `parse-partial-sexp'
+         ;; leaves point wherever it stopped), which would rewind the
+         ;; `re-search-forward' walker and produce an infinite loop.
+         ;; The `save-excursion' guard is load-bearing — do not drop.
+         (goto-char (point-min))
+         (while (re-search-forward regex nil t)
+           (let* ((beg (match-beginning 0))
+                  (end (match-end 0))
+                  (ppss (save-excursion (syntax-ppss beg))))
+             (unless (or (nth 3 ppss)   ; in string
+                         (nth 4 ppss)   ; in comment
+                         (gethash beg defun-name-positions))
+               (push (list :kind (save-excursion
+                                   (anvil-sexp--classify-ref-at beg))
+                           :start beg
+                           :end end)
+                     hits))))
+         (sort hits (lambda (a b) (< (plist-get a :start)
+                                     (plist-get b :start)))))))))
+
+(defun anvil-sexp--classify-ref-at (pos)
+  "Classify the elisp symbol occurrence starting at POS.
+Returns one of `quote', `call', or `symbol' based on the
+immediately preceding character and, when relevant, the
+enclosing list's operator.  Call this only on positions that are
+already known not to be inside a string or comment."
+  (let* ((prev (and (> pos (point-min)) (char-before pos)))
+         (prev2 (and prev (> pos (1+ (point-min)))
+                     (char-before (1- pos)))))
+    (cond
+     ;; #'foo or 'foo reader syntax
+     ((and (eql prev ?') (eql prev2 ?#)) 'quote)
+     ((eql prev ?') 'quote)
+     ;; Operator position: `(foo ...)'
+     ((eql prev ?\() 'call)
+     ;; Parent (quote X) / (function X)
+     (t
+      (let ((car-sym (anvil-sexp--enclosing-list-car pos)))
+        (cond
+         ((memq car-sym '(quote function)) 'quote)
+         ;; defvar / defcustom / defconst / defalias treat the second
+         ;; slot as a name binding.  We do not distinguish that slot
+         ;; from body references here — the kind filter in the caller
+         ;; treats `symbol' as the catch-all.
+         (t 'symbol)))))))
+
+(defun anvil-sexp--enclosing-list-car (pos)
+  "Return the operator symbol of the list immediately enclosing POS.
+Returns nil when POS is at the top level or the operator is not a
+plain symbol."
+  (save-excursion
+    (goto-char pos)
+    (let ((ppss (syntax-ppss)))
+      (when (> (nth 0 ppss) 0)
+        (goto-char (1+ (nth 1 ppss)))
+        (forward-comment most-positive-fixnum)
+        (ignore-errors
+          (let ((s (read (current-buffer))))
+            (and (symbolp s) s)))))))
+
+(defun anvil-sexp--resolve-scope (scope)
+  "Return a list of .el file paths matching SCOPE.
+SCOPE may be:
+  - nil or \"project\"  -> every .el under the current project root
+  - a directory path   -> every .el under that directory
+  - a file path        -> that single file
+  - a comma-separated string of file paths -> each as given
+  - a list of paths    -> each as given"
+  (cond
+   ((or (null scope) (equal scope "") (equal scope "project"))
+    (anvil-sexp--project-el-files (anvil-sexp--project-root)))
+   ((listp scope) scope)
+   ((and (stringp scope) (string-match-p "," scope))
+    (mapcar #'string-trim (split-string scope ",")))
+   ((stringp scope)
+    (cond
+     ((file-directory-p scope) (anvil-sexp--project-el-files scope))
+     ((file-regular-p scope) (list scope))
+     (t (error "anvil-sexp: scope %S does not exist" scope))))
+   (t (error "anvil-sexp: unsupported scope shape %S" scope))))
+
+(defun anvil-sexp--rename-plan (scope old new &optional kinds)
+  "Build an edit plan renaming OLD to NEW across SCOPE.
+KINDS restricts reference kinds (list of symbols; nil = all)."
+  (let* ((files (anvil-sexp--resolve-scope scope))
+         (old-name (if (symbolp old) (symbol-name old) old))
+         (new-name (if (symbolp new) (symbol-name new) new))
+         (kinds-filter (cond ((null kinds) nil)
+                             ((listp kinds) kinds)
+                             ((stringp kinds)
+                              (mapcar #'intern
+                                      (split-string kinds "[ ,]+" t)))))
+         (ops nil)
+         (touched-files 0)
+         (total-hits 0))
+    (unless (and (not (string-empty-p old-name))
+                 (not (string-empty-p new-name)))
+      (error "anvil-sexp-rename-symbol: OLD and NEW must be non-empty"))
+    (dolist (file files)
+      (let ((file-hits (anvil-sexp--scan-symbol-refs file old-name))
+            (emitted 0))
+        (dolist (h file-hits)
+          (when (or (null kinds-filter)
+                    (memq (plist-get h :kind) kinds-filter))
+            (cl-incf emitted)
+            (push (list :file file
+                        :range (cons (plist-get h :start)
+                                     (plist-get h :end))
+                        :replacement new-name
+                        :reason (format "rename-symbol %s->%s [%s]"
+                                        old-name new-name
+                                        (plist-get h :kind)))
+                  ops)))
+        (when (> emitted 0)
+          (cl-incf touched-files)
+          (cl-incf total-hits emitted))))
+    (list :ops (nreverse ops)
+          :summary (format "rename-symbol %s -> %s: %d sites across %d files"
+                           old-name new-name total-hits touched-files)
+          :diff-preview
+          (format "# rename-symbol %s -> %s\n# %d sites, %d files\n"
+                  old-name new-name total-hits touched-files))))
+
+(defun anvil-sexp--tool-rename-symbol (old new &optional kinds scope apply)
+  "Rename OLD to NEW across SCOPE.
+
+MCP Parameters:
+  old   - Current symbol name (string).
+  new   - New symbol name (string).
+  kinds - Optional space/comma list of kinds to include: any
+          of \"defun-name\", \"call\", \"quote\", \"symbol\".
+          Default is all.
+  scope - \"project\" (default), a directory path, a file path,
+          or a comma-separated list of file paths.
+  apply - Truthy to write to disk.  Default preview.
+
+Returns an edit plan plist."
+  (anvil-server-with-error-handling
+   (anvil-sexp--maybe-apply
+    (anvil-sexp--rename-plan scope old new kinds)
+    apply)))
+
+(defun anvil-sexp--render-call-template (template args)
+  "Substitute %1 %2 ... in TEMPLATE string with the printed forms of ARGS.
+Arguments that appear more than once in the template are rendered
+each time; missing positional references signal an error."
+  (let ((max-arg 0))
+    ;; Find highest %N used.
+    (let ((start 0))
+      (while (string-match "%\\([0-9]+\\)" template start)
+        (let ((n (string-to-number (match-string 1 template))))
+          (when (> n max-arg) (setq max-arg n))
+          (setq start (match-end 0)))))
+    (when (> max-arg (length args))
+      (error "replace-call template uses %%%d but only %d arg(s) available"
+             max-arg (length args)))
+    (let ((out template))
+      (dotimes (i max-arg)
+        (let ((idx (1+ i)))
+          (setq out
+                (replace-regexp-in-string
+                 (concat "%" (number-to-string idx))
+                 (prin1-to-string (nth i args))
+                 out t t))))
+      out)))
+
+(defun anvil-sexp--replace-call-plan (scope fn-name new-form-template)
+  "Build an edit plan replacing calls to FN-NAME with NEW-FORM-TEMPLATE."
+  (let* ((files (anvil-sexp--resolve-scope scope))
+         (fn-name-str (if (symbolp fn-name) (symbol-name fn-name) fn-name))
+         (ops nil)
+         (touched-files 0)
+         (total-hits 0))
+    (dolist (file files)
+      (let ((emitted 0))
+        (anvil-sexp--with-elisp-syntax
+         (lambda ()
+           (insert-file-contents file)
+           (dolist (h (anvil-sexp--scan-symbol-refs file fn-name-str))
+             (when (eq (plist-get h :kind) 'call)
+               (let* ((tok-start (plist-get h :start))
+                      (call-beg (save-excursion
+                                  (goto-char tok-start)
+                                  (when (eql (char-before) ?\()
+                                    (1- tok-start))))
+                      (call-end
+                       (and call-beg
+                            (save-excursion
+                              (goto-char call-beg)
+                              (ignore-errors (forward-sexp) (point))))))
+                 (when (and call-beg call-end)
+                   (let* ((call-text
+                           (buffer-substring-no-properties call-beg call-end))
+                          (call-sexp
+                           (condition-case _
+                               (car (read-from-string call-text))
+                             (error nil)))
+                          (args (and (consp call-sexp) (cdr call-sexp)))
+                          (replacement
+                           (ignore-errors
+                             (anvil-sexp--render-call-template
+                              new-form-template args))))
+                     (when replacement
+                       (cl-incf emitted)
+                       (push (list :file file
+                                   :range (cons call-beg call-end)
+                                   :replacement replacement
+                                   :reason (format "replace-call %s"
+                                                   fn-name-str))
+                             ops)))))))))
+        (when (> emitted 0)
+          (cl-incf touched-files)
+          (cl-incf total-hits emitted))))
+    (list :ops (nreverse ops)
+          :summary (format "replace-call %s: %d sites across %d files"
+                           fn-name-str total-hits touched-files)
+          :diff-preview
+          (format "# replace-call %s -> %s\n# %d sites, %d files\n"
+                  fn-name-str new-form-template total-hits touched-files))))
+
+(defun anvil-sexp--tool-replace-call (fn_name new_form &optional scope apply)
+  "Replace every call to FN_NAME with NEW_FORM across SCOPE.
+
+MCP Parameters:
+  fn_name  - Name of the function / macro to rewrite (string).
+  new_form - Source template with %1 %2 ... positional slots
+             (string).  Each %N is substituted with the printed
+             form of the Nth argument at each call site.
+  scope    - As in `sexp-rename-symbol'.  Default project.
+  apply    - Truthy to write.  Default preview.
+
+Returns an edit plan plist."
+  (anvil-server-with-error-handling
+   (anvil-sexp--maybe-apply
+    (anvil-sexp--replace-call-plan scope fn_name new_form)
+    apply)))
+
+
 ;;;; --- verify -------------------------------------------------------------
 
 (defun anvil-sexp--parse-bc-log (log-text file)
@@ -658,6 +996,36 @@ nil to skip a check."
                            (if checkdoc "t" "nil")))
 
 
+;;;; --- public elisp API (Doc 12 Phase 2a) --------------------------------
+
+(cl-defun anvil-sexp-rename-symbol (old new &key kinds scope apply)
+  "Rename OLD symbol to NEW across SCOPE.  See `sexp-rename-symbol'
+MCP tool.  KINDS is a list of symbol kinds to include (any of
+defun-name / call / quote / symbol); default all.  SCOPE is
+`project' (default), a directory path, a file path, or a list of
+file paths."
+  (anvil-sexp--tool-rename-symbol
+   old new
+   (when kinds (mapconcat #'symbol-name kinds ","))
+   (cond ((null scope) "project")
+         ((symbolp scope) (symbol-name scope))
+         ((listp scope) (mapconcat #'identity scope ","))
+         (t scope))
+   (when apply "t")))
+
+(cl-defun anvil-sexp-replace-call (fn-name new-form &key scope apply)
+  "Replace every call to FN-NAME with NEW-FORM template across SCOPE.
+NEW-FORM may reference positional arguments via %1 %2 etc.  See
+`sexp-replace-call' MCP tool."
+  (anvil-sexp--tool-replace-call
+   fn-name new-form
+   (cond ((null scope) "project")
+         ((symbolp scope) (symbol-name scope))
+         ((listp scope) (mapconcat #'identity scope ","))
+         (t scope))
+   (when apply "t")))
+
+
 ;;;; --- module lifecycle ---------------------------------------------------
 
 (defun anvil-sexp--register-tools ()
@@ -724,7 +1092,29 @@ does not parse or when no form matches the given name.")
    "Wrap the sexp surrounding POINT in FILE with WRAPPER source text.
 WRAPPER must contain the placeholder token `|anvil-sexp-hole|';
 the original sexp replaces the placeholder.  Preview by default;
-apply=t writes to disk."))
+apply=t writes to disk.")
+
+  (anvil-server-register-tool
+   #'anvil-sexp--tool-rename-symbol
+   :id "sexp-rename-symbol"
+   :server-id anvil-sexp--server-id
+   :description
+   "Rename every reference of OLD to NEW across SCOPE.  Strings
+and comments are skipped via syntax-ppss.  KINDS restricts to
+one or more of defun-name / call / quote / symbol.  SCOPE is
+\"project\" (default), a directory, a file, or a comma-separated
+list of files.  Preview by default; apply=t writes.
+(Doc 12 Phase 2a reader-only backend.)")
+
+  (anvil-server-register-tool
+   #'anvil-sexp--tool-replace-call
+   :id "sexp-replace-call"
+   :server-id anvil-sexp--server-id
+   :description
+   "Replace every (FN_NAME ARGS...) call with NEW_FORM template
+across SCOPE.  NEW_FORM may reference arguments via positional
+slots %1 %2 etc.  Strings and comments are skipped.  Preview by
+default; apply=t writes."))
 
 (defun anvil-sexp--unregister-tools ()
   "Remove every sexp-* MCP tool from the shared server."
@@ -733,7 +1123,9 @@ apply=t writes to disk."))
                 "sexp-macroexpand"
                 "sexp-verify"
                 "sexp-replace-defun"
-                "sexp-wrap-form"))
+                "sexp-wrap-form"
+                "sexp-rename-symbol"
+                "sexp-replace-call"))
     (anvil-server-unregister-tool id anvil-sexp--server-id)))
 
 ;;;###autoload
