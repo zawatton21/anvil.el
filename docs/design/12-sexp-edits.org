@@ -20,6 +20,12 @@ languages (TS / Python / Rust / Go), but belongs to a separate
 module (see ~Out of scope / future~).  Rationale in ~Why reader-only
 for elisp~ below.
 
+/Revision 2026-04-19 (late):/ Phase 1 SHIPPED (develop @ 87e82a2,
+28 ERT cases, 524/529 full suite green).  Phase 2 split into
+Phase 2a (reader-only, no Doc 11 dependency) and Phase 2b (Doc 11
+backend swap) so the dogfood rename-symbol can land before Doc 11
+is built.
+
 * Vision — elisp as AI's primary language
 
 anvil-sexp is more than a rename tool.  It is a deliberate step
@@ -257,7 +263,14 @@ and returns the same plan with =:applied-at= timestamp added.
   ;; (:kind 'warning|'error :line N :message STR).
 #+end_src
 
-** Phase 2 (uses Doc 11)
+** Phase 2a (reader-only; no Doc 11 dependency)
+
+Same public signatures as Phase 2b below.  The backend walks every
+~.el~ file in the requested SCOPE via ~anvil-sexp--read-file~ and
+scans each form's byte range for symbol-shaped matches using
+~syntax-ppss~ to exclude strings and comments.  Project scope on
+anvil.el (~50 files, ~50k LOC) runs in <10s on a modern machine —
+fast enough to ship before Doc 11 is built.
 
 #+begin_src elisp
 (anvil-sexp-rename-symbol OLD NEW &key kinds scope apply)
@@ -270,6 +283,15 @@ and returns the same plan with =:applied-at= timestamp added.
   ;; Replace every *call* (SYM . ARGS) where SYM == FN-NAME with
   ;; NEW-FORM (which may reference positional args via %1 %2 ...).
 #+end_src
+
+** Phase 2b (uses Doc 11 — backend swap, same API)
+
+No surface change.  Internal resolver is swapped from the Phase 2a
+reader walker to Doc 11 ~anvil-defs-references~, which provides an
+incrementally-updated SQLite index.  Improvements callers see:
+sub-second project-scope queries, fewer false positives on custom
+reader extensions, and definition-kind filtering that Phase 2a can
+only approximate.
 
 ** Phase 3
 
@@ -294,8 +316,8 @@ and returns the same plan with =:applied-at= timestamp added.
 | ~sexp-wrap-form~        |     1 | file, point, wrapper, apply?              | plan       | placeholder sym   |
 | ~sexp-macroexpand~      |     1 | file, name, all?                          | form       | read-only         |
 | ~sexp-verify~           |     1 | file, byte-compile?, checkdoc?, load?     | diags      | composite signal  |
-| ~sexp-rename-symbol~    |     2 | old, new, kinds?, scope?, apply?          | plan       | uses Doc 11       |
-| ~sexp-replace-call~     |     2 | fn-name, new-form, scope?, apply?         | plan       | uses Doc 11       |
+| ~sexp-rename-symbol~    |    2a | old, new, kinds?, scope?, apply?          | plan       | reader scan       |
+| ~sexp-replace-call~     |    2a | fn-name, new-form, scope?, apply?         | plan       | reader scan       |
 | ~sexp-extract-defun~    |     3 | file, range, new-name, arglist?, apply?   | plan       |                   |
 | ~sexp-inline-defun~     |     3 | fn-name, scope?, apply?                   | plan       | safety-gated      |
 
@@ -321,14 +343,57 @@ operations must be explicit.  Matches the convention of
   with a no-op stub via ~sexp-replace-defun~ apply=t, verify passes,
   then restore via a second apply=t call.  Full ERT suite green.
 
-** Phase 2 — cross-file rename (depends on Doc 11)
+** Phase 2a — cross-file rename via reader scan (no Doc 11)
 
-- ~anvil-sexp-rename-symbol~ for 'call + 'quote kinds.
-- ~anvil-sexp-replace-call~ with positional-arg template (%1 %2 ...).
-- ERT +10: cross-file, conflict detection, kind-filtering.
-- *Ship criterion*: rename ~anvil-state-set~ → ~anvil-state-put~
-  across anvil.el yields a correct plan; byte-compile + ert pass
-  after apply.
+Motivation: dogfood value.  anvil.el is itself an elisp codebase
+and every development session that refactors it benefits
+immediately from a reliable rename-symbol.  Doc 11 is the better
+long-term backend, but it is a separate design and should not
+gate Phase 2's delivery.
+
+Implementation path:
+- ~anvil-sexp--scan-symbol-refs FILE NAME~: for each form returned
+  by ~--read-file~, text-scan the form's byte range with a
+  ~\\_<NAME\\_>~ regex while consulting ~syntax-ppss~ to skip
+  string literals and comments.  Return a list of
+  (:kind KIND :start POS :end POS) plists where KIND classifies
+  the site (defun-name / call / quote / var).
+- ~anvil-sexp--project-el-files ROOT~: walk the repo with the
+  existing anvil filesystem helpers, filter to ~*.el~, exclude
+  ~*.elc~, ~tests/fixtures/**~, and vendored third-party trees.
+- ~anvil-sexp-rename-symbol~: collect hits across the requested
+  SCOPE, bucket by :kind, build a single edit plan shaped like
+  Phase 1's output.  Default SCOPE is the project rooted at the
+  containing git repo.  Preview by default; ~:apply t~ writes via
+  ~anvil-sexp--apply-plan~.
+- ~anvil-sexp-replace-call~: find every call site ~(NAME . ARGS)~
+  via the same scan, render NEW-FORM with positional substitutions
+  ~%1 %2 ...~, emit one edit op per site.
+
+ERT +10: cross-file rename, string/comment exclusion, conflict
+detection, kind-filtering (~:kinds '(call)~ leaves quoted symbols
+alone), project-scope smoke (rename a real anvil symbol in a
+scratch worktree and roll back), ~:json-false~ apply-safety (same
+invariant as Phase 1), call-template positional substitution,
+missing-symbol refusal, SCOPE='file and 'region variants.
+
+*Ship criterion*: rename ~anvil-state-set~ → ~anvil-state-put~
+across anvil.el yields a correct plan; ~:apply t~ writes, full
+ERT suite stays green, byte-compile of every touched file
+succeeds.
+
+** Phase 2b — backend swap to Doc 11 index (no API change)
+
+Once Doc 11 ~anvil-defs-references~ is in place:
+- Replace ~anvil-sexp--scan-symbol-refs~ with a Doc 11 index
+  query path.  Fall back to the reader scan when the index is
+  unbuilt or stale.
+- ERT +3: parity tests confirming the index backend produces the
+  same plans as the reader backend for the Phase 2a ship-criterion
+  input.
+- *Ship criterion*: rename plan output byte-equal between the two
+  backends; Phase 2a suite still green; project-scope query
+  latency ≤ 500 ms on anvil.el.
 
 ** Phase 3 — extraction + inlining
 
