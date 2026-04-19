@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + gemma4-strip + observability SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -149,7 +149,28 @@
   延期): DAG resume across daemon restart、HTTP-date 形式の
   Retry-After、その他 rate-limit hint format。
 
-Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP / 6C') を
+- gemma4 thinking-mode guard + observability aggregation bundle
+  (commit ce60f0a, merge 922cfc6, branch
+  feat/orchestrator-gemma4-observability): orthogonal な 2 feature
+  を 1 branch で bundle ship。gemma4 guard は =ollama-strip-thinking=
+  defcustom (既定 t) + =--ollama-strip-thinking-block= helper が
+  =<think>...</think>= を case-insensitive multi-line で除去、
+  =--ollama-parse-output= の summary line に pipe、gemma4:e4b 等の
+  thinking-mode local model が tail-4KB cutoff で実答えを失う問題を
+  解消 — zero-cost local member が consensus に復帰可能に。
+  Observability は =--percentile= helper + =anvil-orchestrator-stats=
+  public fn (&rest args、:since / :provider filter、plist returns
+  :total / :by-status / :by-provider / :elapsed-ms-avg/p50/p95 /
+  :total-cost-usd) + =--format-stats-text= text formatter +
+  =anvil-orchestrator-stats-dashboard= interactive command
+  (special-mode buffer) + MCP tool =orchestrator-stats= (read-only)。
+  「今週何を走らせたか」の cross-session view 実装、anvil-state
+  rehydrate task table を pure-read で aggregate。dogfooded (codex
+  3 並列 A/B/C → claude Edit 統合、合計 ~100s)。ERT +9 (= 124 pass
+  / 1 live skip in anvil-orchestrator-test.el, 435 total across
+  the suite, 2 live skips).
+
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5 / 6C MVP / 6C' + gemma4-strip + observability) を
 develop branch 上で ship 済み。さらに同日の 2 件 bug fix (commit
 31d2f3f stdin EOF / 5a2610f shared-tail copy-sequence) も含む。
 Review Questions Q1-Q12 resolved 状態キープ。
