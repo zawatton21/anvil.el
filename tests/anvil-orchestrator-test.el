@@ -1714,5 +1714,69 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
             (should (equal "done×2" (aref (cadr entry) 1))))
         (remhash id anvil-orchestrator--tasks)))))
 
+;; --- Phase 6C' tests ---
+(ert-deftest anvil-orchestrator--phase-6cp-stderr-retry-after-parses-http-header ()
+  (let ((path (make-temp-file "anvil-orchestrator-stderr-")))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "some log\nRetry-After: 45\nmore"))
+          (should (= 45000
+                     (anvil-orchestrator--stderr-retry-after-ms path 1))))
+      (when (file-exists-p path)
+        (delete-file path)))))
+
+(ert-deftest anvil-orchestrator--phase-6cp-stderr-retry-after-parses-json ()
+  (let ((path (make-temp-file "anvil-orchestrator-stderr-")))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "{\"error\":\"rate limited\",\"retry_after\":12}"))
+          (should (= 12000
+                     (anvil-orchestrator--stderr-retry-after-ms path 1))))
+      (when (file-exists-p path)
+        (delete-file path)))))
+
+(ert-deftest anvil-orchestrator--phase-6cp-stderr-retry-after-nil-on-clean-exit ()
+  (let ((path (make-temp-file "anvil-orchestrator-stderr-")))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "Retry-After: 30"))
+          (should (null
+                   (anvil-orchestrator--stderr-retry-after-ms path 0))))
+      (when (file-exists-p path)
+        (delete-file path)))))
+
+(ert-deftest anvil-orchestrator--phase-6cp-resolve-backoff-uses-globals-for-unknown ()
+  (let ((anvil-orchestrator-per-provider-backoff nil))
+    (let ((backoff (anvil-orchestrator--resolve-backoff 'claude)))
+      (should (= (plist-get backoff :base-ms)
+                 anvil-orchestrator-auto-retry-base-ms))
+      (should (= (plist-get backoff :max-delay-ms)
+                 anvil-orchestrator-auto-retry-max-delay-ms))
+      (should (= (plist-get backoff :jitter-pct)
+                 anvil-orchestrator-auto-retry-jitter-pct)))))
+
+(ert-deftest anvil-orchestrator--phase-6cp-resolve-backoff-honours-override ()
+  (let ((anvil-orchestrator-per-provider-backoff '((claude :base-ms 500 :jitter-pct 10))))
+    (let ((claude-backoff (anvil-orchestrator--resolve-backoff 'claude))
+          (gemini-backoff (anvil-orchestrator--resolve-backoff 'gemini)))
+      (should (= (plist-get claude-backoff :base-ms) 500))
+      (should (= (plist-get claude-backoff :jitter-pct) 10))
+      (should (= (plist-get claude-backoff :max-delay-ms)
+                 anvil-orchestrator-auto-retry-max-delay-ms))
+      (should (= (plist-get gemini-backoff :base-ms)
+                 anvil-orchestrator-auto-retry-base-ms))
+      (should (= (plist-get gemini-backoff :max-delay-ms)
+                 anvil-orchestrator-auto-retry-max-delay-ms))
+      (should (= (plist-get gemini-backoff :jitter-pct)
+                 anvil-orchestrator-auto-retry-jitter-pct)))))
+
+(ert-deftest anvil-orchestrator--phase-6cp-compute-delay-retry-after-overrides-computed ()
+  (let ((anvil-orchestrator-auto-retry-jitter-pct 0))
+    (should (= 60000
+               (anvil-orchestrator--compute-retry-delay-ms 2 nil 60000)))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

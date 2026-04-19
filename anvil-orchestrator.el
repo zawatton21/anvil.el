@@ -157,6 +157,15 @@ Clamped internally to [0, 100]."
   :type 'integer
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-per-provider-backoff
+  nil
+  "Optional per-provider override of the backoff schedule.
+Alist of PROVIDER → plist with any of keys :base-ms :max-delay-ms :jitter-pct.
+Missing keys fall back to the global `anvil-orchestrator-auto-retry-*' defcustoms.
+Providers not listed use the globals entirely."
+  :type '(alist :key-type symbol :value-type plist)
+  :group 'anvil-orchestrator)
+
 (defcustom anvil-orchestrator-poll-interval-sec 1.0
   "Timer period for the pool pump + timeout scan (seconds)."
   :type 'number
@@ -267,6 +276,26 @@ plug this into their parse-output epilogue."
                (re-search-forward anvil-orchestrator--retry-network-re
                                   nil t))
         'network)))))
+
+(defun anvil-orchestrator--stderr-retry-after-ms (stderr-path exit-code)
+  "Return retry delay from STDERR-PATH as integer milliseconds, or nil.
+Reads STDERR-PATH only when EXIT-CODE is a non-zero integer and the file is
+readable; otherwise reads nothing and returns nil.  Scans the first 8192 bytes
+for a Retry-After hint and returns the delay in milliseconds, clamped to the
+range [0, 600000]."
+  (when (and (integerp exit-code)
+             (not (zerop exit-code))
+             (file-readable-p stderr-path))
+    (with-temp-buffer
+      (insert-file-contents stderr-path nil 0 8192)
+      (let ((case-fold-search t))
+        (cond
+         ((re-search-forward "[Rr]etry-[Aa]fter[ :]+\\([0-9]+\\)" nil t)
+          (max 0 (min 600000 (* 1000 (string-to-number (match-string 1))))))
+         ((progn
+            (goto-char (point-min))
+            (re-search-forward "\"retry_after\"[ :]*\\([0-9]+\\)" nil t))
+          (max 0 (min 600000 (* 1000 (string-to-number (match-string 1)))))))))))
 
 (defun anvil-orchestrator--truncate-summary (summary)
   "Trim SUMMARY and clamp it to `anvil-orchestrator-summary-max-chars'.
@@ -1230,7 +1259,9 @@ stream-json NDJSON survives round-trip."
          :cost-tokens  (plist-get parsed :cost-tokens)
          :commit-sha   (plist-get parsed :commit-sha)
          :error        error-msg
-         :auto-retry-code (plist-get parsed :auto-retry-code))
+         :auto-retry-code (plist-get parsed :auto-retry-code)
+         :retry-after-ms (and (eq final 'failed)
+                              (anvil-orchestrator--stderr-retry-after-ms stderr exit)))
         (anvil-orchestrator--maybe-auto-retry id)
         (anvil-orchestrator--pump)))))
 
@@ -1380,25 +1411,61 @@ everything else runs when global concurrency permits."
 
 ;;;; --- auto-retry ---------------------------------------------------------
 
-(defun anvil-orchestrator--compute-retry-delay-ms (tries)
-  "Return retry delay in milliseconds for TRIES using capped exponential backoff with jitter.
-The raw delay is `min(cap, base * 2^tries)`, where `base` is
-`anvil-orchestrator-auto-retry-base-ms' and `cap' is
-`anvil-orchestrator-auto-retry-max-delay-ms'.  Jitter percentage is taken from
-`anvil-orchestrator-auto-retry-jitter-pct' and clamped to the range 0..100.
-When jitter is zero, return the raw delay.  Otherwise compute a symmetric range
-around the raw delay with `spread = raw * pct / 100', then return a random
-integer in the inclusive range `[raw - spread, raw + spread]'."
-  (let* ((base anvil-orchestrator-auto-retry-base-ms)
-         (cap anvil-orchestrator-auto-retry-max-delay-ms)
+(defun anvil-orchestrator--resolve-backoff (provider)
+  "Return the effective backoff plist for PROVIDER.
+The result has shape `(:base-ms N :max-delay-ms M :jitter-pct P)'.
+If `anvil-orchestrator-per-provider-backoff' contains an override plist for
+PROVIDER, each of keys `:base-ms', `:max-delay-ms', and `:jitter-pct' uses the
+override when its value is a number.  Missing or non-numeric override values
+fall back to the corresponding global defcustoms:
+`anvil-orchestrator-auto-retry-base-ms',
+`anvil-orchestrator-auto-retry-max-delay-ms', and
+`anvil-orchestrator-auto-retry-jitter-pct'.  If no override exists for
+PROVIDER, all values come from the globals."
+  (let* ((override (alist-get provider anvil-orchestrator-per-provider-backoff))
+         (base-ms (plist-get override :base-ms))
+         (max-delay-ms (plist-get override :max-delay-ms))
+         (jitter-pct (plist-get override :jitter-pct)))
+    (list :base-ms (if (numberp base-ms)
+                       base-ms
+                     anvil-orchestrator-auto-retry-base-ms)
+          :max-delay-ms (if (numberp max-delay-ms)
+                            max-delay-ms
+                          anvil-orchestrator-auto-retry-max-delay-ms)
+          :jitter-pct (if (numberp jitter-pct)
+                          jitter-pct
+                        anvil-orchestrator-auto-retry-jitter-pct))))
+
+(defun anvil-orchestrator--compute-retry-delay-ms (tries &optional provider retry-after-ms)
+  "Return retry delay in milliseconds for TRIES, optionally using PROVIDER and RETRY-AFTER-MS.
+Resolve backoff settings with `anvil-orchestrator--resolve-backoff' using
+PROVIDER, where a nil PROVIDER falls back to the global settings.  The raw
+delay is `min(cap, base * 2^tries)', where `base' is `:base-ms' and `cap' is
+`:max-delay-ms' from the resolved plist.  Jitter percentage is taken from
+`:jitter-pct' and clamped to the range 0..100.
+
+When jitter is zero, return the raw delay.  Otherwise compute a symmetric
+inclusive jitter range around the raw delay using `spread = raw * pct / 100',
+`low = raw - spread', and `high = raw + spread', then return a random integer
+in the inclusive range `[low, high]'.
+
+When RETRY-AFTER-MS is a number, return the greater of RETRY-AFTER-MS and the
+computed backoff delay.  Otherwise return the computed backoff delay."
+  (let* ((backoff (anvil-orchestrator--resolve-backoff provider))
+         (base (plist-get backoff :base-ms))
+         (cap (plist-get backoff :max-delay-ms))
          (raw (min cap (* base (expt 2 tries))))
-         (pct (max 0 (min 100 anvil-orchestrator-auto-retry-jitter-pct))))
-    (if (= pct 0)
-        raw
-      (let* ((spread (/ (* raw pct) 100))
-             (low (- raw spread))
-             (high (+ raw spread)))
-        (+ low (random (1+ (- high low))))))))
+         (pct (max 0 (min 100 (plist-get backoff :jitter-pct))))
+         (computed
+          (if (= pct 0)
+              raw
+            (let* ((spread (/ (* raw pct) 100))
+                   (low (- raw spread))
+                   (high (+ raw spread)))
+              (+ low (random (1+ (- high low))))))))
+    (if (numberp retry-after-ms)
+        (max retry-after-ms computed)
+      computed)))
 
 (defun anvil-orchestrator--maybe-auto-retry (id)
   "Spawn an auto-retry of task ID when its failure matches policy."
@@ -1412,7 +1479,10 @@ integer in the inclusive range `[raw - spread, raw + spread]'."
                (memq code anvil-orchestrator-auto-retry-on)
                (< tries anvil-orchestrator-auto-retry-max)
                (eq (plist-get task :status) 'failed))
-      (let* ((delay-ms (anvil-orchestrator--compute-retry-delay-ms tries))
+      (let* ((delay-ms (anvil-orchestrator--compute-retry-delay-ms
+                        tries
+                        (plist-get task :provider)
+                        (plist-get task :retry-after-ms)))
              (new-id   (anvil-orchestrator--uuid))
              (clone    (copy-sequence task)))
         (setq clone (plist-put clone :id new-id))
