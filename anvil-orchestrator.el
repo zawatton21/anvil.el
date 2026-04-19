@@ -2494,7 +2494,7 @@ decimal places, or \"-\" when nil or zero."
         (special-mode)))
     (pop-to-buffer buffer)))
 
-(defun anvil-orchestrator--tool-stats (_args)
+(defun anvil-orchestrator--tool-stats ()
   "MCP wrapper for `anvil-orchestrator-stats'.
 The server layer performs JSON serialisation; this function
 returns the stats plist verbatim."

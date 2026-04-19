@@ -1935,7 +1935,7 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
              (lambda (&rest _args)
                '(:total 42))))
     (should (equal '(:total 42)
-                   (anvil-orchestrator--tool-stats nil)))))
+                   (anvil-orchestrator--tool-stats)))))
 
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here
