@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a + 7b SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -198,6 +198,19 @@ Review Questions Q1-Q12 resolved 状態キープ。
   300 → 4000 に引き上げて common case の再 parse round-trip を排除。
   MCP tools =orchestrator-extract-result / -submit-one / -tail= も同時 land。
   ERT +11。
+
+- Phase 7b (branch feat/orchestrator-phase7b-preamble): 共通 context
+  preamble の KV 登録 + ~:preamble-ref~ による prompt 冒頭 inject。
+  =anvil-state= ns="orchestrator-preamble" に KEY→TEXT 保存、
+  =anvil-orchestrator-preamble-{set,get,list,delete}= 4 public API +
+  private helper =--resolve-preamble-ref= (string / list / unknown-err)。
+  解決は =--coerce-task= 内で行い =:preamble-ref= を drop して retry /
+  resume 時の double-apply を防止。=submit-one= / =submit-and-collect=
+  の両 API 面に =:preamble-ref= 通し、MCP tools
+  =orchestrator-preamble-{set,get,list,delete}= 4 本 land。preamble 本文は
+  prompt に copy する方針 (provider-side prompt-cache に依存しない、
+  context pollution 回避が主目的)。ERT +5 (= 153 pass / 1 live skip in
+  anvil-orchestrator-test.el, 484 pass / 5 skip across the suite).
 
 * Goal
 
@@ -914,16 +927,20 @@ Phase 7 はこの 3 項目を sub-phase に分けて潰す。
 
 **Tests:** +4 ERT (done / failed / timeout / MCP coercion)
 
-*** Phase 7b — context preamble 登録 (所要 3-5h)
+*** Phase 7b — context preamble 登録 *SHIPPED* (2026-04-19)
 
 **Scope:**
 - ~anvil-state~ ns="orchestrator-preamble" に user 登録の共通 preamble
   (設計 doc 抜粋 / コーディング規約 / 今日の決定) を key → text で保存
-- submit 時 ~:preamble-ref KEY~ を受け取ると、provider prompt 組立時に
-  prepend (claude の ~--append-system-prompt~ か prompt 冒頭差し込み)
-- 重複送信避けるため TTL cache (Doc 09 http 同様)、preamble 変更時は
-  hash で invalidate
+- submit 時 ~:preamble-ref KEY~ を受け取ると ~--coerce-task~ で text を
+  解決し ~:prompt~ 冒頭に ~TEXT + "\n\n" + prompt~ の形で prepend、
+  ~:preamble-ref~ は persist 前に drop して retry 時の double-apply を防ぐ
+- ~:preamble-ref~ は string / list-of-strings 許可、list は空行区切りで concat
 - MCP tools: ~orchestrator-preamble-set~ / ~-get~ / ~-list~ / ~-delete~
+- 公開 Elisp API: ~anvil-orchestrator-preamble-{set,get,list,delete}~ +
+  private helper ~--resolve-preamble-ref~
+- ~anvil-orchestrator-submit-one~ / ~-submit-and-collect~ の両 API 面に
+  ~:preamble-ref~ 通し
 
 **Decisions:**
 1. preamble は **本文 copy** で submit (provider 側の prompt cache は
@@ -932,8 +949,15 @@ Phase 7 はこの 3 項目を sub-phase に分けて潰す。
 3. ~:preamble-ref~ は string or list of strings 許可、複数はこの順で concat
 4. subscription 前提なので cost 上の gain は小さい、**context pollution
    回避** が主目的
+5. TTL cache は入れず、anvil-state sqlite の素 read で十分 (KV lookup
+   は µs order、preamble 変更時は次 submit で自動反映)
+6. 解決は ~--coerce-task~ 内で済ませて ~:preamble-ref~ を drop する
+   — persist は展開後 prompt 1 本に集約し、retry / resume / daemon
+   restart の idempotency を保証
 
-**Tests:** +5 ERT (get/set/list/delete + resolve-in-submit)
+**Tests:** +5 ERT (set+get roundtrip / list+sizes / delete / resolve
+forms including errors / coerce-task prepend+drop).  Total
+489 / 484 pass / 0 fail / 5 skip across the suite.
 
 *** Phase 7c — live streaming (所要 1-2 日)
 

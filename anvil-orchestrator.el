@@ -1591,6 +1591,19 @@ Signals `user-error' on missing / malformed fields."
                  (not (string-empty-p (plist-get task :prompt))))
       (user-error "anvil-orchestrator: task :prompt missing (%s)"
                   (plist-get task :name)))
+    ;; Phase 7b: resolve :preamble-ref by prepending registered text to
+    ;; :prompt, then drop :preamble-ref so a later `retry' (which clones
+    ;; the persisted task) does not double-apply the preamble.
+    (let ((pre-ref (plist-get task :preamble-ref)))
+      (when pre-ref
+        (let ((preamble (anvil-orchestrator--resolve-preamble-ref pre-ref)))
+          (when (and preamble (not (string-empty-p preamble)))
+            (setq task (plist-put task :prompt
+                                  (concat preamble "\n\n"
+                                          (plist-get task :prompt)))))
+          (setq task (cl-loop for (k v) on task by #'cddr
+                              unless (eq k :preamble-ref)
+                              append (list k v))))))
     ;; defaults
     (unless (plist-get task :budget-usd)
       (setq task (plist-put task :budget-usd
@@ -2707,7 +2720,8 @@ majority of single-turn responses."
 
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-one
-    (&key provider prompt model name cwd budget-usd timeout-sec)
+    (&key provider prompt model name cwd budget-usd timeout-sec
+          preamble-ref)
   "Submit a single task and return its task-id (not the batch-id).
 
 A light convenience over `anvil-orchestrator-submit' for the
@@ -2716,7 +2730,11 @@ not need DAG / consensus / multi-task semantics.  All keyword
 arguments except :provider and :prompt are optional.  Behaviour
 is identical to passing a one-element list through `submit':
 the task enters the global pool with the same concurrency,
-retry, and budget rules as any other batch."
+retry, and budget rules as any other batch.
+
+:preamble-ref accepts a preamble key string (or list of strings)
+registered via `anvil-orchestrator-preamble-set'; the stored text
+is prepended to PROMPT at submit time (Phase 7b)."
   (unless (and provider prompt)
     (user-error "submit-one: :provider and :prompt are required"))
   (let* ((auto-name (or name
@@ -2731,7 +2749,9 @@ retry, and budget rules as any other batch."
                        (when model       (list :model model))
                        (when cwd         (list :cwd cwd))
                        (when budget-usd  (list :budget-usd budget-usd))
-                       (when timeout-sec (list :timeout-sec timeout-sec))))
+                       (when timeout-sec (list :timeout-sec timeout-sec))
+                       (when preamble-ref
+                         (list :preamble-ref preamble-ref))))
          (batch-id (anvil-orchestrator-submit (list task)))
          (ids      (gethash batch-id anvil-orchestrator--batches)))
     (car ids)))
@@ -2739,6 +2759,7 @@ retry, and budget rules as any other batch."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-and-collect
     (&key provider prompt model name cwd budget-usd timeout-sec
+          preamble-ref
           (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
   "Submit a single task and wait (non-blocking) for its result.
 
@@ -2748,7 +2769,8 @@ poll + `anvil-orchestrator-extract-result' so short-running tasks
 submit → poll → tail → extract hop chain.
 
 :provider / :prompt are forwarded to `submit-one'; :model / :name
-/ :cwd / :budget-usd / :timeout-sec likewise when non-nil.
+/ :cwd / :budget-usd / :timeout-sec / :preamble-ref likewise when
+non-nil.
 
 :collect-timeout-sec (default 180) is the wall-clock cap on the
 poll loop.  :poll-interval-sec (default 0.5) tunes the
@@ -2769,7 +2791,8 @@ re-collect via `extract-result' later."
                    :name name
                    :cwd cwd
                    :budget-usd budget-usd
-                   :timeout-sec timeout-sec))
+                   :timeout-sec timeout-sec
+                   :preamble-ref preamble-ref))
          (deadline (+ (float-time) collect-timeout-sec)))
     (while (let ((task (anvil-orchestrator--task-get task-id)))
              (and task
@@ -2919,6 +2942,127 @@ MCP Parameters:
                        :stream (or stream "stdout")
                        :bytes n)
                       "")))))
+
+;;;; --- Phase 7b: context preamble registry -------------------------------
+;;
+;; User-registered reusable context (design notes, coding conventions,
+;; daily-operational facts) stored under a short KEY in anvil-state.
+;; A task referring to the KEY via :preamble-ref has the stored text
+;; prepended verbatim to its prompt at submit time.  Text is embedded
+;; into the prompt body rather than routed through any provider-side
+;; prompt-cache feature: the primary goal is context hygiene for the
+;; parent session, not provider-side cost (subscription-plan premise).
+
+(defconst anvil-orchestrator--preamble-ns "orchestrator-preamble"
+  "anvil-state namespace backing the preamble registry.")
+
+;;;###autoload
+(defun anvil-orchestrator-preamble-set (key text)
+  "Register TEXT under KEY in the preamble store.  Returns KEY.
+KEY must be a non-empty string; TEXT must be a string (may be
+empty to clear content without deleting the entry)."
+  (unless (and (stringp key) (not (string-empty-p key)))
+    (user-error "preamble-set: KEY must be a non-empty string"))
+  (unless (stringp text)
+    (user-error "preamble-set: TEXT must be a string"))
+  (anvil-state-enable)
+  (anvil-state-set key text :ns anvil-orchestrator--preamble-ns)
+  key)
+
+;;;###autoload
+(defun anvil-orchestrator-preamble-get (key)
+  "Return the preamble text registered under KEY, or nil."
+  (unless (and (stringp key) (not (string-empty-p key)))
+    (user-error "preamble-get: KEY must be a non-empty string"))
+  (anvil-state-enable)
+  (anvil-state-get key :ns anvil-orchestrator--preamble-ns))
+
+;;;###autoload
+(defun anvil-orchestrator-preamble-delete (key)
+  "Remove the preamble registered under KEY.  Returns t when a row
+was actually deleted, nil when KEY was absent."
+  (unless (and (stringp key) (not (string-empty-p key)))
+    (user-error "preamble-delete: KEY must be a non-empty string"))
+  (anvil-state-enable)
+  (and (anvil-state-delete key :ns anvil-orchestrator--preamble-ns) t))
+
+;;;###autoload
+(defun anvil-orchestrator-preamble-list ()
+  "Return a list of plists describing every registered preamble.
+Each entry is `(:key KEY :chars N)' with N the character length
+of the stored text.  Sorted ascending by key."
+  (anvil-state-enable)
+  (let ((rows (ignore-errors
+                (sqlite-select
+                 (anvil-state--db)
+                 "SELECT k, v FROM kv WHERE ns = ?1 ORDER BY k"
+                 (list anvil-orchestrator--preamble-ns)))))
+    (delq nil
+          (mapcar (lambda (row)
+                    (let* ((k    (car row))
+                           (text (ignore-errors
+                                   (anvil-state--deserialize (cadr row)))))
+                      (when (stringp text)
+                        (list :key k :chars (length text)))))
+                  rows))))
+
+(defun anvil-orchestrator--resolve-preamble-ref (ref)
+  "Resolve REF to a preamble text string, or nil when REF is nil.
+REF is a string KEY or a list of string KEYs.  Multiple keys are
+looked up in order and joined with a blank line.  Unknown keys
+signal `user-error'."
+  (cond
+   ((null ref) nil)
+   ((stringp ref)
+    (or (anvil-orchestrator-preamble-get ref)
+        (user-error "preamble-ref: unknown key %S" ref)))
+   ((and (listp ref) (cl-every #'stringp ref))
+    (when ref
+      (mapconcat
+       (lambda (k)
+         (or (anvil-orchestrator-preamble-get k)
+             (user-error "preamble-ref: unknown key %S" k)))
+       ref
+       "\n\n")))
+   (t
+    (user-error "preamble-ref: expected string or list of strings, got %S"
+                ref))))
+
+(defun anvil-orchestrator--tool-preamble-set (key text)
+  "MCP wrapper for `anvil-orchestrator-preamble-set'.
+
+MCP Parameters:
+  key  - Non-empty preamble key string.  Referenced later via
+         :preamble-ref when submitting tasks.
+  text - Preamble body string.  Embedded verbatim in front of
+         each referencing task's prompt at submit time."
+  (anvil-server-with-error-handling
+    (anvil-orchestrator-preamble-set key text)
+    (list :key key :chars (length text))))
+
+(defun anvil-orchestrator--tool-preamble-get (key)
+  "MCP wrapper for `anvil-orchestrator-preamble-get'.
+
+MCP Parameters:
+  key - Preamble key string registered earlier."
+  (anvil-server-with-error-handling
+    (let ((text (anvil-orchestrator-preamble-get key)))
+      (list :key key
+            :text (or text "")
+            :found (and text t)))))
+
+(defun anvil-orchestrator--tool-preamble-list ()
+  "MCP wrapper for `anvil-orchestrator-preamble-list'."
+  (anvil-server-with-error-handling
+    (list :preambles (anvil-orchestrator-preamble-list))))
+
+(defun anvil-orchestrator--tool-preamble-delete (key)
+  "MCP wrapper for `anvil-orchestrator-preamble-delete'.
+
+MCP Parameters:
+  key - Preamble key string to remove."
+  (anvil-server-with-error-handling
+    (list :deleted (and (anvil-orchestrator-preamble-delete key) t))))
 
 ;;;; --- dashboard ----------------------------------------------------------
 
@@ -3195,7 +3339,44 @@ Phase 6C'' DAG resume diagnostic."
 place, preserving task-ids + :depends-on so downstream work
 reconnects to resumed upstream.  Optional batch_id scope.
 Returns counts of immediately-DAG-ready vs dep-blocked ids.
-Phase 6C'' DAG resume."))
+Phase 6C'' DAG resume.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-preamble-set
+   :id "orchestrator-preamble-set"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Register reusable context TEXT under KEY (Phase 7b).  Tasks
+referring to the same KEY via :preamble-ref have TEXT prepended
+verbatim to their prompt at submit time, so a common preamble
+(design notes, conventions, daily-ops context) lives in anvil-
+state rather than being re-typed into every prompt.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-preamble-get
+   :id "orchestrator-preamble-get"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the preamble text registered under KEY, plus :found
+boolean.  Empty text when KEY is absent."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-preamble-list
+   :id "orchestrator-preamble-list"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "List every registered preamble key and its stored text length.
+Read-only snapshot, sorted by key."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-preamble-delete
+   :id "orchestrator-preamble-delete"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Remove the preamble registered under KEY.  Returns
+:deleted t when a row existed, :deleted nil when KEY was absent."))
 
 (defun anvil-orchestrator--unregister-tools ()
   (dolist (id '("orchestrator-submit" "orchestrator-status"
@@ -3211,7 +3392,11 @@ Phase 6C'' DAG resume."))
                 "orchestrator-submit-and-collect"
                 "orchestrator-tail"
                 "orchestrator-list-interrupted"
-                "orchestrator-resume-interrupted"))
+                "orchestrator-resume-interrupted"
+                "orchestrator-preamble-set"
+                "orchestrator-preamble-get"
+                "orchestrator-preamble-list"
+                "orchestrator-preamble-delete"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload

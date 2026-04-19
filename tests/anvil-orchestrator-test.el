@@ -2198,6 +2198,82 @@ hash).  Cleans the task + batch tables on exit."
               "claude" "hi" nil nil nil nil nil "")))
       (should (equal 'done (plist-get r :status))))))
 
+;;;; --- Phase 7b: context preamble registry -------------------------------
+
+(defmacro anvil-orchestrator-test--with-preamble-store (&rest body)
+  "Run BODY against a fresh anvil-state DB so preamble keys start empty."
+  (declare (indent 0))
+  `(let ((anvil-state-db-path (make-temp-file "anvil-pre-" nil ".db"))
+         (anvil-state--db nil))
+     (unwind-protect
+         (progn
+           (anvil-state-enable)
+           ,@body)
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(ert-deftest anvil-orchestrator--preamble-set-and-get-roundtrip ()
+  "preamble-set stores text that preamble-get returns verbatim."
+  (anvil-orchestrator-test--with-preamble-store
+    (anvil-orchestrator-preamble-set "style" "Be concise.")
+    (should (equal "Be concise."
+                   (anvil-orchestrator-preamble-get "style")))
+    (should-not (anvil-orchestrator-preamble-get "unknown"))
+    (should-error (anvil-orchestrator-preamble-set "" "x")
+                  :type 'user-error)
+    (should-error (anvil-orchestrator-preamble-set "k" 42)
+                  :type 'user-error)))
+
+(ert-deftest anvil-orchestrator--preamble-list-sorted-with-sizes ()
+  "preamble-list returns (:key :chars) plists sorted ascending by key."
+  (anvil-orchestrator-test--with-preamble-store
+    (anvil-orchestrator-preamble-set "zzz" "xx")
+    (anvil-orchestrator-preamble-set "aaa" "hello")
+    (let ((rows (anvil-orchestrator-preamble-list)))
+      (should (= 2 (length rows)))
+      (should (equal "aaa" (plist-get (nth 0 rows) :key)))
+      (should (equal 5    (plist-get (nth 0 rows) :chars)))
+      (should (equal "zzz" (plist-get (nth 1 rows) :key)))
+      (should (equal 2    (plist-get (nth 1 rows) :chars))))))
+
+(ert-deftest anvil-orchestrator--preamble-delete-removes-entry ()
+  "preamble-delete removes the row and reports deletion status."
+  (anvil-orchestrator-test--with-preamble-store
+    (anvil-orchestrator-preamble-set "k" "v")
+    (should (equal t (anvil-orchestrator-preamble-delete "k")))
+    (should-not (anvil-orchestrator-preamble-get "k"))
+    (should-not (anvil-orchestrator-preamble-delete "k"))))
+
+(ert-deftest anvil-orchestrator--resolve-preamble-ref-forms ()
+  "resolve-preamble-ref handles nil / string / list / unknown / bad type."
+  (anvil-orchestrator-test--with-preamble-store
+    (anvil-orchestrator-preamble-set "a" "ALPHA")
+    (anvil-orchestrator-preamble-set "b" "BETA")
+    (should-not (anvil-orchestrator--resolve-preamble-ref nil))
+    (should (equal "ALPHA"
+                   (anvil-orchestrator--resolve-preamble-ref "a")))
+    (should (equal "ALPHA\n\nBETA"
+                   (anvil-orchestrator--resolve-preamble-ref '("a" "b"))))
+    (should-error (anvil-orchestrator--resolve-preamble-ref "missing")
+                  :type 'user-error)
+    (should-error (anvil-orchestrator--resolve-preamble-ref '("a" "missing"))
+                  :type 'user-error)
+    (should-error (anvil-orchestrator--resolve-preamble-ref 42)
+                  :type 'user-error)))
+
+(ert-deftest anvil-orchestrator--coerce-task-resolves-preamble-ref ()
+  "Coerced task gets the preamble prepended to :prompt and loses
+:preamble-ref so a later retry does not double-apply the text."
+  (anvil-orchestrator-test--with-preamble-store
+    (anvil-orchestrator-preamble-set "style" "Be concise.")
+    (let* ((raw (list :name "t1" :provider 'claude
+                      :prompt "Do thing."
+                      :preamble-ref "style"))
+           (coerced (anvil-orchestrator--coerce-task raw)))
+      (should (equal "Be concise.\n\nDo thing."
+                     (plist-get coerced :prompt)))
+      (should-not (plist-get coerced :preamble-ref)))))
+
 ;;;; --- DAG resume (Phase 6C'') --------------------------------------------
 
 (defmacro anvil-orchestrator-test--with-pool (tasks &rest body)
