@@ -2116,6 +2116,88 @@ Cleans up the task hash afterwards so the ambient state stays pristine."
          (default-value 'anvil-orchestrator-summary-max-chars)))
     (should (equal 4000 anvil-orchestrator-summary-max-chars))))
 
+;;;; --- Phase 7a: submit-and-collect ---------------------------------------
+
+(defmacro anvil-orchestrator-test--with-mocked-submit (task-plist &rest body)
+  "Run BODY with `anvil-orchestrator-submit' mocked to return a batch
+whose sole task plist is TASK-PLIST (already installed into the task
+hash).  Cleans the task + batch tables on exit."
+  (declare (indent 1))
+  `(let ((_tasks   (copy-hash-table anvil-orchestrator--tasks))
+         (_batches (copy-hash-table anvil-orchestrator--batches)))
+     (unwind-protect
+         (let* ((task (copy-sequence ,task-plist))
+                (id   (plist-get task :id)))
+           (puthash id task anvil-orchestrator--tasks)
+           (cl-letf (((symbol-function 'anvil-orchestrator-submit)
+                      (lambda (_tasks)
+                        (let ((batch "sac-batch"))
+                          (puthash batch (list id)
+                                   anvil-orchestrator--batches)
+                          batch))))
+             ,@body))
+       (setq anvil-orchestrator--tasks   _tasks)
+       (setq anvil-orchestrator--batches _batches))))
+
+(ert-deftest anvil-orchestrator--submit-and-collect-returns-done-result ()
+  "When the task is already done the wrapper returns extract-result."
+  (anvil-orchestrator-test--with-mocked-submit
+      '(:id "sac-done" :status done :provider codex
+        :summary "ok" :cost-usd 0.02
+        :cost-tokens (:input 5 :output 7)
+        :commit-sha "abc" :exit-code 0)
+    (let ((r (anvil-orchestrator-submit-and-collect
+              :provider 'codex :prompt "do"
+              :collect-timeout-sec 2.0
+              :poll-interval-sec 0.05)))
+      (should (equal "sac-done" (plist-get r :task-id)))
+      (should (equal 'done      (plist-get r :status)))
+      (should (equal "ok"       (plist-get r :summary)))
+      (should (equal 0.02       (plist-get r :cost-usd)))
+      (should-not (plist-get r :pending)))))
+
+(ert-deftest anvil-orchestrator--submit-and-collect-surfaces-failed-error ()
+  "A failed task yields :status failed + :error + :pending nil."
+  (anvil-orchestrator-test--with-mocked-submit
+      '(:id "sac-fail" :status failed :provider codex
+        :error "boom" :exit-code 2 :summary nil
+        :cost-tokens nil)
+    (let ((r (anvil-orchestrator-submit-and-collect
+              :provider 'codex :prompt "do"
+              :collect-timeout-sec 2.0
+              :poll-interval-sec 0.05)))
+      (should (equal 'failed (plist-get r :status)))
+      (should (equal "boom"  (plist-get r :error)))
+      (should-not (plist-get r :pending)))))
+
+(ert-deftest anvil-orchestrator--submit-and-collect-times-out-non-destructive ()
+  "Collect timeout returns :pending t + :task-id without killing the task."
+  (anvil-orchestrator-test--with-mocked-submit
+      '(:id "sac-run" :status running :provider codex)
+    (let ((r (anvil-orchestrator-submit-and-collect
+              :provider 'codex :prompt "do"
+              :collect-timeout-sec 0.2
+              :poll-interval-sec 0.05)))
+      (should (equal "sac-run" (plist-get r :task-id)))
+      (should (plist-get r :pending))
+      (should (equal 'running (plist-get r :status))))
+    ;; task is NOT cleaned up
+    (should (gethash "sac-run" anvil-orchestrator--tasks))))
+
+(ert-deftest anvil-orchestrator--tool-submit-and-collect-coerces-numeric-strings ()
+  "MCP wrapper accepts collect_timeout_sec as a numeric string."
+  (anvil-orchestrator-test--with-mocked-submit
+      '(:id "sac-mcp" :status done :provider claude
+        :summary "m" :cost-usd 0 :cost-tokens nil :exit-code 0)
+    (let ((r (anvil-orchestrator--tool-submit-and-collect
+              "claude" "hi" nil nil nil nil nil "5")))
+      (should (equal 'done (plist-get r :status)))
+      (should (equal "m"   (plist-get r :summary))))
+    ;; empty string collect_timeout_sec falls back to default 180
+    (let ((r (anvil-orchestrator--tool-submit-and-collect
+              "claude" "hi" nil nil nil nil nil "")))
+      (should (equal 'done (plist-get r :status))))))
+
 ;;;; --- DAG resume (Phase 6C'') --------------------------------------------
 
 (defmacro anvil-orchestrator-test--with-pool (tasks &rest body)

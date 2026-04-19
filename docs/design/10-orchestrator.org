@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -880,6 +880,92 @@ buffer) が main daemon 側にあるため、cron dispatcher は
 別 doc or 本 doc 更新で。
 
 合計 Phase 1a-2b で 11-16 日目安。
+
+** Phase 7 — Effectiveness improvements (Tier 1)
+
+2026-04-19 の dogfooding 後の振り返りで、orchestrator を **常時 ON** で
+使えない三大根本原因を識別した (~feedback_orchestrator_when_to_use.md~):
+
+1. Live progress が見えない (submit 後 tail でしか状況把握できない)
+2. 共通 preamble の再送税 (N task で同じ 2KB を N 回 tokenize)
+3. 小タスク用 sync API が無い (submit → poll → tail → extract の 4 hop)
+
+Phase 7 はこの 3 項目を sub-phase に分けて潰す。
+
+*** Phase 7a — ~orchestrator-submit-and-collect~ sync API *SHIPPED* (2026-04-19)
+
+**Scope:**
+- 既存 ~anvil-orchestrator-submit-one~ + ~-tail~ + ~-extract-result~ を
+  合成した薄い wrapper を 1 つ追加
+- signature: ~(anvil-orchestrator-submit-and-collect &key provider prompt
+  model name cwd budget-usd timeout-sec collect-timeout-sec poll-interval-sec)~
+- 挙動: submit → poll 完了まで (timeout 付) → done なら ~:summary~ 直返、
+  failed なら ~:error~ 返、timeout なら ~:pending t :task-id ID~ で逃す
+- MCP tool ~orchestrator-submit-and-collect~ も登録
+- 短い task (30s-2min) を "one-shot" で扱える、既存 4 hop を 1 hop に
+
+**Decisions:**
+1. 並列性は変えない。内部で pool 経由で投げる、collect 時は non-blocking
+   ~accept-process-output~ 駆動で待つ
+2. timeout 切れ時 task は kill せず残す (task-id 返すので後から collect 可)
+3. MCP schema は ~collect-timeout-sec~ を string coerce 可 (既存 glue-helpers
+   と同 pattern)
+4. Phase 7a では consensus / judge / DAG を使わない — これらは batch API 専用
+
+**Tests:** +4 ERT (done / failed / timeout / MCP coercion)
+
+*** Phase 7b — context preamble 登録 (所要 3-5h)
+
+**Scope:**
+- ~anvil-state~ ns="orchestrator-preamble" に user 登録の共通 preamble
+  (設計 doc 抜粋 / コーディング規約 / 今日の決定) を key → text で保存
+- submit 時 ~:preamble-ref KEY~ を受け取ると、provider prompt 組立時に
+  prepend (claude の ~--append-system-prompt~ か prompt 冒頭差し込み)
+- 重複送信避けるため TTL cache (Doc 09 http 同様)、preamble 変更時は
+  hash で invalidate
+- MCP tools: ~orchestrator-preamble-set~ / ~-get~ / ~-list~ / ~-delete~
+
+**Decisions:**
+1. preamble は **本文 copy** で submit (provider 側の prompt cache は
+   provider 次第、orchestrator 側は可視性重視)
+2. key collision を避けるため user が明示的に設定、auto-inject は無し
+3. ~:preamble-ref~ は string or list of strings 許可、複数はこの順で concat
+4. subscription 前提なので cost 上の gain は小さい、**context pollution
+   回避** が主目的
+
+**Tests:** +5 ERT (get/set/list/delete + resolve-in-submit)
+
+*** Phase 7c — live streaming (所要 1-2 日)
+
+**Scope:**
+- claude CLI は ~--output-format stream-json~ で 1 行 1 event、既に parser
+  あり。現状は sentinel 完了時に最終 message を抽出するのみ
+- partial-output を task state (~:stream-events~ list) に push、~tail~ では
+  stderr-file 読みだが、新 API ~orchestrator-stream~ で accumulated events
+  を取れる
+- ~:on-event CALLBACK~ option で Elisp hook も流す (dashboard live update、
+  parent Claude session への通知 hook 等)
+- MCP tool ~orchestrator-stream~ は since-seq 指定の増分 read
+
+**Decisions:**
+1. memory 書き込み量を cap (~anvil-orchestrator-stream-max-events~ 既定 500、
+   超過時は圧縮: 古い event の body を discard、meta のみ保持)
+2. stream は opt-in (~:stream t~ 指定時のみ parser が event push)、default off で
+   互換性維持
+3. provider 対応は claude 先行、他 provider は next phase
+4. dashboard は Phase 7c 完了で auto-refresh に昇格 (filenotify or timer)
+
+**Tests:** +8 ERT (event push / cap / since-seq / MCP tool / opt-in default /
+callback invocation / multi-provider stub / overflow discard)
+
+*** Phase 7 全体 依存関係
+
+- 7a は独立、今セッション ship 予定
+- 7b は 7a に依存せず、独立実装可
+- 7c は 7a / 7b と独立、sentinel + parser 改修が大きいので最後
+
+Phase 6C'' (DAG resume) との orthogonality は確認済。interrupt-flag 機構は
+7c streaming と相性良 (再開時 since-seq で分割 collect 可能)。
 
 * References
 

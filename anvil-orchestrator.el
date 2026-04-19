@@ -2737,6 +2737,58 @@ retry, and budget rules as any other batch."
     (car ids)))
 
 ;;;###autoload
+(cl-defun anvil-orchestrator-submit-and-collect
+    (&key provider prompt model name cwd budget-usd timeout-sec
+          (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
+  "Submit a single task and wait (non-blocking) for its result.
+
+A thin composition of `anvil-orchestrator-submit-one' + internal
+poll + `anvil-orchestrator-extract-result' so short-running tasks
+(30 s to a few minutes) can be dispatched in one call without the
+submit → poll → tail → extract hop chain.
+
+:provider / :prompt are forwarded to `submit-one'; :model / :name
+/ :cwd / :budget-usd / :timeout-sec likewise when non-nil.
+
+:collect-timeout-sec (default 180) is the wall-clock cap on the
+poll loop.  :poll-interval-sec (default 0.5) tunes the
+`accept-process-output' cadence.  :full is passed through to
+`extract-result' when the task completes.
+
+Returns a plist.  When the task reaches a terminal state the
+plist is `extract-result' s output plus `:pending nil'; fields
+include `:task-id', `:status' (`done' / `failed' / `cancelled'),
+`:summary', `:error', etc.  When the collect timeout elapses
+first, returns `(:task-id ID :status running :pending t)' and
+the task is deliberately not cancelled so the caller can
+re-collect via `extract-result' later."
+  (let* ((task-id (anvil-orchestrator-submit-one
+                   :provider provider
+                   :prompt prompt
+                   :model model
+                   :name name
+                   :cwd cwd
+                   :budget-usd budget-usd
+                   :timeout-sec timeout-sec))
+         (deadline (+ (float-time) collect-timeout-sec)))
+    (while (let ((task (anvil-orchestrator--task-get task-id)))
+             (and task
+                  (not (memq (plist-get task :status)
+                             '(done failed cancelled)))
+                  (< (float-time) deadline)))
+      (accept-process-output nil poll-interval-sec))
+    (let* ((task (anvil-orchestrator--task-get task-id))
+           (status (and task (plist-get task :status))))
+      (cond
+       ((memq status '(done failed cancelled))
+        (append (anvil-orchestrator-extract-result task-id full)
+                (list :pending nil)))
+       (t
+        (list :task-id task-id
+              :status  (or status 'unknown)
+              :pending t))))))
+
+;;;###autoload
 (cl-defun anvil-orchestrator-tail (task-id &key stream bytes)
   "Return the last BYTES bytes of task TASK-ID's STREAM file.
 
@@ -2803,6 +2855,50 @@ MCP Parameters:
                     :model    (and model (not (string-empty-p model)) model)
                     :name     (and name  (not (string-empty-p name))  name))))
       (list :task-id task-id))))
+
+(defun anvil-orchestrator--tool-submit-and-collect
+    (provider prompt
+     &optional model name cwd budget_usd timeout_sec
+     collect_timeout_sec full)
+  "MCP wrapper for `anvil-orchestrator-submit-and-collect'.
+
+MCP Parameters:
+  provider - Provider name string (e.g. \"claude\", \"codex\").
+  prompt   - Prompt text string.  Required.
+  model    - Optional provider-specific model id override.
+  name     - Optional human-readable task label.
+  cwd      - Optional working directory.
+  budget_usd           - Optional per-task budget as a string
+                         (numeric).  Empty or nil = use default.
+  timeout_sec          - Optional provider kill timeout (string,
+                         integer).
+  collect_timeout_sec  - Optional wall-clock collect timeout
+                         (string, integer, default 180).  When the
+                         task is still running at the deadline the
+                         wrapper returns :pending t without killing
+                         the task.
+  full                 - Truthy string (\"t\" / \"true\") asks
+                         extract-result to re-parse without
+                         summary truncation."
+  (anvil-server-with-error-handling
+    (unless (and (stringp provider) (not (string-empty-p provider)))
+      (user-error "submit-and-collect: provider required"))
+    (unless (and (stringp prompt) (not (string-empty-p prompt)))
+      (user-error "submit-and-collect: prompt required"))
+    (cl-labels ((num (s)
+                  (and s (stringp s) (not (string-empty-p s))
+                       (let ((n (string-to-number s)))
+                         (and (numberp n) (> n 0) n)))))
+      (anvil-orchestrator-submit-and-collect
+       :provider (intern provider)
+       :prompt   prompt
+       :model    (and model (not (string-empty-p model)) model)
+       :name     (and name  (not (string-empty-p name))  name)
+       :cwd      (and cwd   (not (string-empty-p cwd))   cwd)
+       :budget-usd          (num budget_usd)
+       :timeout-sec         (num timeout_sec)
+       :collect-timeout-sec (or (num collect_timeout_sec) 180)
+       :full (anvil-orchestrator--coerce-truthy-string full)))))
 
 (defun anvil-orchestrator--tool-tail (task_id &optional stream bytes)
   "MCP wrapper for `anvil-orchestrator-tail'.
@@ -3056,6 +3152,20 @@ pool / retry / budget semantics.  Use orchestrator-submit for
 DAGs, consensus, or multi-task batches.")
 
   (anvil-server-register-tool
+   #'anvil-orchestrator--tool-submit-and-collect
+   :id "orchestrator-submit-and-collect"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Submit a single task and block until it finishes (or
+collect_timeout_sec elapses — default 180).  Returns the
+extract-result plist (:summary / :cost-usd / :status / ...) when
+the task reaches a terminal state.  On timeout the task is kept
+alive and the wrapper returns :pending t + :task-id, so a later
+orchestrator-extract-result picks it up.  Phase 7a: replaces the
+submit-one / poll / tail / extract-result 4-hop chain with a
+single call for short-running tasks.")
+
+  (anvil-server-register-tool
    #'anvil-orchestrator--tool-tail
    :id "orchestrator-tail"
    :server-id anvil-orchestrator--server-id
@@ -3098,6 +3208,7 @@ Phase 6C'' DAG resume."))
                 "orchestrator-stats"
                 "orchestrator-extract-result"
                 "orchestrator-submit-one"
+                "orchestrator-submit-and-collect"
                 "orchestrator-tail"
                 "orchestrator-list-interrupted"
                 "orchestrator-resume-interrupted"))
