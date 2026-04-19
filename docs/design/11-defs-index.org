@@ -7,12 +7,19 @@
   :PROPERTIES:
   :ID:       6f61ae23-9615-4632-8ba8-5f734a973d65
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (revised 2026-04-19)
 
 Tier 1 of Week-2 roadmap.  Sister to Doc 02 (anvil-org-index) but for
 elisp.  Provides the SQLite-backed symbol index that Doc 12 (sexp
 edits), Doc 13 (bisect), Doc 14 (bench), Doc 16 (lint), Doc 19 (pair)
 all query against.
+
+/Revision 2026-04-19 (late):/ scope for the initial ship narrowed to
+"Phase 1 + Phase 2 minus filenotify" — enough to unblock Doc 12 Phase 2b.
+Phase 3 (filenotify incremental updates) and Phase 4 (macro expansion)
+are deferred to a separate ship cycle.  Reader helpers are taken
+directly from `anvil-sexp' (Doc 12 Phase 1 / 2a) so we do not duplicate
+top-level form parsing or kind classification.
 
 * Motivation
 
@@ -230,7 +237,7 @@ DB.
 - *Ship criterion*: ~defs-references 'anvil-state-set~ returns all real
   call sites in anvil/ without false positives from strings or comments.
 
-** Phase 3 — filenotify + common index helper extract
+** Phase 3 — filenotify + common index helper extract (deferred)
 
 - Filenotify watcher per-file, delta update on save.
 - Extract ~anvil-index-common.el~ with the filenotify boilerplate
@@ -238,6 +245,11 @@ DB.
 - ERT +5 (edit event → def removed → def re-added, debounce).
 - *Ship criterion*: saving a .el file updates the DB within 500ms,
   search reflects change.
+
+Phase 3 does not block Doc 12 Phase 2b — between rebuilds, callers use
+~anvil-defs-refresh-if-stale~ to re-scan changed files lazily (same
+fallback pattern as anvil-org-index).  Filenotify is a latency
+improvement, not a correctness prerequisite.
 
 ** Phase 4 — macro-expansion opt-in (optional)
 
