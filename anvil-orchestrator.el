@@ -1013,6 +1013,12 @@ stream-json NDJSON survives round-trip."
                 :coding   'utf-8-unix
                 :noquery  t
                 :sentinel #'anvil-orchestrator--sentinel)))
+    ;; Providers pass the prompt via argv, not stdin; ollama / claude
+    ;; wait on the input pipe indefinitely if we leave it open, so the
+    ;; task hangs until the wall-clock kills it.  Close stdin eagerly.
+    ;; Opt out with :keep-stdin t in the task plist.
+    (unless (plist-get task :keep-stdin)
+      (ignore-errors (process-send-eof proc)))
     (process-put proc 'anvil-task-id       (plist-get task :id))
     (process-put proc 'anvil-stdout-path   stdout)
     (process-put proc 'anvil-stderr-path   stderr)
