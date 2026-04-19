@@ -1937,5 +1937,184 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
     (should (equal '(:total 42)
                    (anvil-orchestrator--tool-stats)))))
 
+;;;; --- glue helpers (extract-result / submit-one / tail) ------------------
+
+(defmacro anvil-orchestrator-test--with-task (task-plist &rest body)
+  "Run BODY with a single TASK-PLIST registered in the in-memory task table.
+Cleans up the task hash afterwards so the ambient state stays pristine."
+  (declare (indent 1))
+  `(let* ((_tasks (copy-hash-table anvil-orchestrator--tasks))
+          (task   (copy-sequence ,task-plist))
+          (id     (plist-get task :id)))
+     (unwind-protect
+         (progn
+           (puthash id task anvil-orchestrator--tasks)
+           ,@body)
+       (setq anvil-orchestrator--tasks _tasks))))
+
+(ert-deftest anvil-orchestrator--extract-result-returns-summary-and-cost ()
+  "extract-result returns a slim plist for a finished task without FULL."
+  (anvil-orchestrator-test--with-task
+      '(:id "tid-1" :status done :provider codex
+        :summary "short answer" :cost-usd 0.01
+        :cost-tokens (:input 10 :output 5)
+        :commit-sha "abc1234" :exit-code 0)
+    (let ((r (anvil-orchestrator-extract-result "tid-1")))
+      (should (equal "tid-1"         (plist-get r :task-id)))
+      (should (equal 'done           (plist-get r :status)))
+      (should (equal "short answer"  (plist-get r :summary)))
+      (should (equal 0.01            (plist-get r :cost-usd)))
+      (should (equal '(:input 10 :output 5)
+                     (plist-get r :tokens)))
+      (should (equal "abc1234"       (plist-get r :commit-sha)))
+      (should (equal 0               (plist-get r :exit-code))))))
+
+(ert-deftest anvil-orchestrator--extract-result-errors-on-unknown-id ()
+  (should-error (anvil-orchestrator-extract-result "no-such-id")
+                :type 'user-error))
+
+(ert-deftest anvil-orchestrator--extract-result-full-bypasses-truncation ()
+  "With FULL non-nil, re-parse stdout-path without clamping summary."
+  (let* ((tmp (make-temp-file "orch-extract-" nil ".jsonl")))
+    (unwind-protect
+        (progn
+          ;; Write one codex-shaped agent_message event with a long body.
+          (let ((long-text (make-string 8000 ?x)))
+            (with-temp-file tmp
+              (insert
+               (json-serialize
+                (list :type "item.completed"
+                      :item (list :type "agent_message"
+                                  :text long-text))
+                :null-object nil :false-object nil)
+               "\n")))
+          (anvil-orchestrator-test--with-task
+              (list :id "tid-full"
+                    :status 'done :provider 'codex
+                    :stdout-path tmp
+                    :stderr-path nil
+                    :exit-code 0
+                    ;; Stored summary was clamped on finalize.
+                    :summary (make-string 4000 ?x))
+            ;; default full=nil returns stored (4k) summary
+            (let ((r (anvil-orchestrator-extract-result "tid-full")))
+              (should (= 4000 (length (plist-get r :summary)))))
+            ;; full=t re-parses and delivers the entire 8k body
+            (let ((r (anvil-orchestrator-extract-result "tid-full" t)))
+              (should (= 8000 (length (plist-get r :summary)))))))
+      (delete-file tmp))))
+
+(ert-deftest anvil-orchestrator--submit-one-returns-task-id ()
+  "submit-one returns the (single) task-id, not the batch-id."
+  (cl-letf* ((submitted nil)
+             ((symbol-function 'anvil-orchestrator-submit)
+              (lambda (tasks)
+                (setq submitted tasks)
+                (let ((batch "batch-xyz")
+                      (task-id "task-abc"))
+                  (puthash batch (list task-id)
+                           anvil-orchestrator--batches)
+                  batch))))
+    (let ((id (anvil-orchestrator-submit-one
+               :provider 'codex
+               :prompt "do a thing"
+               :model "gpt-5-codex"
+               :name "unit-one")))
+      (should (equal "task-abc" id))
+      (should (= 1 (length submitted)))
+      (let ((t0 (car submitted)))
+        (should (equal 'codex        (plist-get t0 :provider)))
+        (should (equal "do a thing"  (plist-get t0 :prompt)))
+        (should (equal "gpt-5-codex" (plist-get t0 :model)))
+        (should (equal "unit-one"    (plist-get t0 :name)))))))
+
+(ert-deftest anvil-orchestrator--submit-one-auto-names-when-omitted ()
+  "submit-one auto-generates :name when caller does not supply one."
+  (cl-letf* ((submitted nil)
+             ((symbol-function 'anvil-orchestrator-submit)
+              (lambda (tasks)
+                (setq submitted tasks)
+                (puthash "batch" (list "tid")
+                         anvil-orchestrator--batches)
+                "batch")))
+    (anvil-orchestrator-submit-one :provider 'claude :prompt "x")
+    (let ((name (plist-get (car submitted) :name)))
+      (should (stringp name))
+      (should (string-match-p "\\`one-claude-" name)))))
+
+(ert-deftest anvil-orchestrator--submit-one-requires-provider-and-prompt ()
+  (should-error (anvil-orchestrator-submit-one :prompt "x") :type 'user-error)
+  (should-error (anvil-orchestrator-submit-one :provider 'claude)
+                :type 'user-error))
+
+(ert-deftest anvil-orchestrator--tail-reads-last-bytes ()
+  "tail returns the last N bytes of stdout when smaller than file."
+  (let ((tmp (make-temp-file "orch-tail-")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (dotimes (_i 10) (insert "0123456789\n"))) ; 110 bytes
+          (anvil-orchestrator-test--with-task
+              (list :id "tid-tail" :status 'done
+                    :provider 'codex
+                    :stdout-path tmp :stderr-path nil)
+            (let ((text (anvil-orchestrator-tail "tid-tail" :bytes 20)))
+              (should (stringp text))
+              (should (= 20 (length text))))))
+      (delete-file tmp))))
+
+(ert-deftest anvil-orchestrator--tail-returns-nil-when-empty ()
+  "tail returns nil when the stdout file is empty."
+  (let ((tmp (make-temp-file "orch-tail-empty-")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp (insert ""))
+          (anvil-orchestrator-test--with-task
+              (list :id "tid-empty" :status 'done
+                    :provider 'codex
+                    :stdout-path tmp :stderr-path nil)
+            (should (null (anvil-orchestrator-tail "tid-empty")))))
+      (delete-file tmp))))
+
+(ert-deftest anvil-orchestrator--tail-honours-stderr-stream ()
+  "tail :stream :stderr reads from :stderr-path instead of :stdout-path."
+  (let ((out (make-temp-file "orch-out-"))
+        (err (make-temp-file "orch-err-")))
+    (unwind-protect
+        (progn
+          (with-temp-file out (insert "OUTPUT\n"))
+          (with-temp-file err (insert "STDERR_CONTENT\n"))
+          (anvil-orchestrator-test--with-task
+              (list :id "tid-stream" :status 'done
+                    :provider 'codex
+                    :stdout-path out :stderr-path err)
+            (should (equal "OUTPUT\n"
+                           (anvil-orchestrator-tail "tid-stream")))
+            (should (equal "STDERR_CONTENT\n"
+                           (anvil-orchestrator-tail
+                            "tid-stream" :stream :stderr)))))
+      (delete-file out)
+      (delete-file err))))
+
+(ert-deftest anvil-orchestrator--tool-tail-coerces-bytes-from-string ()
+  "tool-tail accepts bytes as a numeric string (MCP pass-through)."
+  (let ((tmp (make-temp-file "orch-tool-tail-")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp (insert (make-string 50 ?X)))
+          (anvil-orchestrator-test--with-task
+              (list :id "tid-tt" :status 'done
+                    :provider 'codex
+                    :stdout-path tmp :stderr-path nil)
+            (let ((r (anvil-orchestrator--tool-tail "tid-tt" "stdout" "10")))
+              (should (equal 10 (length (plist-get r :tail)))))))
+      (delete-file tmp))))
+
+(ert-deftest anvil-orchestrator--summary-default-is-4000 ()
+  "Default `anvil-orchestrator-summary-max-chars' is 4000 after bump."
+  (let ((anvil-orchestrator-summary-max-chars
+         (default-value 'anvil-orchestrator-summary-max-chars)))
+    (should (equal 4000 anvil-orchestrator-summary-max-chars))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

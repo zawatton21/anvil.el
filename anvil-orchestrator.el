@@ -171,8 +171,13 @@ Providers not listed use the globals entirely."
   :type 'number
   :group 'anvil-orchestrator)
 
-(defcustom anvil-orchestrator-summary-max-chars 300
-  "Maximum length of the summary kept on each task record."
+(defcustom anvil-orchestrator-summary-max-chars 4000
+  "Maximum length of the summary kept on each task record.
+The original 300-char ceiling forced callers to re-read
+`:stdout-path' every time they needed the real agent message;
+4000 is roughly the upper tail of a single-turn AI answer in
+practice so `orchestrator-extract-result' can return the text
+directly in the common case without a follow-up file read."
   :type 'integer
   :group 'anvil-orchestrator)
 
@@ -2500,6 +2505,171 @@ The server layer performs JSON serialisation; this function
 returns the stats plist verbatim."
   (anvil-orchestrator-stats))
 
+;;;; --- glue helpers (dogfood friction reducers) ---------------------------
+
+;;;###autoload
+(defun anvil-orchestrator-extract-result (task-id &optional full)
+  "Return the result plist for TASK-ID.
+
+Produces the minimum fields a caller needs to act on a finished
+task without opening `:stdout-path' by hand: `:summary' (the
+provider-parsed final message), `:cost-usd', `:tokens',
+`:commit-sha', `:exit-code', and `:error'.
+
+When FULL is non-nil the provider's `parse-output' hook is
+re-invoked on the raw stream files with
+`anvil-orchestrator-summary-max-chars' bound to
+`most-positive-fixnum', so the caller receives the untruncated
+agent message.  FULL is the right knob for rare long answers
+(codex long explanations, consensus judge narratives); the
+default summary is already 4000 chars which fits the vast
+majority of single-turn responses."
+  (let* ((task (anvil-orchestrator--task-get task-id))
+         (_    (unless task
+                 (user-error "extract-result: unknown task id %s" task-id)))
+         (base (list :task-id    task-id
+                     :status     (plist-get task :status)
+                     :provider   (plist-get task :provider)
+                     :cost-usd   (plist-get task :cost-usd)
+                     :tokens     (plist-get task :cost-tokens)
+                     :commit-sha (plist-get task :commit-sha)
+                     :exit-code  (plist-get task :exit-code)
+                     :error      (plist-get task :error))))
+    (if (not full)
+        (append base (list :summary (plist-get task :summary)))
+      (let* ((provider (plist-get task :provider))
+             (prov-rec (and provider (anvil-orchestrator--provider provider)))
+             (parser   (and prov-rec
+                            (anvil-orchestrator-provider-parse-output prov-rec)))
+             (stdout   (plist-get task :stdout-path))
+             (stderr   (plist-get task :stderr-path))
+             (exit     (plist-get task :exit-code)))
+        (unless (and parser stdout (file-readable-p stdout))
+          (user-error "extract-result: cannot re-parse (provider=%s, stdout-readable=%s)"
+                      provider (and stdout (file-readable-p stdout))))
+        (let* ((anvil-orchestrator-summary-max-chars most-positive-fixnum)
+               (reparsed (funcall parser stdout stderr exit)))
+          (append base (list :summary (plist-get reparsed :summary))))))))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-submit-one
+    (&key provider prompt model name cwd budget-usd timeout-sec)
+  "Submit a single task and return its task-id (not the batch-id).
+
+A light convenience over `anvil-orchestrator-submit' for the
+common case where the caller has exactly one prompt and does
+not need DAG / consensus / multi-task semantics.  All keyword
+arguments except :provider and :prompt are optional.  Behaviour
+is identical to passing a one-element list through `submit':
+the task enters the global pool with the same concurrency,
+retry, and budget rules as any other batch."
+  (unless (and provider prompt)
+    (user-error "submit-one: :provider and :prompt are required"))
+  (let* ((auto-name (or name
+                        (format "one-%s-%s"
+                                (if (symbolp provider)
+                                    (symbol-name provider)
+                                  provider)
+                                (format-time-string "%H%M%S"))))
+         (task (append (list :name auto-name
+                             :provider provider
+                             :prompt prompt)
+                       (when model       (list :model model))
+                       (when cwd         (list :cwd cwd))
+                       (when budget-usd  (list :budget-usd budget-usd))
+                       (when timeout-sec (list :timeout-sec timeout-sec))))
+         (batch-id (anvil-orchestrator-submit (list task)))
+         (ids      (gethash batch-id anvil-orchestrator--batches)))
+    (car ids)))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-tail (task-id &key stream bytes)
+  "Return the last BYTES bytes of task TASK-ID's STREAM file.
+
+STREAM is either `:stdout' / \"stdout\" (default) or
+`:stderr' / \"stderr\".  BYTES defaults to 8192 and is clamped
+to the file size.  Returns the raw tail string, or nil when
+the stream file is missing or empty.  Unlike
+`extract-result :full t' this is provider-agnostic: it reads
+raw bytes straight off disk without re-running any parser, so
+it is the right primitive for watching codex / claude partial
+output mid-run or for inspecting stderr after a crash."
+  (let* ((task   (anvil-orchestrator--task-get task-id))
+         (_      (unless task
+                   (user-error "tail: unknown task id %s" task-id)))
+         (sym    (cond ((eq stream :stderr) :stderr-path)
+                       ((equal stream "stderr") :stderr-path)
+                       (t :stdout-path)))
+         (path   (plist-get task sym))
+         (nbytes (or bytes 8192)))
+    (when (and path (file-readable-p path))
+      (let ((size (file-attribute-size (file-attributes path))))
+        (when (and size (> size 0))
+          (with-temp-buffer
+            (insert-file-contents path nil
+                                  (max 0 (- size nbytes))
+                                  size)
+            (buffer-string)))))))
+
+(defun anvil-orchestrator--coerce-truthy-string (s)
+  "Coerce MCP string S to nil / t using the same rules as tool-collect."
+  (and s (not (member s '("" "nil" "false" "0" "no" "False" "NIL")))))
+
+(defun anvil-orchestrator--tool-extract-result (task_id &optional full)
+  "MCP wrapper for `anvil-orchestrator-extract-result'.
+
+MCP Parameters:
+  task_id - Task id string as returned by orchestrator-submit* tools.
+  full    - When truthy (\"t\" / \"true\" / non-empty), bypass
+            summary truncation and re-parse the full stdout."
+  (anvil-server-with-error-handling
+    (anvil-orchestrator-extract-result
+     task_id
+     (anvil-orchestrator--coerce-truthy-string full))))
+
+(defun anvil-orchestrator--tool-submit-one (provider prompt
+                                            &optional model name)
+  "MCP wrapper for `anvil-orchestrator-submit-one'.
+
+MCP Parameters:
+  provider - Provider name string (e.g. \"claude\", \"codex\",
+             \"gemini\", \"aider\", \"ollama\").  Coerced to symbol.
+  prompt   - Prompt text string.  Required.
+  model    - Optional provider-specific model id override.
+  name     - Optional human-readable task label; auto-generated
+             from provider + HHMMSS when omitted."
+  (anvil-server-with-error-handling
+    (unless (and (stringp provider) (not (string-empty-p provider)))
+      (user-error "submit-one: provider required"))
+    (unless (and (stringp prompt) (not (string-empty-p prompt)))
+      (user-error "submit-one: prompt required"))
+    (let ((task-id (anvil-orchestrator-submit-one
+                    :provider (intern provider)
+                    :prompt   prompt
+                    :model    (and model (not (string-empty-p model)) model)
+                    :name     (and name  (not (string-empty-p name))  name))))
+      (list :task-id task-id))))
+
+(defun anvil-orchestrator--tool-tail (task_id &optional stream bytes)
+  "MCP wrapper for `anvil-orchestrator-tail'.
+
+MCP Parameters:
+  task_id - Task id string.
+  stream  - Optional \"stdout\" (default) or \"stderr\".
+  bytes   - Optional integer (as string) cap, default 8192."
+  (anvil-server-with-error-handling
+    (let ((n (or (and bytes
+                      (stringp bytes)
+                      (not (string-empty-p bytes))
+                      (string-to-number bytes))
+                 8192)))
+      (when (<= n 0) (setq n 8192))
+      (list :tail (or (anvil-orchestrator-tail
+                       task_id
+                       :stream (or stream "stdout")
+                       :bytes n)
+                      "")))))
+
 ;;;; --- dashboard ----------------------------------------------------------
 
 (defvar anvil-orchestrator-dashboard-mode-map
@@ -2616,7 +2786,8 @@ coming) and return a batch id.  Tasks run asynchronously in a
 pool with global and per-provider concurrency caps; poll via
 `orchestrator-status' or `orchestrator-collect'.  Designed to
 keep the parent session's context small — only task ids and
-final summaries (<= 300 chars) come back by default.")
+final summaries (<= `anvil-orchestrator-summary-max-chars',
+default 4000) come back by default.")
 
   (anvil-server-register-tool
    #'anvil-orchestrator--tool-status
@@ -2705,6 +2876,40 @@ state."
    "Return aggregated task statistics from the in-memory task table:
 totals, per-status counts, per-provider breakdown, elapsed-ms avg/
 p50/p95, and total cost-usd sum.  Read-only snapshot."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-extract-result
+   :id "orchestrator-extract-result"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the minimum result plist for a task — summary, cost,
+tokens, exit code, error — without exposing the raw prompt or
+paths.  Pass full=\"t\" to bypass summary truncation and
+re-parse the full agent message from stdout.  Replaces the old
+three-tool glue dance (Read stdout-path + python3 json extract
++ Edit) with a single call."
+   :read-only t)
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-submit-one
+   :id "orchestrator-submit-one"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Submit a single task and return its task-id.  A convenience
+wrapper over orchestrator-submit for one-off prompts; identical
+pool / retry / budget semantics.  Use orchestrator-submit for
+DAGs, consensus, or multi-task batches.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-tail
+   :id "orchestrator-tail"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the last N bytes of a task's stdout or stderr stream.
+Provider-agnostic raw-byte tail: no parsing, no truncation at
+summary granularity.  Use this to watch in-flight codex /
+claude partial output, or to inspect stderr after a failure."
    :read-only t))
 
 (defun anvil-orchestrator--unregister-tools ()
@@ -2715,7 +2920,10 @@ p50/p95, and total cost-usd sum.  Read-only snapshot."
                 "orchestrator-consensus-collect"
                 "orchestrator-consensus-judge"
                 "orchestrator-consensus-judge-collect"
-                "orchestrator-stats"))
+                "orchestrator-stats"
+                "orchestrator-extract-result"
+                "orchestrator-submit-one"
+                "orchestrator-tail"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload
