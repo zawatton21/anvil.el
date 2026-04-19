@@ -787,18 +787,26 @@ building the tail summary.")
 (defun anvil-orchestrator--ollama-strip-thinking-block (text)
   "Strip ollama thinking-mode preamble blocks from TEXT.
 
-When `anvil-orchestrator-ollama-strip-thinking' is non-nil, remove
-all case-insensitive `<think>...</think>' substrings from TEXT using
-a multi-line regex match, then trim the result with `string-trim'.
-If TEXT is nil, or stripping is disabled, return TEXT unchanged.
-Return nil when the stripped and trimmed result is an empty string."
+When `anvil-orchestrator-ollama-strip-thinking' is non-nil, remove:
+  (a) `<think>...</think>' XML-style blocks (some reasoning models); and
+  (b) `Thinking...' ... `...done thinking.' plain-text blocks (gemma4
+      on ollama emits this rather than XML tags).
+
+Both patterns match case-insensitive and multi-line.  After stripping,
+the result is trimmed via `string-trim'.  Returns TEXT unchanged when
+TEXT is nil or stripping is disabled.  Returns nil when the stripped
+and trimmed result is empty."
   (if (or (null text)
           (not anvil-orchestrator-ollama-strip-thinking))
       text
     (let* ((case-fold-search t)
            (stripped
             (replace-regexp-in-string
-             "<think>\\(?:.\\|\n\\)*?</think>" ""
+             (concat
+              "<think>\\(?:.\\|\n\\)*?</think>"
+              "\\|"
+              "Thinking\\.\\.\\.\\(?:.\\|\n\\)*?\\.\\.\\.done thinking\\.")
+             ""
              text)))
       (let ((trimmed (string-trim stripped)))
         (unless (string-empty-p trimmed)

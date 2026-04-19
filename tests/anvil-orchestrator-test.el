@@ -1801,6 +1801,14 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
      (equal input
             (anvil-orchestrator--ollama-strip-thinking-block input)))))
 
+(ert-deftest anvil-orchestrator--gemma4-strip-plain-text-delimiter ()
+  "Strip the `Thinking... ... ...done thinking.' plain-text form emitted by gemma4:e4b on ollama."
+  (let ((anvil-orchestrator-ollama-strip-thinking t))
+    (should
+     (equal "Final Answer: 42"
+            (anvil-orchestrator--ollama-strip-thinking-block
+             "Thinking...\nStep 1: 7+5=12\nStep 2: 1+1+2=4\n...done thinking.\n\nFinal Answer: 42")))))
+
 ;; --- observability stats tests ---
 
 (ert-deftest anvil-orchestrator--obs-stats-empty-table-zero-totals ()
