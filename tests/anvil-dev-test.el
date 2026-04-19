@@ -483,4 +483,76 @@ picking up the status line itself."
           (should (string-match-p "root: " text)))
       (delete-directory d t))))
 
+;;;; --- bundle: release-audit :scope + test-run-all :minimal --------------
+
+(ert-deftest anvil-dev-test-release-audit-scope-limits-to-one-file ()
+  "`:scope FILE' filters source scanners to that file only."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          ;; Dirty file (arglist-strip hit).
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-bad.el" d)
+           "(defun anvil-bad--tool-foo (_x)\n  \"no MCP Parameters.\"\n  \"ok\")\n")
+          ;; Clean file.
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-good.el" d)
+           "(defun anvil-good--tool-probe () \"no-arg.\" \"ok\")\n")
+          (anvil-dev-test--audit-write
+           (expand-file-name "docs/design/01-ok.org" d)
+           "* STATUS\n~SHIPPED~\n")
+          ;; Whole-tree audit sees the hit.
+          (let ((r (anvil-dev-release-audit d)))
+            (should (plist-get r :arglist-strip))
+            (should-not (plist-get r :clean-p)))
+          ;; Scope to the clean file — hit disappears.
+          (let* ((scope (expand-file-name "anvil-good.el" d))
+                 (r (anvil-dev-release-audit d :scope scope)))
+            (should (null (plist-get r :arglist-strip)))
+            (should (null (plist-get r :missing-params)))
+            (should (equal scope (plist-get r :scope))))
+          ;; Scope to the bad file — hit re-appears but narrowly.
+          (let* ((scope (expand-file-name "anvil-bad.el" d))
+                 (r (anvil-dev-release-audit d :scope scope)))
+            (should (= 1 (length (plist-get r :arglist-strip))))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-release-audit-scope-nonexistent-returns-empty ()
+  "`:scope' to a path that does not exist finds nothing in source."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--audit-write
+           (expand-file-name "anvil-bad.el" d)
+           "(defun anvil-bad--tool-foo (_x) \"no docs.\" \"ok\")\n")
+          (let* ((scope (expand-file-name "nope.el" d))
+                 (r (anvil-dev-release-audit d :scope scope)))
+            (should (null (plist-get r :arglist-strip)))
+            (should (null (plist-get r :missing-params)))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-test-run-all-minimal-omits-per-file ()
+  "With `:minimal t' the return plist has no :per-file key."
+  (cl-letf* ((files '("/tmp/anvil-fake/tests/anvil-x-test.el"))
+             ((symbol-function 'anvil-dev--discover-test-files)
+              (lambda (_root) files))
+             ((symbol-function 'anvil-dev--run-one-test-file)
+              (lambda (_file _root)
+                (list :file "anvil-x-test.el" :ok t
+                      :total 3 :passed 3 :failed 0 :skipped 0
+                      :elapsed-ms 42))))
+    (let ((default-directory
+           (make-temp-file "anvil-dev-minimal-" t)))
+      (unwind-protect
+          (progn
+            (let ((r (anvil-dev-test-run-all default-directory)))
+              (should (plist-member r :per-file))
+              (should (= 1 (length (plist-get r :per-file)))))
+            (let ((r (anvil-dev-test-run-all default-directory
+                                             :minimal t)))
+              (should-not (plist-member r :per-file))
+              (should (= 3 (plist-get r :total)))
+              (should (= 3 (plist-get r :passed)))))
+        (delete-directory default-directory t)))))
+
 ;;; anvil-dev-test.el ends here

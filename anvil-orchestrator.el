@@ -1186,6 +1186,22 @@ this list to accumulate; non-streaming tasks return nil."
          events)
       events)))
 
+;;;###autoload
+(defun anvil-orchestrator-attach-on-event (task-id cb)
+  "Install CB as TASK-ID's `:on-event' callback after submit.
+Companion to the `:on-event' keyword on `submit-one' for the
+post-submit case (dashboards / inspectors that want to latch
+onto an already-running task).  Returns t on success, nil when
+TASK-ID is unknown or already in a terminal state (done /
+failed / cancelled) — a terminal task will not emit new events,
+so attaching a callback silently is a lie the caller should see."
+  (let ((task (gethash task-id anvil-orchestrator--tasks)))
+    (when (and task
+               (not (memq (plist-get task :status)
+                          '(done failed cancelled))))
+      (anvil-orchestrator--task-update-volatile task-id :on-event cb)
+      t)))
+
 (defun anvil-orchestrator--restore-from-state ()
   "Re-hydrate task records from anvil-state into memory.
 Tasks that were `running' at shutdown are marked failed because
@@ -3171,6 +3187,45 @@ empty to clear content without deleting the entry)."
   key)
 
 ;;;###autoload
+(cl-defun anvil-orchestrator-preamble-set-from-file
+    (key path &key offset limit)
+  "Read PATH server-side and register its contents under KEY.
+
+Token-saving alternative to `preamble-set' when the text lives in
+a file the caller would otherwise have to load into its own
+context just to hand it back.  The file is read directly inside
+the daemon process; nothing transits via the MCP channel aside
+from KEY / PATH / the optional OFFSET / LIMIT numbers.
+
+:OFFSET (1-based line, default 1) and :LIMIT (line count, default
+whole file from OFFSET onward) carve a sub-section out of PATH
+without requiring the caller to produce the slice themselves.
+Signals `user-error' on missing / unreadable PATH."
+  (unless (and (stringp key) (not (string-empty-p key)))
+    (user-error "preamble-set-from-file: KEY must be a non-empty string"))
+  (unless (and (stringp path) (not (string-empty-p path))
+               (file-readable-p path))
+    (user-error "preamble-set-from-file: PATH unreadable: %S" path))
+  (let* ((start (or offset 1))
+         (_     (unless (and (integerp start) (>= start 1))
+                  (user-error "preamble-set-from-file: :offset must be >= 1")))
+         (cnt   limit)
+         (_     (when cnt
+                  (unless (and (integerp cnt) (> cnt 0))
+                    (user-error "preamble-set-from-file: :limit must be > 0"))))
+         (text  (with-temp-buffer
+                  (insert-file-contents path)
+                  (goto-char (point-min))
+                  (forward-line (1- start))
+                  (let ((beg (point)))
+                    (if cnt
+                        (forward-line cnt)
+                      (goto-char (point-max)))
+                    (buffer-substring-no-properties beg (point))))))
+    (anvil-orchestrator-preamble-set key text)
+    (list :key key :chars (length text) :path (expand-file-name path))))
+
+;;;###autoload
 (defun anvil-orchestrator-preamble-get (key)
   "Return the preamble text registered under KEY, or nil."
   (unless (and (stringp key) (not (string-empty-p key)))
@@ -3264,6 +3319,72 @@ MCP Parameters:
   key - Preamble key string to remove."
   (anvil-server-with-error-handling
     (list :deleted (and (anvil-orchestrator-preamble-delete key) t))))
+
+(defun anvil-orchestrator--tool-preamble-set-from-file (key path
+                                                           &optional
+                                                           offset limit)
+  "MCP wrapper for `anvil-orchestrator-preamble-set-from-file'.
+
+MCP Parameters:
+  key    - Non-empty preamble key string.
+  path   - Absolute file path readable by the Emacs daemon.  The
+           file's text is stored verbatim as the preamble, so the
+           caller's context never transits the content.
+  offset - Optional 1-based line number (as numeric string); the
+           saved slice starts from this line.  Empty = start of
+           file.
+  limit  - Optional line count (as numeric string); the saved
+           slice spans at most this many lines from OFFSET.
+           Empty = remainder of the file."
+  (anvil-server-with-error-handling
+    (let* ((num (lambda (s)
+                  (and s (stringp s) (not (string-empty-p s))
+                       (let ((n (string-to-number s)))
+                         (and (integerp n) (> n 0) n)))))
+           (off (funcall num offset))
+           (lim (funcall num limit)))
+      (anvil-orchestrator-preamble-set-from-file
+       key path
+       :offset (or off 1)
+       :limit  lim))))
+
+(defconst anvil-orchestrator--preamble-tool-specs
+  `((,#'anvil-orchestrator--tool-preamble-set
+     :id "orchestrator-preamble-set"
+     :description
+     "Register reusable context TEXT under KEY (Phase 7b).  Tasks
+referring to the same KEY via :preamble-ref have TEXT prepended
+verbatim to their prompt at submit time, so a common preamble
+(design notes, conventions, daily-ops context) lives in anvil-
+state rather than being re-typed into every prompt.")
+    (,#'anvil-orchestrator--tool-preamble-get
+     :id "orchestrator-preamble-get"
+     :description
+     "Return the preamble text registered under KEY, plus :found
+boolean.  Empty text when KEY is absent."
+     :read-only t)
+    (,#'anvil-orchestrator--tool-preamble-list
+     :id "orchestrator-preamble-list"
+     :description
+     "List every registered preamble key and its stored text length.
+Read-only snapshot, sorted by key."
+     :read-only t)
+    (,#'anvil-orchestrator--tool-preamble-delete
+     :id "orchestrator-preamble-delete"
+     :description
+     "Remove the preamble registered under KEY.  Returns
+:deleted t when a row existed, :deleted nil when KEY was absent.")
+    (,#'anvil-orchestrator--tool-preamble-set-from-file
+     :id "orchestrator-preamble-set-from-file"
+     :description
+     "Register a preamble whose body lives in a file the daemon
+can read directly.  Saves the caller from loading the file into
+its own context just to hand the text back — a pure token-saving
+variant of orchestrator-preamble-set.  Supports optional offset/
+limit slicing by line number."))
+  "Specs for the Phase 7b / bundle preamble MCP tools.
+Consumed via `anvil-server-register-tools' / `-unregister-tools'
+in `--register-tools' / `--unregister-tools'.")
 
 ;;;; --- dashboard ----------------------------------------------------------
 
@@ -3366,6 +3487,53 @@ MCP Parameters:
     (when id
       (anvil-orchestrator-retry id)
       (anvil-orchestrator-dashboard-refresh))))
+
+;;;###autoload
+(defun anvil-orchestrator-dashboard-autofollow (task-id
+                                                &optional dashboard-buffer)
+  "Refresh DASHBOARD-BUFFER automatically as TASK-ID emits stream events.
+
+Closes the Phase 7c loop: streaming infrastructure exists, but
+the dashboard previously had to be refreshed by hand (`g' or
+`M-x anvil-orchestrator-dashboard-refresh').  Installing this
+callback wires the filter straight into `tabulated-list-revert'
+via a deferred timer (0s) so the redraw runs in Emacs' command
+loop, not inside the process filter.
+
+DASHBOARD-BUFFER defaults to the current buffer and must be in
+`anvil-orchestrator-dashboard-mode'.  TASK-ID must reference a
+non-terminal task submitted with `:stream t' — otherwise there
+are no events to react to and the function returns nil.
+
+When called interactively the command reads the id from the
+cursor line."
+  (interactive
+   (list (or (and (derived-mode-p 'anvil-orchestrator-dashboard-mode)
+                  (tabulated-list-get-id))
+             (read-string "Task id: "))))
+  (let ((buf (or dashboard-buffer (current-buffer))))
+    (unless (and buf (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (derived-mode-p 'anvil-orchestrator-dashboard-mode)))
+      (user-error "autofollow: buffer %s is not a dashboard" buf))
+    (let ((cb (lambda (_id _ev)
+                (let ((target buf))
+                  (when (buffer-live-p target)
+                    (run-at-time
+                     0 nil
+                     (lambda ()
+                       (when (buffer-live-p target)
+                         (with-current-buffer target
+                           (when (derived-mode-p
+                                  'anvil-orchestrator-dashboard-mode)
+                             (ignore-errors
+                               (anvil-orchestrator-dashboard-refresh))))))))))))
+      (if (anvil-orchestrator-attach-on-event task-id cb)
+          (progn
+            (message "anvil-orchestrator: auto-following %s" task-id)
+            t)
+        (message "anvil-orchestrator: task %s unknown or terminal" task-id)
+        nil))))
 
 ;;;; --- lifecycle ----------------------------------------------------------
 
@@ -3542,42 +3710,11 @@ reconnects to resumed upstream.  Optional batch_id scope.
 Returns counts of immediately-DAG-ready vs dep-blocked ids.
 Phase 6C'' DAG resume.")
 
-  (anvil-server-register-tool
-   #'anvil-orchestrator--tool-preamble-set
-   :id "orchestrator-preamble-set"
-   :server-id anvil-orchestrator--server-id
-   :description
-   "Register reusable context TEXT under KEY (Phase 7b).  Tasks
-referring to the same KEY via :preamble-ref have TEXT prepended
-verbatim to their prompt at submit time, so a common preamble
-(design notes, conventions, daily-ops context) lives in anvil-
-state rather than being re-typed into every prompt.")
-
-  (anvil-server-register-tool
-   #'anvil-orchestrator--tool-preamble-get
-   :id "orchestrator-preamble-get"
-   :server-id anvil-orchestrator--server-id
-   :description
-   "Return the preamble text registered under KEY, plus :found
-boolean.  Empty text when KEY is absent."
-   :read-only t)
-
-  (anvil-server-register-tool
-   #'anvil-orchestrator--tool-preamble-list
-   :id "orchestrator-preamble-list"
-   :server-id anvil-orchestrator--server-id
-   :description
-   "List every registered preamble key and its stored text length.
-Read-only snapshot, sorted by key."
-   :read-only t)
-
-  (anvil-server-register-tool
-   #'anvil-orchestrator--tool-preamble-delete
-   :id "orchestrator-preamble-delete"
-   :server-id anvil-orchestrator--server-id
-   :description
-   "Remove the preamble registered under KEY.  Returns
-:deleted t when a row existed, :deleted nil when KEY was absent.")
+  ;; Preamble tool family (Phase 7b + bundle `preamble-set-from-file')
+  ;; migrated to `anvil-server-register-tools' as a dogfood demo of the
+  ;; bundle's new spec-list primitive; see `--preamble-tool-specs'.
+  (anvil-server-register-tools anvil-orchestrator--server-id
+                               anvil-orchestrator--preamble-tool-specs)
 
   (anvil-server-register-tool
    #'anvil-orchestrator--tool-stream
@@ -3607,12 +3744,13 @@ Response plist includes :events / :last-seq / :task-status."
                 "orchestrator-tail"
                 "orchestrator-list-interrupted"
                 "orchestrator-resume-interrupted"
-                "orchestrator-preamble-set"
-                "orchestrator-preamble-get"
-                "orchestrator-preamble-list"
-                "orchestrator-preamble-delete"
                 "orchestrator-stream"))
-    (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
+    (anvil-server-unregister-tool id anvil-orchestrator--server-id))
+  ;; Preamble tool family uses the spec-list primitive (see
+  ;; `--preamble-tool-specs').  Keep the two ecosystems paired so a
+  ;; partial teardown cannot leave stale tools behind.
+  (anvil-server-unregister-tools anvil-orchestrator--server-id
+                                 anvil-orchestrator--preamble-tool-specs))
 
 ;;;###autoload
 (defun anvil-orchestrator-enable ()
