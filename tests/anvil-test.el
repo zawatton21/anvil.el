@@ -16,6 +16,7 @@
 ;; feature name.  Optional: if the stub is absent the `:offload' tests
 ;; simply fail their registration step and everyone else keeps working.
 (require 'anvil-offload-stub nil 'noerror)
+(require 'anvil-test-fixtures)
 
 (ert-deftest anvil-test-feature-provided ()
   "Verify that anvil feature is provided."
@@ -496,5 +497,82 @@ checkpoint's `:value' and `:cursor' when the handler called
           (should (equal "cursor:run-A" (plist-get plist :cursor)))))
     (anvil-server-unregister-tool "anvil-test-resumable-ckpt" "anvil-test")
     (ignore-errors (anvil-offload-stop-repl))))
+
+
+;;;; --- bundle: anvil-server-register-tools / -unregister-tools -----------
+
+(defvar anvil-test--spec-handler-a-called nil)
+(defvar anvil-test--spec-handler-b-called nil)
+
+(defun anvil-test--spec-handler-a ()
+  "Test tool A."
+  (setq anvil-test--spec-handler-a-called t)
+  (list :ok "a"))
+
+(defun anvil-test--spec-handler-b ()
+  "Test tool B."
+  (setq anvil-test--spec-handler-b-called t)
+  (list :ok "b"))
+
+(ert-deftest anvil-test-server-register-tools-registers-all ()
+  "`anvil-server-register-tools' enrols every spec under SERVER-ID."
+  (let ((specs `((,#'anvil-test--spec-handler-a
+                  :id "anvil-test-spec-a"
+                  :description "spec-a")
+                 (,#'anvil-test--spec-handler-b
+                  :id "anvil-test-spec-b"
+                  :description "spec-b"
+                  :read-only t))))
+    (unwind-protect
+        (let ((ids (anvil-server-register-tools "anvil-test" specs))
+              (registered (anvil-test-fixtures-registered-tool-ids
+                           "anvil-test")))
+          (should (equal '("anvil-test-spec-a" "anvil-test-spec-b") ids))
+          (should (member "anvil-test-spec-a" registered))
+          (should (member "anvil-test-spec-b" registered)))
+      (anvil-server-unregister-tools "anvil-test" specs))))
+
+(ert-deftest anvil-test-server-unregister-tools-removes-all ()
+  "`anvil-server-unregister-tools' removes every :id from SPECS."
+  (let ((specs `((,#'anvil-test--spec-handler-a
+                  :id "anvil-test-unreg-a"
+                  :description "a")
+                 (,#'anvil-test--spec-handler-b
+                  :id "anvil-test-unreg-b"
+                  :description "b"))))
+    (anvil-server-register-tools "anvil-test" specs)
+    (let ((results (anvil-server-unregister-tools "anvil-test" specs))
+          (leftover (anvil-test-fixtures-registered-tool-ids "anvil-test")))
+      (should (= 2 (length results)))
+      (should-not (member "anvil-test-unreg-a" leftover))
+      (should-not (member "anvil-test-unreg-b" leftover)))))
+
+(ert-deftest anvil-test-server-register-tools-overrides-stale-server-id ()
+  "Even if a spec carries :server-id, the argument SERVER-ID wins."
+  (let ((specs `((,#'anvil-test--spec-handler-a
+                  :id "anvil-test-override"
+                  :description "override"
+                  :server-id "some-stale-server"))))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tools "anvil-test" specs)
+          (should (member "anvil-test-override"
+                          (anvil-test-fixtures-registered-tool-ids
+                           "anvil-test")))
+          (should-not (member "anvil-test-override"
+                              (anvil-test-fixtures-registered-tool-ids
+                               "some-stale-server"))))
+      (anvil-server-unregister-tools "anvil-test" specs))))
+
+(ert-deftest anvil-test-server-register-tools-rejects-bad-spec ()
+  "Malformed specs abort registration with a clear error."
+  (should-error (anvil-server-register-tools
+                 "anvil-test"
+                 '(("not-a-function" :id "x" :description "x")))
+                :type 'error)
+  (should-error (anvil-server-register-tools
+                 "anvil-test"
+                 `((,#'anvil-test--spec-handler-a :id "x")))
+                :type 'error))
 
 ;;; anvil-test.el ends here

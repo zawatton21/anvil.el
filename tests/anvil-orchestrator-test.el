@@ -2274,6 +2274,48 @@ hash).  Cleans the task + batch tables on exit."
                      (plist-get coerced :prompt)))
       (should-not (plist-get coerced :preamble-ref)))))
 
+(ert-deftest anvil-orchestrator--preamble-set-from-file-stores-whole-file ()
+  "`preamble-set-from-file' without slicing stores the entire file."
+  (anvil-orchestrator-test--with-preamble-store
+    (let ((path (make-temp-file "anvil-pre-file-")))
+      (unwind-protect
+          (progn
+            (with-temp-file path
+              (insert "line-one\nline-two\nline-three\n"))
+            (let ((r (anvil-orchestrator-preamble-set-from-file
+                      "doc" path)))
+              (should (equal "doc" (plist-get r :key)))
+              (should (> (plist-get r :chars) 20))
+              (should (equal (expand-file-name path)
+                             (plist-get r :path))))
+            (should (equal "line-one\nline-two\nline-three\n"
+                           (anvil-orchestrator-preamble-get "doc"))))
+        (ignore-errors (delete-file path))))))
+
+(ert-deftest anvil-orchestrator--preamble-set-from-file-offset-limit-slices ()
+  "`:offset' and `:limit' carve an inclusive line range out of PATH."
+  (anvil-orchestrator-test--with-preamble-store
+    (let ((path (make-temp-file "anvil-pre-slice-")))
+      (unwind-protect
+          (progn
+            (with-temp-file path
+              (insert "one\ntwo\nthree\nfour\nfive\n"))
+            (anvil-orchestrator-preamble-set-from-file
+             "slice" path :offset 2 :limit 2)
+            (should (equal "two\nthree\n"
+                           (anvil-orchestrator-preamble-get "slice")))
+            (anvil-orchestrator-preamble-set-from-file
+             "tail" path :offset 4)
+            (should (equal "four\nfive\n"
+                           (anvil-orchestrator-preamble-get "tail")))
+            (should-error (anvil-orchestrator-preamble-set-from-file
+                           "bad" "/nonexistent/path.txt")
+                          :type 'user-error)
+            (should-error (anvil-orchestrator-preamble-set-from-file
+                           "bad" path :offset 0)
+                          :type 'user-error))
+        (ignore-errors (delete-file path))))))
+
 ;;;; --- Phase 7c: live streaming -------------------------------------------
 
 (ert-deftest anvil-orchestrator--stream-opt-in-default-off ()
@@ -2401,6 +2443,36 @@ hash).  Cleans the task + batch tables on exit."
     (should (plist-get sanitized :status))
     (should-not (plist-get sanitized :stream-events))
     (should-not (plist-get sanitized :on-event))))
+
+(ert-deftest anvil-orchestrator--attach-on-event-sets-callback ()
+  "`attach-on-event' stores CB on a running task, refuses terminal ones."
+  (anvil-orchestrator-test--with-fresh
+    (let ((running (list :id "run1" :batch-id "b" :status 'running
+                         :stream t))
+          (done    (list :id "done1" :batch-id "b" :status 'done
+                         :stream t)))
+      (puthash "run1"  running anvil-orchestrator--tasks)
+      (puthash "done1" done    anvil-orchestrator--tasks)
+      (let ((cb (lambda (_ _) 'noop)))
+        (should (anvil-orchestrator-attach-on-event "run1" cb))
+        (should (eq cb (plist-get
+                        (gethash "run1" anvil-orchestrator--tasks)
+                        :on-event)))
+        ;; terminal task rejected
+        (should-not (anvil-orchestrator-attach-on-event "done1" cb))
+        ;; unknown id rejected
+        (should-not (anvil-orchestrator-attach-on-event "nope" cb))))))
+
+(ert-deftest anvil-orchestrator--dashboard-autofollow-rejects-bad-buffer ()
+  "`dashboard-autofollow' errors when BUF is not in dashboard-mode."
+  (anvil-orchestrator-test--with-fresh
+    (let ((task (list :id "r2" :batch-id "b" :status 'running
+                      :stream t)))
+      (puthash "r2" task anvil-orchestrator--tasks))
+    (with-temp-buffer
+      (should-error (anvil-orchestrator-dashboard-autofollow
+                     "r2" (current-buffer))
+                    :type 'user-error))))
 
 ;;;; --- DAG resume (Phase 6C'') --------------------------------------------
 

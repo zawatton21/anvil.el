@@ -229,12 +229,19 @@ Returns a result plist with :file :ok :exit :elapsed-ms :total
             :output     output))))
 
 ;;;###autoload
-(defun anvil-dev-test-run-all (&optional project-dir)
+(cl-defun anvil-dev-test-run-all (&optional project-dir &key minimal)
   "Run every tests/anvil-*-test.el in PROJECT-DIR via `emacs --batch'.
 Each file runs in its own subprocess so one file's load error
 cannot mask failures in others.  Returns an aggregated plist:
   :project-dir ROOT :file-count N :total T :passed P :failed F
-  :skipped S :elapsed-ms MS :failed-files (FILE...) :per-file (PLIST...)"
+  :skipped S :elapsed-ms MS :failed-files (FILE...) :per-file (PLIST...)
+
+With non-nil :MINIMAL, the per-file list is omitted entirely,
+cutting the return value down to the aggregate counters plus
+`:failed-files'.  Useful for high-frequency polling (CI dashboards,
+dogfooding loops) where the per-file breakdown costs orders of
+magnitude more bytes than the aggregate it summarises; failure
+diagnosis can always fall back to a non-minimal run."
   (interactive)
   (let ((root (or project-dir (anvil-dev--project-root))))
     (unless (and root (file-directory-p root))
@@ -251,20 +258,22 @@ cannot mask failures in others.  Returns an aggregated plist:
              (failed (funcall sum :failed))
              (skipped (funcall sum :skipped))
              (elapsed-ms (funcall sum :elapsed-ms))
-             (bad (cl-remove-if (lambda (r) (plist-get r :ok)) results)))
+             (bad (cl-remove-if (lambda (r) (plist-get r :ok)) results))
+             (base (list :project-dir  root
+                         :file-count   (length files)
+                         :total        total
+                         :passed       passed
+                         :failed       failed
+                         :skipped      skipped
+                         :elapsed-ms   elapsed-ms
+                         :failed-files (mapcar (lambda (r) (plist-get r :file)) bad))))
         (when (called-interactively-p 'any)
           (message "Anvil test-run-all: %d files · %d/%d tests · %d failed · %.1fs"
                    (length files) passed total failed
                    (/ elapsed-ms 1000.0)))
-        (list :project-dir  root
-              :file-count   (length files)
-              :total        total
-              :passed       passed
-              :failed       failed
-              :skipped      skipped
-              :elapsed-ms   elapsed-ms
-              :failed-files (mapcar (lambda (r) (plist-get r :file)) bad)
-              :per-file     results)))))
+        (if minimal
+            base
+          (append base (list :per-file results)))))))
 
 ;;;###autoload
 (defun anvil-dev-test-run-all-batch ()
@@ -287,32 +296,44 @@ Invoke as `emacs --batch -L . -l anvil-dev -f anvil-dev-test-run-all-batch'."
              (/ (plist-get result :elapsed-ms) 1000.0))
     (kill-emacs (if (zerop (plist-get result :failed)) 0 1))))
 
-(defun anvil-dev--tool-test-run-all (&optional project-dir)
+(defun anvil-dev--tool-test-run-all (&optional project-dir minimal)
   "MCP wrapper for `anvil-dev-test-run-all'.
 
 Drops the per-file :output (noisy ERT logs) from the response so
 a green run stays compact; failure output is still reachable via
-the interactive command.
+the interactive command.  With MINIMAL truthy, the per-file list
+is omitted entirely — cuts the response to ~10% of the default
+size, ideal for dogfooding / polling loops where only the
+aggregate counters matter.
 
 MCP Parameters:
-  project-dir - Optional anvil checkout root (defaults to installed clone)"
+  project-dir - Optional anvil checkout root (defaults to installed clone)
+  minimal     - Optional truthy string (\"t\" / \"true\" / \"1\") to
+                omit the per-file breakdown.  Failed-files list is
+                still returned so a red run can still be diagnosed
+                at a glance."
   (anvil-server-with-error-handling
    (let* ((dir (and project-dir (stringp project-dir)
                     (not (string-empty-p project-dir))
                     project-dir))
-          (result (anvil-dev-test-run-all dir))
-          (lean-per-file
-           (mapcar (lambda (r)
-                     (list :file (plist-get r :file)
-                           :ok (plist-get r :ok)
-                           :total (plist-get r :total)
-                           :passed (plist-get r :passed)
-                           :failed (plist-get r :failed)
-                           :skipped (plist-get r :skipped)
-                           :elapsed-ms (plist-get r :elapsed-ms)))
-                   (plist-get result :per-file)))
-          (compact (plist-put (copy-sequence result) :per-file lean-per-file)))
-     (format "%S" compact))))
+          (mini (and minimal (stringp minimal)
+                     (not (member minimal
+                                  '("" "nil" "false" "0" "no" "False" "NIL")))))
+          (result (anvil-dev-test-run-all dir :minimal mini)))
+     (if mini
+         (format "%S" result)
+       (let* ((lean-per-file
+               (mapcar (lambda (r)
+                         (list :file (plist-get r :file)
+                               :ok (plist-get r :ok)
+                               :total (plist-get r :total)
+                               :passed (plist-get r :passed)
+                               :failed (plist-get r :failed)
+                               :skipped (plist-get r :skipped)
+                               :elapsed-ms (plist-get r :elapsed-ms)))
+                       (plist-get result :per-file)))
+              (compact (plist-put (copy-sequence result) :per-file lean-per-file)))
+         (format "%S" compact))))))
 
 ;;;; --- module scaffold -----------------------------------------------------
 
@@ -501,14 +522,15 @@ wrappers (e.g. `anvil-org--tool-validation-error') and must not
 be audited."
   (not (string-suffix-p "-error" name)))
 
-(defun anvil-dev--audit-scan-arglist-strip (root)
-  "Scan ROOT for MCP tool wrappers with `(_arg)`-style arguments.
-Returns a list of plists `(:file NAME :line N :defun SYM :args ARGS)'
-for every wrapper whose first argument begins with an underscore
-— that is the exact Emacs 30 arglist-strip regression that
-broke v0.2.0 (issue #9)."
+(defun anvil-dev--audit-scan-arglist-strip-in-files (files)
+  "Scan FILES (explicit list of paths) for arglist-strip hits.
+Used both by `anvil-dev--audit-scan-arglist-strip' (auto-discovery
+path) and `anvil-dev-release-audit' (scope-limited path).  Passing
+an empty list short-circuits cleanly to no findings — that is how
+a scope filter that matches zero files becomes a zero-finding
+scan instead of reverting to full-tree discovery."
   (let (findings)
-    (dolist (file (anvil-dev--audit-module-files root))
+    (dolist (file files)
       (with-temp-buffer
         (insert-file-contents file)
         (goto-char (point-min))
@@ -525,6 +547,15 @@ broke v0.2.0 (issue #9)."
                     findings))))))
     (nreverse findings)))
 
+(defun anvil-dev--audit-scan-arglist-strip (root)
+  "Scan ROOT for MCP tool wrappers with `(_arg)`-style arguments.
+Returns a list of plists `(:file NAME :line N :defun SYM :args ARGS)'
+for every wrapper whose first argument begins with an underscore
+— that is the exact Emacs 30 arglist-strip regression that
+broke v0.2.0 (issue #9)."
+  (anvil-dev--audit-scan-arglist-strip-in-files
+   (anvil-dev--audit-module-files root)))
+
 (defun anvil-dev--audit-wrapper-has-real-args-p (args)
   "Return non-nil when the wrapper ARG-STRING describes a real parameter.
 Empty, `&rest', `&optional _x', and `_foo' forms are treated as
@@ -538,12 +569,13 @@ documented in an `MCP Parameters:' section."
      ((string-match-p "\\`&optional[ \t]+_" trimmed) nil)
      (t t))))
 
-(defun anvil-dev--audit-scan-missing-params-section (root)
-  "Scan ROOT for MCP tool wrappers that take real args but lack
-an `MCP Parameters:' docstring section.  Returns a list of
-plists `(:file NAME :line N :defun SYM :args ARGS)'."
+(defun anvil-dev--audit-scan-missing-params-section-in-files (files)
+  "Scan explicit FILES list for wrappers with real args but no
+`MCP Parameters:' docstring section.  See the kind-mate
+`-arglist-strip-in-files' for the rationale behind accepting an
+explicit list instead of auto-discovering from a project root."
   (let (findings)
-    (dolist (file (anvil-dev--audit-module-files root))
+    (dolist (file files)
       (with-temp-buffer
         (insert-file-contents file)
         (goto-char (point-min))
@@ -569,6 +601,13 @@ plists `(:file NAME :line N :defun SYM :args ARGS)'."
                               :args args)
                         findings))))))))
     (nreverse findings)))
+
+(defun anvil-dev--audit-scan-missing-params-section (root)
+  "Scan ROOT for MCP tool wrappers that take real args but lack
+an `MCP Parameters:' docstring section.  Returns a list of
+plists `(:file NAME :line N :defun SYM :args ARGS)'."
+  (anvil-dev--audit-scan-missing-params-section-in-files
+   (anvil-dev--audit-module-files root)))
 
 (defun anvil-dev--audit-design-doc-status (file)
   "Extract the first non-blank line of FILE's `* STATUS' section.
@@ -622,7 +661,24 @@ reader can judge the master-integration gate criterion."
                 (push (list :file base :status status) findings))))))))
     (nreverse findings)))
 
-(defun anvil-dev-release-audit (&optional project-dir)
+(defun anvil-dev--audit-filter-by-scope (files scope)
+  "Restrict FILES to entries under SCOPE (file path or directory).
+SCOPE nil returns FILES unchanged.  Non-existent SCOPE returns nil."
+  (cond
+   ((null scope) files)
+   ((not (file-exists-p scope)) nil)
+   ((file-regular-p scope)
+    (let ((abs (expand-file-name scope)))
+      (cl-remove-if-not (lambda (f) (equal (expand-file-name f) abs))
+                        files)))
+   ((file-directory-p scope)
+    (let ((dir (file-name-as-directory (expand-file-name scope))))
+      (cl-remove-if-not (lambda (f)
+                          (string-prefix-p dir (expand-file-name f)))
+                        files)))
+   (t nil)))
+
+(cl-defun anvil-dev-release-audit (&optional project-dir &key scope)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
 Runs three cheap scanners (see the `release audit' section for
@@ -636,14 +692,29 @@ details) and returns a plist:
                       docs whose STATUS line lacks `SHIPPED'
   :clean-p          — t iff all three scans returned empty
   :root             — absolute directory that was audited
-  :audited-at       — ISO timestamp when the scan ran"
+  :scope            — SCOPE value when supplied, else nil
+  :audited-at       — ISO timestamp when the scan ran
+
+:SCOPE limits the source scanners (arglist-strip / missing-params)
+to a single file or directory path.  When SCOPE names a regular
+file, only that file is audited; when it names a directory, files
+under it are audited.  The design-docs scanner is always run on
+the project tree — whole-tree doc state is cheap and independent
+of the scope in question."
   (interactive)
   (let* ((root (or project-dir (anvil-dev--audit-default-root)))
          (_    (unless (and root (file-directory-p root))
                  (error "anvil-dev-release-audit: no anvil root found (tried %S)"
                         root)))
-         (arglist-strip  (anvil-dev--audit-scan-arglist-strip root))
-         (missing-params (anvil-dev--audit-scan-missing-params-section root))
+         (all-files      (anvil-dev--audit-module-files root))
+         (scanner-files  (if scope
+                             (anvil-dev--audit-filter-by-scope
+                              all-files scope)
+                           all-files))
+         (arglist-strip  (anvil-dev--audit-scan-arglist-strip-in-files
+                          scanner-files))
+         (missing-params (anvil-dev--audit-scan-missing-params-section-in-files
+                          scanner-files))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
@@ -654,6 +725,7 @@ details) and returns a plist:
                 :non-shipped-docs non-shipped
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
+                :scope scope
                 :audited-at (format-time-string "%Y-%m-%d %H:%M:%S"))))
     (when (called-interactively-p 'any)
       (message "%s" (anvil-dev--audit-format-report result)))
@@ -709,10 +781,19 @@ return a one-line string."
                    (plist-get f :file)
                    (plist-get f :status)))))))))
 
-(defun anvil-dev--tool-release-audit ()
-  "Audit the anvil tree for pre-release hazards and return a formatted report."
+(defun anvil-dev--tool-release-audit (&optional scope)
+  "Audit the anvil tree for pre-release hazards and return a formatted report.
+
+MCP Parameters:
+  scope - Optional file-or-directory path.  When supplied, the
+          source scanners (arglist-strip / missing-params) are
+          restricted to that path; the design-docs scan still
+          covers the whole tree.  Empty string = full audit."
   (anvil-server-with-error-handling
-    (anvil-dev--audit-format-report (anvil-dev-release-audit))))
+    (let ((sc (and scope (stringp scope) (not (string-empty-p scope))
+                   scope)))
+      (anvil-dev--audit-format-report
+       (anvil-dev-release-audit nil :scope sc)))))
 
 ;;;; --- module lifecycle ----------------------------------------------------
 

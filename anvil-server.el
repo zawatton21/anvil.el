@@ -1372,6 +1372,61 @@ See also: `anvil-server-register-tool'"
          (anvil-server--get-server-tools (or server-id "default"))))
     (anvil-server--ref-counted-unregister tool-id tools-table)))
 
+(defun anvil-server-register-tools (server-id specs)
+  "Register every (HANDLER . PROPS) SPEC under SERVER-ID in one call.
+
+SPECS is a list whose entries each look like (HANDLER :id ID
+:description DESC [:read-only t] [:title STR] ...).  SERVER-ID is
+auto-filled into every PROPS plist, overriding any stray
+`:server-id' already in there (so a spec list authored once can
+be re-used across servers without editing).
+
+Signals `error' on structurally-bad specs; otherwise returns the
+list of registered tool-id strings in input order.  Use with the
+companion `anvil-server-unregister-tools' to keep register /
+unregister paths consistent — the common module pattern becomes:
+
+  (defconst my-mod--tool-specs `((,#\\='my-mod--tool-foo :id \"foo\"
+                                  :description \"...\")))
+  (defun my-mod--register-tools () (anvil-server-register-tools
+                                    SERVER-ID my-mod--tool-specs))
+  (defun my-mod--unregister-tools () (anvil-server-unregister-tools
+                                      SERVER-ID my-mod--tool-specs))
+
+Collapses the verbose per-tool register boilerplate (four-line
+call + matching id string in an unregister dolist) into a single
+spec list maintained in one place."
+  (let (ids)
+    (dolist (spec specs)
+      (unless (and (consp spec) (functionp (car spec))
+                   (cl-evenp (length (cdr spec))))
+        (error "anvil-server-register-tools: malformed spec %S" spec))
+      (let* ((handler (car spec))
+             (props   (cl-loop for (k v) on (cdr spec) by #'cddr
+                               unless (eq k :server-id)
+                               append (list k v)))
+             (final   (append (list :server-id server-id) props))
+             (id      (plist-get final :id)))
+        (apply #'anvil-server-register-tool handler final)
+        (push id ids)))
+    (nreverse ids)))
+
+(defun anvil-server-unregister-tools (server-id specs)
+  "Unregister every :id referenced in SPECS from SERVER-ID.
+Bad specs and missing :id entries are silently skipped so the
+function is safe to call even when partial registration left the
+table in an intermediate state.  Returns the list of tool ids
+that were unregistered (t = removed, nil = absent)."
+  (let (results)
+    (dolist (spec specs)
+      (when (consp spec)
+        (let ((id (plist-get (cdr spec) :id)))
+          (when id
+            (push (cons id
+                        (anvil-server-unregister-tool id server-id))
+                  results)))))
+    (nreverse results)))
+
 ;; Custom error type for tool errors
 (define-error 'anvil-server-tool-error "MCP tool error" 'user-error)
 (define-error 'anvil-server-resource-error "MCP resource error")
