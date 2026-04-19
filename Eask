@@ -1,7 +1,7 @@
 ;; -*- mode: eask; lexical-binding: t -*-
 
 (package "anvil"
-         "0.2.1"
+         "0.3.0"
          "An Emacs MCP server — your AI's workbench")
 
 (author "zawatton")

@@ -4,7 +4,7 @@
 
 ;; Author: zawatton
 ;; Keywords: comm, tools, ai, mcp
-;; Version: 0.2.1
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.2"))
 ;; URL: https://github.com/zawatton21/anvil.el
 

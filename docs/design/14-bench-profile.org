@@ -1,0 +1,118 @@
+#+title: anvil-bench + anvil-profile — Performance Measurement Primitives
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       6127d448-df2d-4587-a120-ebea967896d7
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 2 of Week-2 roadmap.
+
+* Motivation
+
+Performance work today is eyeballed: "it feels faster", "this call
+took ~200ms".  Without a shared measurement surface Claude can't
+falsify its own "this should be faster" intuitions, and can't compare
+A vs B implementations cheaply.  Memory
+=feedback_org_element_cache_during_init.md= literally warns that a
+perf hypothesis turned out wrong because no A/B benchmark was run.
+
+~benchmark-call~ and ~profiler-start~ exist but need careful
+invocation and aren't ergonomic for AI tool use.  Doc 14 wraps them in
+a 2-tool MCP surface:
+
+- ~bench-compare~: run two expressions N times, report timings +
+  stddev + winner.
+- ~profile~: run one expression, sample CPU, report top N hot
+  functions.
+
+* Goals
+
+1. Deterministic, reproducible micro-benchmarks with warmup.
+2. Sampling profiler output formatted for AI consumption (top-K
+   function names + %-time, not raw samples).
+3. Per-call GC settings override (disable GC for perf runs), restored
+   after.
+4. Output always includes Emacs version, load-path, and whether the
+   target function was byte-compiled — so results are reproducible.
+
+* Non-goals
+
+- Flamegraph rendering (text only; graphical output not MCP-friendly).
+- Long-running perf regression tracking (that's Doc 13 bisect + custom
+  scripts).
+- System-level profiling (perf, strace) — Emacs-internal only.
+
+* Architecture
+
+Both tools wrap the built-in ~benchmark-call~ / ~profiler-*~:
+
+#+begin_src elisp
+(anvil-bench-compare A-EXPR B-EXPR &key n warmup gc-cons-threshold)
+  ;; :n 1000 default, :warmup 100 default, GC disabled during runs
+  ;; Returns: (:a-mean-ms F :a-stddev-ms F :b-mean-ms F :b-stddev-ms F
+  ;;           :ratio F :winner 'a/'b/'tie :n N :env (:emacs-version ...))
+
+(anvil-profile EXPR &key duration-sec sample-ms top)
+  ;; Uses profiler-start / profiler-report-calltree then stringify
+  ;; top N slow functions.  Default duration 3s, sample 1ms, top 20.
+  ;; Returns: (:top ((FN-NAME . PCT) ...) :total-samples N)
+
+(anvil-bench-last-report)
+  ;; Session-local last result for polling.
+#+end_src
+
+* Public MCP tools
+
+| id                | args                                               | notes            |
+|-------------------+----------------------------------------------------+------------------|
+| ~bench-compare~   | a-expr, b-expr, n?, warmup?                        | both as strings  |
+| ~profile-expr~    | expr, duration-sec?, sample-ms?, top?              | read-only        |
+| ~bench-last~      | (none)                                             | last result      |
+
+All read-only from anvil-state's perspective.  Long-running invocations
+(e.g. duration 30s) should use offload (:offload t).
+
+* Phases
+
+** Phase 1 — bench-compare + profile-expr
+
+Core tools, ERT with sleep-based fixtures, ship criterion: ratio
+error <10% vs hand-timed reference.
+
+** Phase 2 — richer output
+
+- =:per-run= flag returns the full timing array, for caller-side
+  stats.
+- =:warmup-detect t= auto-picks warmup count based on first-run
+  variance.
+- byte-compile check integrated (warn if target is
+  interpreted-only).
+
+* Testing strategy
+
+- Deterministic fixture: two sleep-based lambdas where one is 2×
+  slower.  Assert winner.
+- Profile test: expr that calls a named function in a tight loop,
+  assert it's in top-5.
+
+* Platform notes
+
+- Windows: profiler sample rate is less precise; use 5ms default on
+  Windows.
+- Cold-cache first run on Windows can skew small benchmarks; warmup
+  count 200+ on Windows.
+
+* Out of scope / future
+
+- Cross-session perf trend (store each run in anvil-state and chart)
+  — interesting but Doc 17 (session) territory.
+- Memory profiling (Emacs doesn't have great heap tooling) — skip.
+
+* References
+
+- ~benchmark.el~, ~profiler.el~ — Emacs built-ins.
+- Memory =feedback_org_element_cache_during_init.md~: motivation.

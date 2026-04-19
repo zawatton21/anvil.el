@@ -501,7 +501,8 @@ budget goes to reasoning about your code, not re-reading it.
 | =browser=    | Web fetch / interact / capture / screenshot via agent-browser (opt.) | agent-browser CLI |
 | =state=      | Persistent SQLite-backed KV store (ns / TTL, opt.) | Emacs 29+        |
 | =http=       | GET/HEAD with ETag/TTL cache via `url-retrieve' (opt.) | Emacs 29+ (state) |
-| =orchestrator= | Parallel AI CLI dispatcher (claude today) with concurrency cap + state-persisted queue + dashboard (opt.) | claude CLI, Emacs 29+ |
+| =orchestrator= | Parallel AI CLI dispatcher (claude / aider / gemini / ollama / codex) with DAG, consensus, meta-LLM judge, live streaming, cron + worktree isolation (opt.) | AI CLIs, Emacs 29+ |
+| =pty-broker=  | Node-pty TCP broker for spawning processes that need a real TTY (opt.) | Node.js, node-pty |
 
 * Quick Start
 
@@ -518,9 +519,9 @@ Then run =M-x anvil-describe-setup= for client configuration instructions.
 Two tracks are supported. Pick *stable* unless you know why you
 want master.
 
-** Stable (recommended) — tag =v0.2.1=
+** Stable (recommended) — tag =v0.3.0=
 
-=v0.2.1= is the current stable tag.  New features and fixes
+=v0.3.0= is the current stable tag.  New features and fixes
 land on =master= continuously; periodically a tag is cut once
 the surface has settled enough to recommend.  Pin to this tag
 unless you have a reason to track =master=.
@@ -531,7 +532,7 @@ unless you have a reason to track =master=.
 
 #+begin_src emacs-lisp
 (async-installer-git-add "https://github.com/zawatton/anvil.el.git"
-                            :tag "v0.2.1"
+                            :tag "v0.3.0"
                             :main "anvil.el")
 #+end_src
 
@@ -540,14 +541,14 @@ unless you have a reason to track =master=.
 #+begin_src emacs-lisp
 (straight-use-package
  '(anvil :type git :host github :repo "zawatton/anvil.el"
-         :branch "v0.2.1"))
+         :branch "v0.3.0"))
 #+end_src
 
 *** elpaca
 
 #+begin_src emacs-lisp
 (elpaca (anvil :host github :repo "zawatton/anvil.el"
-               :ref "v0.2.1"))
+               :ref "v0.3.0"))
 #+end_src
 
 *** use-package (with straight or elpaca)
@@ -556,11 +557,11 @@ unless you have a reason to track =master=.
 ;; with straight
 (use-package anvil
   :straight (anvil :type git :host github :repo "zawatton/anvil.el"
-                   :branch "v0.2.1"))
+                   :branch "v0.3.0"))
 
 ;; with elpaca
 (use-package anvil
-  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.2.1"))
+  :ensure (:host github :repo "zawatton/anvil.el" :ref "v0.3.0"))
 #+end_src
 
 ** Bleeding edge — =master= (strongly discouraged)
@@ -611,8 +612,8 @@ Clone this repository and add it to your =load-path=:
 (require 'anvil)
 #+end_src
 
-When cloning manually, check out the =v0.2.1= tag for the stable
-track (=git checkout v0.2.1=), or stay on =master= at your own
+When cloning manually, check out the =v0.3.0= tag for the stable
+track (=git checkout v0.3.0=), or stay on =master= at your own
 risk.
 
 * Configuration

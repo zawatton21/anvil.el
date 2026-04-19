@@ -1,0 +1,222 @@
+#+title: anvil-sexp — AST-Aware Structural Edits for Elisp
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       192939f5-33ad-4c4d-bd26-737ee1292895
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 1 of Week-2 roadmap.  Depends on Doc 11 (anvil-defs) for symbol
+discovery.  Provides AST-aware editing primitives that replace fragile
+regex-based edits with sexp-respecting transformations.
+
+* Motivation
+
+Current state: Claude's elisp edits use ~file-replace-string~ /
+~file-replace-regexp~ / ~file-batch~.  These are text-level and have
+known failure modes:
+
+- Renaming ~foo~ to ~bar~ also rewrites the substring ~foo~ inside
+  docstrings, comments, and string literals.
+- ~(foo 1 2)~ vs ~(foo-helper 1 2)~: regex with word-boundaries still
+  mis-matches when ~foo~ appears at start or end of composite names.
+- ~(defun foo ...)~ rename must also touch every call site — multiple
+  ~file-batch-across~ operations and still risks false positives.
+- Extracting a region into a new ~defun~ requires manual paren balancing.
+
+Claude today mitigates this with heavy manual review ("grep first to
+see candidates, then carefully review each").  That burns tool hops
+and tokens on a task that is purely structural.
+
+The fix is obvious in retrospect: parse the sexp tree, operate on the
+tree, serialize.  Elisp is a lisp — this is the cheapest case in all
+of programming-language tooling.
+
+* Goals
+
+1. Provide AST-level edit primitives that *never touch* strings,
+   comments, or docstrings unless explicitly requested.
+2. Default to *preview mode* — return the proposed edit as a diff
+   without writing.  Writing requires =:apply t=.  Same safety stance
+   as ~code-add-field-by-map~ (Doc 06).
+3. Support project-wide rename via Doc 11's reference index, not via
+   repeated Grep.
+4. Wrap both the ~parse-sexp~ builtin primitives and ~treesit-parser~
+   (when available) behind a single thin API — caller doesn't care
+   which backend.
+
+* Non-goals
+
+- Full code refactoring suite (inline let, convert-to-cl-flet, etc.).
+  Start with 4 operations; others can come later if they prove needed.
+- Multi-language (TS/Python/Ruby).  Elisp only — treesit would make
+  this expandable, but the MCP surface stays elisp-centric.
+- Automatic import management.  ~file-ensure-import~ already covers
+  "add require idempotently"; we don't replicate.
+- Syntax validation beyond "does it reparse cleanly".  Semantic checks
+  (byte-compile, ert) are separate concerns.
+
+* Architecture
+
+** Backends
+
+Two backends, picked by runtime capability check:
+
+1. *Preferred:* ~treesit~ (Emacs 29+, elisp grammar if installed).
+   Gives precise range info even across multiline forms with
+   whitespace/comments.  Query language (~treesit-query-compile~)
+   makes pattern-matching fast.
+2. *Fallback:* ~parse-sexp~ + ~syntax-ppss~.  Built in, works
+   everywhere, slightly less accurate on oddly-spaced forms.
+
+~anvil-sexp--backend~ picks once at init, logs choice.  Both backends
+implement the same 4-function protocol:
+
+#+begin_src elisp
+(anvil-sexp--backend-parse STRING)            ; -> tree
+(anvil-sexp--backend-walk TREE VISITOR)       ; pre-order walk
+(anvil-sexp--backend-bounds TREE NODE)        ; -> (BEG . END) in bytes
+(anvil-sexp--backend-form-at PATH POINT)      ; -> node at point, or nil
+#+end_src
+
+Everything above this layer is backend-agnostic.
+
+** Comment / string awareness
+
+Neither backend should ever report a node inside a comment or string
+unless the caller opted in (~:include 'strings~ / ~:include 'comments~).
+~syntax-ppss~ gives the 4th element (string start) and 8th (comment
+start) for cheap boundary checks.
+
+** Edit model
+
+All mutating operations take the same shape:
+
+#+begin_src elisp
+(plist-of-plan
+ :ops
+ ((:file PATH :range (BEG . END) :replacement STRING :reason STRING)
+  ...)
+ :summary "renamed foo → bar in 3 files, 7 sites"
+ :diff-preview "..."   ; unified diff
+ )
+#+end_src
+
+=:apply nil= (default) returns the plan unchanged.  =:apply t= writes
+via ~file-batch-across~ (so all changes go through one audit point)
+and returns the same plan with =:applied-at= timestamp added.
+
+* Public API
+
+#+begin_src elisp
+(anvil-sexp-replace-call FN-NAME NEW-FORM &key scope apply)
+  ;; Replace every *call* (SYM . ARGS) where SYM == FN-NAME with
+  ;; NEW-FORM (which may reference positional args via %1 %2 ...).
+  ;; SCOPE: 'project / 'file / 'region / list of file paths.
+
+(anvil-sexp-rename-symbol OLD NEW &key kinds scope apply)
+  ;; Rename OLD to NEW where the occurrence is a *symbol reference*,
+  ;; not a substring in a string/comment.  KINDS limits what we touch:
+  ;; '(defun-name call var quote)  — default all.
+
+(anvil-sexp-extract-defun FILE RANGE NEW-NAME &key arglist apply)
+  ;; Wrap the given byte range in a new defun at the nearest top-level
+  ;; insertion point.  ARGLIST inferred from free variables if omitted.
+
+(anvil-sexp-surrounding-form FILE POINT &key kind)
+  ;; Inspect: return the innermost top-level form containing POINT, or
+  ;; the nearest of KIND (e.g. 'defun, 'let).  Read-only; no apply.
+
+(anvil-sexp-inline-defun FN-NAME &key scope apply)
+  ;; Replace every call site with the body of the defun, substituting
+  ;; args.  Only safe for pure-expression defuns; we refuse on those
+  ;; with &rest, interactive forms, or self-reference.
+#+end_src
+
+* Public MCP tools
+
+| id                         | args                                       | returns              | notes              |
+|----------------------------+--------------------------------------------+----------------------+--------------------|
+| ~sexp-replace-call~        | fn-name, new-form, scope?, apply?          | plan plist           | diff + summary     |
+| ~sexp-rename-symbol~       | old, new, kinds?, scope?, apply?           | plan plist           | uses defs index    |
+| ~sexp-extract-defun~       | file, range, new-name, arglist?, apply?    | plan plist           |                    |
+| ~sexp-surrounding-form~    | file, point, kind?                         | form + bounds        | read-only          |
+| ~sexp-inline-defun~        | fn-name, scope?, apply?                    | plan plist           | safety-gated       |
+
+All default to =apply=false= (preview).  Write operations must be
+explicit.  This matches the convention set by
+~code-add-field-by-map~ (Doc 06) and is central to the "safe by default"
+stance.
+
+* Phases
+
+** Phase 1 — backend protocol + rename-symbol
+
+- Backend choice (treesit vs parse-sexp), 4-fn protocol.
+- ~anvil-sexp-rename-symbol~ for 'call + 'quote kinds, using Doc 11
+  ~defs-references~ to locate sites.
+- ~anvil-sexp-surrounding-form~ (read-only, builds confidence in
+  backend).
+- ERT 10+ tests: comment/string exclusion, multiple call sites,
+  preview vs apply, unknown-symbol refusal.
+- *Ship criterion*: rename ~anvil-state-set~ → ~anvil-state-put~
+  across anvil.el yields a correct plan; byte-compile + ert pass
+  after apply.
+
+** Phase 2 — replace-call + extract-defun
+
+- ~anvil-sexp-replace-call~ with positional-arg template (%1 %2 ...).
+- ~anvil-sexp-extract-defun~ with free-variable detection.
+- ERT +8.
+- *Ship criterion*: extract a 10-line let body into a new defun and
+  the file still byte-compiles, original call site replaced by
+  single-line call.
+
+** Phase 3 — inline-defun + polish
+
+- ~anvil-sexp-inline-defun~ (safety-gated — refuse on &rest,
+  interactive, self-recursive, captured free vars).
+- Conflict detection when multiple renames target overlapping regions.
+- ERT +5.
+
+** Phase 4 (optional) — treesit elsif backend
+
+If parse-sexp backend proves limiting (e.g. macro-heavy files with
+reader macros), formally enable treesit mode as default when available
+and document the fallback path.
+
+* Testing strategy
+
+- Golden fixture files in ~tests/fixtures/sexp-sample/~: one per
+  edit kind, hand-crafted.
+- Property-style test: random well-formed defun → rename symbol →
+  rename back → assert byte-identical (round-trip).
+- Integration: run Phase 1 rename against anvil.el, byte-compile all
+  files, run the full ert suite, expect 0 new failures.
+
+* Platform notes
+
+- treesit requires the elisp grammar; check at load time, fall back
+  gracefully.  Do *not* force a grammar install.
+- On Windows, byte-count ranges must account for CRLF vs LF — we
+  enforce LF via existing .gitattributes, but still use position-based
+  rather than byte-based ranges where practical.
+
+* Out of scope / future
+
+- Paredit-style smartparens navigation shortcuts (these are Emacs
+  interactive-mode concerns, not MCP).
+- Macroexpansion-aware rewrites (e.g. rename a symbol used only as a
+  macro keyword).  Would need Doc 11 Phase 4 + macro engine.
+- Type-aware refactors (inference on cl-defun argument types).
+
+* References
+
+- Doc 11 (~11-defs-index.org~): provides the references we query.
+- Doc 06 (~06-code-transform-tools.org~): established the
+  preview-by-default + bulk-plan style we inherit.
+- Memory =feedback_elisp_match_data_clobber.md=: reminder that
+  hand-rolled regex over elisp is always fragile.

@@ -1,0 +1,115 @@
+#+title: anvil-session — Cross-Session Context Handoff for Claude
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       f1dd6d46-6e38-4942-97d6-feb402fb826a
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 3 of Week-2 roadmap.  Ephemeral-state persistence that sits
+between a single Claude conversation and the long-term memory system.
+
+* Motivation
+
+Today's memory system stores durable facts (user preferences, project
+patterns, known incidents).  A Claude conversation also builds up a
+second class of state that *dies when the session ends*:
+
+- Current branch + base branch of active work.
+- Baseline test results captured at session start.
+- Open/edited buffers relevant to the task.
+- Intermediate reasoning: "I ruled out X because Y".
+- Task list progress.
+
+Memory is the wrong place for this — too noisy, expires naturally.
+Git branch + worktree state encode some of it.  What's missing is a
+*structured session record* that a resuming Claude (same topic, new
+session) can read in 1 call and pick up from.
+
+Doc 17 fills this gap with a thin SQLite-backed rec.  Think of it as
+"bookmarks for Claude".
+
+* Goals
+
+1. ~session-snapshot NAME~ captures active state into a named rec.
+2. ~session-resume NAME~ returns that rec, along with a suggested
+   preamble string.
+3. Snapshots survive daemon restart (persisted via anvil-state, ns
+   =session=).
+4. Auto-expire after TTL (default 14 days).
+
+* Non-goals
+
+- Full replay (tool call history replay is not safe).
+- Cross-machine sync (single-machine anvil-state; user's Git is
+  synchronization).
+
+* Architecture
+
+#+begin_src elisp
+(:name STR :created-at TIMESTAMP
+ :branch STR :base-branch STR
+ :buffers (list (:file PATH :line N :last-edit TIMESTAMP))
+ :baseline-tests (:passed N :total N :failed N)
+ :task-summary STR        ; human/Claude written
+ :notes LIST              ; bulleted reasoning
+ :preamble-suggested STR)
+#+end_src
+
+Captured automatically via helpers (read git branch + open
+buffer-list + run test-baseline); caller supplies :task-summary and
+:notes.  Restored: emit a formatted string suitable for
+~orchestrator-preamble-set~ so the resuming session gets context
+without a wall of Read calls.
+
+* Public API
+
+#+begin_src elisp
+(anvil-session-snapshot NAME &key task-summary notes)
+  ;; Captures current state, stores, returns the plist.
+
+(anvil-session-resume NAME)
+  ;; Returns the plist (or nil).  Does not mutate current state.
+
+(anvil-session-list)
+  ;; Returns list of (:name :created-at :branch :task-summary-head).
+
+(anvil-session-delete NAME)
+  ;; Purge one snapshot.
+#+end_src
+
+* Public MCP tools
+
+| id                   | args                               | notes                |
+|----------------------+------------------------------------+----------------------|
+| ~session-snapshot~   | name, task-summary?, notes?        | writes               |
+| ~session-resume~     | name                               | read-only            |
+| ~session-list~       | (none)                             | read-only            |
+| ~session-delete~     | name                               | writes (purge)       |
+
+* Phases
+
+** Phase 1 — snapshot + resume + list
+
+Minimum viable.  ERT 5.
+
+** Phase 2 — auto-snapshot hooks
+
+Optional hook on branch-switch or after ~my-anvil-ship-verify~ to
+capture automatically under a computed name.
+
+* Out of scope / future
+
+- Cross-Claude session diffing ("what's changed since I last worked
+  on this?") — Doc 15 git-why covers the git side; session-diff could
+  be composed later.
+- Structured re-planning from a resumed snapshot — belongs to the
+  caller Claude, not the tool.
+
+* References
+
+- Doc 08 (~08-state.org~): the KV store we persist in.
+- Doc 10 Phase 7b (preamble): what =:preamble-suggested= feeds into.

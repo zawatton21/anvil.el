@@ -1,0 +1,111 @@
+#+title: anvil-pty-broker Phase 2 — Interactive TUI over the Broker
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       3ce1c404-1907-4091-92b1-35420ffa5906
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 3 of Week-2 roadmap.  Extends the shipped Phase 1 broker (memory:
+=project_anvil_pty_broker_phase1.md~) with interactive TUI semantics
+so that claude CLI, vim, less can run over the broker on Windows.
+
+* Motivation
+
+Memory =feedback_conpty_headless_stdin_unidirectional.md~ documents
+that ConPTY's headless stdin is unidirectional — raw key input to
+TUIs doesn't work.  Phase 1 broker (node-pty TCP, 5 MCP tools) proves
+the transport works for non-interactive commands; Phase 2 extends it
+to bidirectional keystroke streams so Windows users can talk to
+claude / vim without resorting to ssh.
+
+* Goals
+
+1. Bidirectional raw-mode TTY over the TCP broker.
+2. Resize events propagated (SIGWINCH analog).
+3. Claude CLI starts + runs + receives raw keys correctly on Windows
+   native.
+4. Session persistence: detach/attach, so a TUI survives an Emacs
+   restart (approximately — the broker process keeps the pty).
+
+* Non-goals
+
+- GUI emulation.  Text-mode only.
+- Cursor-addressable TUIs beyond what xterm.js / libvte already
+  support (good enough for claude CLI + vim).
+- Replacing eat/vterm for general-purpose term work.
+
+* Architecture
+
+Phase 1 broker already speaks a line-oriented protocol over TCP.  Phase
+2 adds:
+
+- =attach sid= frame switches socket to raw mode.
+- Incoming frames carry raw bytes.  Outgoing frames carry keyboard
+  input.
+- =resize sid cols rows= frame.
+- Heartbeat / reconnect on broker side (so a restart of the Emacs
+  client doesn't orphan a running claude CLI).
+
+Emacs side: a minor-mode over the *anvil-pty* buffer renders
+xterm escapes via a small interpreter (built-in ~term.el~ subset,
+or reuse eat's decoder in reduced form).
+
+* Public API
+
+#+begin_src elisp
+(anvil-pty-attach SID)
+  ;; Pop to buffer, switch to raw-mode.  User input → broker.
+
+(anvil-pty-detach)
+  ;; Drop buffer, leave broker running.
+
+(anvil-pty-reattach SID)
+  ;; After Emacs restart, pick back up an existing broker session.
+#+end_src
+
+* Public MCP tools
+
+| id                | args                          | notes              |
+|-------------------+-------------------------------+--------------------|
+| ~pty-attach~      | sid                           | interactive launch |
+| ~pty-detach~      | (none)                        |                    |
+| ~pty-reattach~    | sid                           |                    |
+| ~pty-list-alive~  | (none)                        | detached sessions  |
+
+* Phases
+
+** Phase 2a — raw bidirectional + resize
+
+Node-pty supports raw mode + resize natively; the broker already does
+this for Phase 1 commands.  Work is on the Emacs-client side: a small
+terminal emulator minor-mode.  Reuse eat's decoder if license-compatible.
+
+** Phase 2b — detach / reattach
+
+Broker-side: keep pty alive past client disconnect; tag by SID.
+Client-side: reconnect flow.
+
+** Phase 2c — session list + GC
+
+Dead sessions cleaned after idle timeout.  Admin tool to list and
+kill.
+
+* Out of scope / future
+
+- Full xterm feature set (alternate screen, 256 colors, etc.).
+  Phase 2 targets the subset claude CLI + vim + less + ripgrep need.
+- SSH replacement at the protocol level.  anvil-pty-broker remains
+  LAN-local.
+
+* References
+
+- Doc 04 (~04-pty-broker.org~): Phase 1 design, already SHIPPED.
+- Memory =project_anvil_pty_broker_phase1.md~: ship notes.
+- Memory =reference_windows_native_pty_options.md~: why node-pty won
+  the bake-off.
+- Memory =feedback_eat_t_write_wide_char_loop.md~: be careful reusing
+  eat; decoder subset only.

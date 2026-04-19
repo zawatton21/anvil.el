@@ -32,15 +32,43 @@ Anvil の現行アーキテクチャ (Architecture B) は、purpose 別に 4 層
 順序は依存関係で決めている。~01~ と ~02~ は並列着手可能。~03~ は ~01~ の worker pool を使う。
 ~04~ と ~05~ は独立。
 
-| #  | Doc                         | 依存        | 想定工数 | 優先度 |
-|----+-----------------------------+-------------+----------+--------|
-| 01 | [[file:01-worker-pool-v2.org][Worker Pool v2]]              | なし        | 中       | 高     |
-| 02 | [[file:02-org-index.org][Persistent Org Index]]        | なし        | 大       | 高     |
-| 03 | [[file:03-offload-framework.org][Offload Framework]]           | 01          | 中       | 中     |
-| 04 | [[file:04-pty-broker.org][PTY Broker + Headless UI]]    | なし        | 大       | 中     |
-| 05 | [[file:05-disk-first.org][Disk-First Policy]]           | なし        | 小       | 高     |
-| 06 | [[file:06-code-transform-tools.org][Code Transform Tools]]        | なし        | 小       | 中     |
-| 07 | [[file:07-browser-framework.org][Browser Framework + Vision]]   | なし (A)    | 小 (A)   | 高     |
+** Foundation Wave (Doc 01–10, SHIPPED)
+
+| #  | Doc                         | 依存        | 想定工数 | 優先度 | 状態    |
+|----+-----------------------------+-------------+----------+--------+---------|
+| 01 | [[file:01-worker-pool-v2.org][Worker Pool v2]]              | なし        | 中       | 高     | SHIPPED |
+| 02 | [[file:02-org-index.org][Persistent Org Index]]        | なし        | 大       | 高     | SHIPPED |
+| 03 | [[file:03-offload-framework.org][Offload Framework]]           | 01          | 中       | 中     | SHIPPED |
+| 04 | [[file:04-pty-broker.org][PTY Broker + Headless UI]]    | なし        | 大       | 中     | SHIPPED (Ph1) |
+| 05 | [[file:05-disk-first.org][Disk-First Policy]]           | なし        | 小       | 高     | SHIPPED |
+| 06 | [[file:06-code-transform-tools.org][Code Transform Tools]]        | なし        | 小       | 中     | SHIPPED |
+| 07 | [[file:07-browser-framework.org][Browser Framework + Vision]] | なし (A)    | 小 (A)   | 高     | SHIPPED |
+| 08 | [[file:08-state.org][State KV Store]]              | なし        | 小       | 高     | SHIPPED |
+| 09 | [[file:09-http.org][HTTP + Cache]]                | 08          | 中       | 中     | SHIPPED |
+| 10 | [[file:10-orchestrator.org][AI CLI Orchestrator]]         | 01, 03, 08  | 大       | 高     | SHIPPED |
+
+** Week-2 Wave (Doc 11–20, DRAFT, 2026-04-19 提案)
+
+Tier 1 から順に実装。Tier 1 完了で Claude の tool hop が構造的に 3 → 1
+に落ち、以降の Tier が加速する設計。
+
+| #  | Doc                                         | 依存           | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------+----------------+----------+------+-------|
+| 11 | [[file:11-defs-index.org][Elisp Symbol Index]]                          | なし           | 中       | 1    | DRAFT |
+| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits]]                            | 11             | 中       | 1    | DRAFT |
+| 13 | [[file:13-bisect.org][Test-Driven Bisect]]                          | 01             | 小       | 1    | DRAFT |
+| 14 | [[file:14-bench-profile.org][Bench + Profile]]                             | なし           | 小       | 2    | DRAFT |
+| 15 | [[file:15-git-msg.org][Commit / PR Synthesis]]                       | なし           | 小       | 2    | DRAFT |
+| 16 | [[file:16-lint.org][Repo Hygiene Scanner]]                        | 11             | 小       | 2    | DRAFT |
+| 17 | [[file:17-session.org][Cross-Session Context Handoff]]               | 08             | 小       | 3    | DRAFT |
+| 18 | [[file:18-rag.org][Local Semantic Search (RAG)]]                 | 02, 11         | 中       | 3    | DRAFT |
+| 19 | [[file:19-pair.org][Multi-Agent Peer Review]]                     | 10             | 小       | 3    | DRAFT |
+| 20 | [[file:20-pty-broker-phase2.org][PTY Broker Phase 2 (Interactive TUI)]]        | 04             | 中       | 3    | DRAFT |
+
+Tier 凡例:
+- *Tier 1* — 10x multiplier.  Claude の日常的な hop 数を構造的に減らす。
+- *Tier 2* — 大きな生産性向上.  Tier 1 の上に乗る使い勝手と安全性。
+- *Tier 3* — 増幅器.  他 AI 連携、cross-session、semantic 検索、Windows TUI。
 
 * Status Legend
 

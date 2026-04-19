@@ -1,0 +1,108 @@
+#+title: anvil-rag — Local Semantic Search over the Codebase
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       1ce1e487-24df-4388-8c2f-ace8928f4f0c
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 3 of Week-2 roadmap.  Keyword search (Grep, Doc 11 defs,
+Doc 02 org-index) covers structural / exact queries.  Doc 18 adds
+*semantic* search — "find code that does X-ish" — via local
+embeddings.
+
+* Motivation
+
+Refactors and "where do we already do something like this?" questions
+don't reduce to a keyword.  Grep misses paraphrases; defs-search is
+symbol-exact.  An LLM has the concept-matching, but every query burns
+tokens.
+
+A local embedding index — small model, batched — gives sub-100ms
+concept-similarity over the whole project at near-zero marginal cost.
+Vectors live in SQLite (blob column) alongside the same indexing
+infrastructure Doc 02 / Doc 11 already use.
+
+* Goals
+
+1. Embedding index of elisp defs, org sections, design docs.
+2. Model: ~nomic-embed-text~ via ollama or similar, locally hosted.
+3. ~rag-search QUERY :k 5~ returns top-K (source + snippet + score).
+4. Incremental update on file save (piggyback on Doc 11 / Doc 02
+   filenotify watchers).
+
+* Non-goals
+
+- Online embedding (OpenAI, Cohere).  Too expensive at indexing scale.
+- Chat-style RAG generation.  We return snippets; caller decides.
+- Cross-modal (image / PDF).
+
+* Architecture
+
+#+begin_src sql
+  CREATE TABLE rag_docs (
+    id       INTEGER PRIMARY KEY,
+    source   TEXT,        -- file path + section
+    kind     TEXT,        -- 'defun' / 'org-headline' / 'design-section'
+    content  TEXT,
+    embedding BLOB        -- 768-dim f32
+  );
+  -- FTS5 virtual table for fallback keyword ranking
+#+end_src
+
+Query:
+1. Embed query via local model.
+2. Top-K cosine over all rows (brute force; <10k rows is fine).
+3. Return snippets + score.
+
+Ollama is the default embedding provider; swappable via defcustom.
+
+* Public API
+
+#+begin_src elisp
+(anvil-rag-search QUERY &key k source-kind)
+  ;; Returns list of (:source STR :kind STR :snippet STR :score FLOAT).
+
+(anvil-rag-index-rebuild &optional scope)
+  ;; Full or scoped rebuild.  Slow (seconds to minutes).
+
+(anvil-rag-model-status)
+  ;; (:model STR :host STR :ready-p BOOL :dim INT)
+#+end_src
+
+* Public MCP tools
+
+| id                  | args                          | notes          |
+|---------------------+-------------------------------+----------------|
+| ~rag-search~        | query, k?, source-kind?       | read-only      |
+| ~rag-index-rebuild~ | scope?                        | writes index   |
+| ~rag-model-status~  | (none)                        | diag           |
+
+* Phases
+
+** Phase 1 — embedding infra + search
+
+Ollama-only backend, elisp defs + design docs as sources.  ERT 5.
+
+** Phase 2 — org sections + incremental update
+
+Add org-headline as source kind, hook into Doc 02 watcher.
+
+** Phase 3 — hybrid scoring
+
+Combine embedding similarity with FTS5 BM25.  A simple weighted sum
+usually outperforms either alone.
+
+* Out of scope / future
+
+- User-preference learning (click-model reranking).
+- Cross-repo indexing.
+
+* References
+
+- Doc 02 (~02-org-index.org~): indexing infra.
+- Doc 11 (~11-defs-index.org~): elisp source.
+- Ollama docs for embedding models.

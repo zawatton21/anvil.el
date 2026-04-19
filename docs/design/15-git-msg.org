@@ -1,0 +1,126 @@
+#+title: anvil-git-msg — Commit / PR / Blame Synthesis
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       e09614a8-fab1-4195-919e-788fd6bf9fa9
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 2 of Week-2 roadmap.  Extends anvil-git with commit-message and
+PR-body generators, plus enriched blame.  All changes Claude-side are
+covered by memory =feedback_commit_co_authored_by.md= (Co-Authored-By
+trailer mandatory).
+
+* Motivation
+
+Every phase ship in this project generates:
+
+1. 1 commit message ("feat(X): ...") with structured bullets.
+2. 1 merge message (~Merge feat/X into develop~).
+3. 1 MEMO entry in journal.
+4. Later, 1 PR description if self-PR cycle is used.
+
+All four get derived from the same diff + commit-log data.  Right now
+Claude hand-writes each and the user pastes.  A generator tool that
+takes diff/log and emits structured Conventional Commits / PR body
+saves ~200–400 tokens per ship + eliminates the Co-Authored-By
+forget-to-add class of bugs.
+
+* Goals
+
+1. ~git-commit-message :staged t~ → Conventional Commits draft from
+   staged diff.  Auto-appends Co-Authored-By per memory rule.
+2. ~git-pr-body :base BRANCH~ → summary + test-plan checklist from
+   commit log.
+3. ~git-why LINE FILE~ → blame + originating commit subject + diff
+   hunk (like git-blame but with context).
+4. ~git-commit-split PATH~ → suggest hunks to split a large diff into
+   logical commits (preview only).
+
+* Non-goals
+
+- AI-driven commit message generation via orchestrator.  The tool
+  is deterministic; Claude writes the message using the structured
+  data we provide.  (Users can of course pipe this into orchestrator
+  if they want.)
+- PR creation (that's gh CLI or mcp__github).  We only produce the
+  body text.
+- Cross-repo blame / submodules — anvil repo is the target.
+
+* Architecture
+
+All four tools shell out to git via anvil-git helpers (Doc already
+shipped), not parse git output raw.  Extract:
+
+#+begin_src elisp
+(anvil-git-msg-commit &key staged scope)
+  ;; Returns: (:type STR :scope STR-OR-NIL :subject STR :body STR
+  ;;           :trailers ALIST :suggested-full STR)
+
+(anvil-git-msg-pr &key base head)
+  ;; Returns: (:title STR :summary STR :test-plan LIST :commits LIST
+  ;;           :suggested-body STR)
+
+(anvil-git-msg-why LINE FILE &key revision)
+  ;; Returns: (:sha STR :author STR :date STR :subject STR
+  ;;           :hunk-head STR :co-authors LIST)
+
+(anvil-git-msg-split-suggest PATH)
+  ;; Returns: (:hunks ((:group N :files LIST :lines N :summary STR) ...))
+#+end_src
+
+* Public MCP tools
+
+| id                    | args                             | returns                    |
+|-----------------------+----------------------------------+----------------------------|
+| ~git-commit-message~  | staged?, scope?                  | commit draft plist         |
+| ~git-pr-body~         | base?, head?                     | pr body draft plist        |
+| ~git-why~             | line, file, revision?            | annotated blame plist      |
+| ~git-commit-split~    | path                             | hunk grouping plist        |
+
+All read-only.  No writes to git history from this module.
+
+* Phases
+
+** Phase 1 — commit-message + pr-body
+
+Type / scope inference: file paths → directory prefix → conventional
+scope (e.g. touch only =anvil-http.el= → scope=http; touch
+=docs/design/= → scope=docs).  Subject from line-count summary of
+largest change.  Trailers: Co-Authored-By auto-appended for all
+Claude-invoked runs (detect by checking if we're inside anvil MCP
+process).
+
+ERT 6+: fixture repo, various change patterns, assert scope inference,
+assert Co-Authored-By presence.
+
+** Phase 2 — blame + split suggestions
+
+~git-why~: wraps ~git blame -L~ + ~git show~ head.  ~git-commit-split~:
+heuristic hunk clustering by file group.  ERT +5.
+
+* Testing strategy
+
+- Fixture repo per test, controlled history.
+- Assert trailer presence.  Assert scope choice against golden table.
+
+* Platform notes
+
+- Windows git output has CRLF — force LF in git config
+  ~core.autocrlf=false~ for anvil (already set).
+- Blame across rename chains: use ~-M -C~ flags.
+
+* Out of scope / future
+
+- Changelog generation (release notes).  Could ride on commit-message
+  later.
+- Cross-repo aggregation.
+
+* References
+
+- Memory =feedback_commit_co_authored_by.md~: rule source.
+- Memory =feedback_zawatton_repo_workflow.md~: develop branch + feat
+  workflow semantics.

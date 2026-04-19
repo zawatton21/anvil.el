@@ -1,0 +1,293 @@
+#+title: anvil-defs — Elisp Symbol Index for Cross-File Navigation
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       6f61ae23-9615-4632-8ba8-5f734a973d65
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 1 of Week-2 roadmap.  Sister to Doc 02 (anvil-org-index) but for
+elisp.  Provides the SQLite-backed symbol index that Doc 12 (sexp
+edits), Doc 13 (bisect), Doc 14 (bench), Doc 16 (lint), Doc 19 (pair)
+all query against.
+
+* Motivation
+
+Claude's current code-navigation loop:
+
+1. ~Grep~ for symbol name → candidate line list
+2. ~Read~ each candidate to see which is the *real* definition
+3. ~Grep~ again for call sites to find "who uses this"
+4. ~Read~ each call site for context
+5. Now, finally, can reason about change impact
+
+Typical: 3–5 tool hops per "where is X called from?" question.  Doc 02
+(org-index) collapsed the same pattern for org files from Read+Grep
+to a single query and measured a *177x* speed-up on 1500 files / 71k
+headlines.  Elisp sees the same pattern repeatedly:
+
+- "Where is ~anvil-worker--dispatch~ called?" (today: Grep + 3 Reads)
+- "What requires ~anvil-http~?" (today: Grep ~require 'anvil-http~)
+- "Where is ~:offload~ keyword handled?" (today: Grep + manual filter)
+- "What's the arity of ~anvil-state-set~?" (today: Read anvil-state.el)
+
+All of these are *structured* queries over a known schema.  A SQLite
+index answers them in 1 hop.
+
+* Goals
+
+1. Index every ~defun~ / ~defvar~ / ~defcustom~ / ~defmacro~ / ~defalias~
+   / ~cl-defun~ / ~cl-defmethod~ / ~cl-defgeneric~ in the project.
+2. Index every ~require~ / ~provide~ edge to answer module-dep graph.
+3. Index every *call site* so we can answer "who calls X".
+4. Track =:file :line :end-line :arity :docstring-head :obsolete=.
+5. Incremental update via filenotify — same pattern as Doc 02.
+6. Expose 5–6 MCP tools for search / references / who-requires / signature
+   / module-deps.
+7. Keep the index portable — single SQLite file under
+   =~/.emacs.d/anvil-defs-index.db=, one table per entity kind.
+
+* Non-goals
+
+- *Not* a full semantic analyzer.  Macro expansion, dynamic dispatch,
+  and higher-order patterns (~apply~, ~funcall~ with computed name)
+  are out of scope.  False negatives are acceptable; false positives
+  must be rare.
+- *Not* a language server.  LSP emulation (hover, goto-def with UI) is
+  explicit non-goal — MCP tools only.
+- *Not* multi-language.  Elisp-only for Phase 1.  Future treesit
+  integration could broaden this but is Doc 21+ territory.
+- *Not* a refactoring tool.  Mutation is Doc 12 (anvil-sexp)'s job; this
+  doc strictly answers queries.
+
+* Architecture
+
+** SQLite schema
+
+#+begin_src sql
+  -- one row per top-level definition
+  CREATE TABLE defs (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT NOT NULL,  -- defun/defvar/defcustom/defmacro/defalias/cl-defun/...
+    name        TEXT NOT NULL,
+    file        TEXT NOT NULL,
+    line        INTEGER NOT NULL,
+    end_line    INTEGER,         -- end of the sexp (approx)
+    arity_min   INTEGER,         -- for defun/defmacro/... ; NULL for vars
+    arity_max   INTEGER,         -- NULL = &rest
+    docstring_head TEXT,         -- first line of docstring, <=160 chars
+    obsolete_p  INTEGER DEFAULT 0,
+    mtime       INTEGER NOT NULL
+  );
+  CREATE INDEX defs_name ON defs(name);
+  CREATE INDEX defs_file ON defs(file);
+  CREATE INDEX defs_kind_name ON defs(kind, name);
+
+  -- one row per (caller-file, called-symbol) edge, coarse-grained
+  CREATE TABLE refs (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,    -- symbol being referenced
+    file        TEXT NOT NULL,    -- file where reference appears
+    line        INTEGER NOT NULL,
+    context     TEXT,             -- the enclosing top-level form's name
+    kind        TEXT NOT NULL     -- 'call' / 'var' / 'quote' / 'require'
+  );
+  CREATE INDEX refs_name ON refs(name);
+  CREATE INDEX refs_file ON refs(file);
+
+  -- feature edges for module-dep graph
+  CREATE TABLE features (
+    id          INTEGER PRIMARY KEY,
+    file        TEXT NOT NULL,
+    feature     TEXT NOT NULL,
+    kind        TEXT NOT NULL     -- 'provides' / 'requires'
+  );
+  CREATE INDEX features_feature_kind ON features(feature, kind);
+  CREATE INDEX features_file_kind ON features(file, kind);
+
+  -- meta
+  CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+#+end_src
+
+** Indexer strategy
+
+Scanning uses a per-file read loop with the reader (~read~) not a text
+regex parser — this way macros like ~(pcase-dolist ...)~ don't confuse
+us, and docstring bodies are never mistaken for code.
+
+Per file:
+
+1. ~with-temp-buffer~ + ~insert-file-contents~ + ~emacs-lisp-mode~
+   (minimal, no hooks).
+2. ~goto-char (point-min)~; loop ~(forward-sexp 1)~, record start/end
+   positions.
+3. For each top-level form:
+   - If it's a *definition* (~defun~ et al.): extract name, arglist, docstring.
+     Record in =defs= table.
+   - Walk the form body (~--walk-sexp~) and record:
+     - Function calls: ~(SYM ARGS...)~ with SYM in ~defs~ or unknown → =refs= (kind='call').
+     - ~(require 'X)~ / ~(provide 'X)~ → =features= table.
+     - ~'X~ / ~#'X~ with X a known symbol → =refs= (kind='quote').
+   - Track enclosing def-name as =context= for each ref.
+4. Commit per-file in a single SQLite transaction.
+
+*Arity extraction*: for ~defun NAME ARGLIST~, parse ARGLIST to count
+required / optional / rest.  ~arity_min~ = count before ~&optional~,
+~arity_max~ = count total or NULL if ~&rest~.
+
+*Docstring head*: first line or first 160 chars, whichever smaller.  Full
+docstring is left on disk — cheap to re-read via ~elisp-describe-function~
+when needed.
+
+** Incremental update
+
+Filenotify on each =.el= file under the project root.  On change:
+1. Delete all rows where =file= matches changed path.
+2. Re-scan that file only.
+3. Commit.
+
+This is the same pattern as Doc 02 (org-index) filenotify; reuse the
+helper code if possible (extract to =anvil-index-common= in Phase 3 if
+worth it).
+
+** Where the DB lives
+
+=~/.emacs.d/anvil-defs-index.db= (configurable via
+~anvil-defs-index-db-path~ defcustom).  Same location convention as
+anvil-org-index.  Safe to delete — full rebuild is cheap (projected
+<5s on anvil.el's 23k LOC based on Doc 02 measurements).
+
+* Public API
+
+#+begin_src elisp
+(anvil-defs-search NAME &key kind fuzzy limit)
+  ;; Returns: list of plists (:name :kind :file :line :arity-min :arity-max
+  ;;                          :docstring-head :obsolete-p)
+  ;; :kind can be a symbol or list ('defun / '(defun cl-defun))
+  ;; :fuzzy t for substring / regex match on name
+
+(anvil-defs-references SYMBOL &key kind limit)
+  ;; Returns: list of plists (:name :file :line :context :kind)
+  ;; :kind can filter by 'call 'quote 'var 'require
+
+(anvil-defs-who-requires FEATURE)
+  ;; Returns: list of file paths that contain (require 'FEATURE)
+
+(anvil-defs-signature SYMBOL)
+  ;; Returns: plist (:name :kind :arity-min :arity-max :docstring-head)
+  ;;  or nil if not indexed.  Lighter than elisp-describe-function.
+
+(anvil-defs-module-deps MODULE &key direction depth)
+  ;; Returns: adjacency list. :direction 'out (what this requires) /
+  ;; 'in (what requires this) / 'both.  :depth for transitive.
+
+(anvil-defs-index-rebuild &optional root)
+  ;; Full rebuild.  Returns plist (:files N :defs N :refs N :duration-ms N).
+
+(anvil-defs-index-status)
+  ;; (:db-path STR :files N :defs N :refs N :last-scan TIMESTAMP)
+#+end_src
+
+* Public MCP tools
+
+| id                  | args                           | returns                   | notes                          |
+|---------------------+--------------------------------+---------------------------+--------------------------------|
+| ~defs-search~       | name, kind?, fuzzy?, limit?    | list of def records       | 1-hop "where defined"          |
+| ~defs-references~   | symbol, kind?, limit?          | list of ref records       | 1-hop "who calls X"            |
+| ~defs-who-requires~ | feature                        | list of file paths        | module reverse-dep             |
+| ~defs-signature~    | symbol                         | signature plist           | arity + docstring-head         |
+| ~defs-module-deps~  | module, direction?, depth?     | adjacency list            | require graph                  |
+| ~defs-index-rebuild~| root?                          | stats plist               | opt-in, slow (~seconds)        |
+
+All are read-only (=:read-only t= in registration — Doc 10 glue-helpers
+style).  Only ~defs-index-rebuild~ writes to disk, and only to the index
+DB.
+
+* Phases
+
+** Phase 1 — schema + indexer + rebuild
+
+- SQLite schema creation, migration (=meta.schema_version=).
+- ~anvil-defs--scan-file~ + ~anvil-defs-index-rebuild~.
+- 3 MCP tools: ~defs-search~, ~defs-signature~, ~defs-index-rebuild~.
+- ERT: 10+ tests covering scan (defun with &optional &rest, defvar,
+  defalias, obsolete marker), rebuild, schema migration.
+- *Ship criterion*: rebuild anvil.el project <5s, search returns
+  correct defun in <10ms.
+
+** Phase 2 — references + module-deps
+
+- Walk-sexp to record refs + features.
+- 3 more MCP tools: ~defs-references~, ~defs-who-requires~,
+  ~defs-module-deps~.
+- ERT +8 tests (call ref, quote ref, require, nested def context).
+- *Ship criterion*: ~defs-references 'anvil-state-set~ returns all real
+  call sites in anvil/ without false positives from strings or comments.
+
+** Phase 3 — filenotify + common index helper extract
+
+- Filenotify watcher per-file, delta update on save.
+- Extract ~anvil-index-common.el~ with the filenotify boilerplate
+  shared with Doc 02 (org-index).  Both indices subscribe.
+- ERT +5 (edit event → def removed → def re-added, debounce).
+- *Ship criterion*: saving a .el file updates the DB within 500ms,
+  search reflects change.
+
+** Phase 4 — macro-expansion opt-in (optional)
+
+- ~anvil-defs-expand-macros~ (default nil): if t, expand common anvil
+  macros (~anvil-server-with-error-handling~,
+  ~anvil-server-register-tools~) during scan so tool IDs registered
+  via the bulk primitive are discoverable.
+- Registered-tool introspection: "what MCP tools does this module
+  register?" becomes a query.
+
+This is the only phase that crosses into semantic territory, and it's
+opt-in because macro expansion in a scanner is slow and fragile.  If
+Phase 4 becomes painful, defer to Doc 21 and ship Phases 1–3 only.
+
+* Testing strategy
+
+- Unit tests against a fixture project (=tests/fixtures/defs-sample/=
+  with hand-crafted .el files covering every kind).
+- Integration test: index anvil.el itself and assert known
+  ground-truth (e.g. ~anvil-server-register-tools~ must show up as
+  ~defun~ at a specific file).
+- Benchmark test (soak, opt-out via =ANVIL_SOAK=): full rebuild of
+  anvil.el, assert <5s on the dev machine.
+
+* Platform notes
+
+- Emacs 29+ required (built-in SQLite).  Same constraint as Doc 02.
+- On Windows, filenotify delay is higher (~1s/dir); batch debounce
+  window should match (already 500ms in Doc 02, same here).
+- Unicode: scan reads via ~insert-file-contents~ with explicit utf-8
+  coding — same guard as =my-cc--insert-file= (memory:
+  =feedback_my_cc_helpers_utf8_journals.md=).
+
+* Out of scope / future
+
+- Multi-language (python / typescript / etc.) — would require treesit
+  integration and a language plugin layer.  Too much scope.
+- Full call-graph analysis (higher-order dispatch, ~apply~ with
+  computed names) — fundamentally hard for elisp.
+- Diff-over-time queries ("this function's call count across history")
+  — better served by Doc 15 (anvil-git-msg) + ad-hoc rebuild.
+- Interactive UI (tabulated-list for search results) — MCP tools are
+  the primary surface; an xref backend could come later as a thin
+  wrapper but is not Phase-1 blocking.
+
+* References
+
+- Doc 02 (~02-org-index.org~): the pattern this follows, almost
+  directly.  Lift the SQLite + filenotify boilerplate.
+- Memory =project_anvil_org_index.md=: Phase 1–4 ship notes, 177x
+  speed-up measurement.
+- Memory =feedback_anvil_macro_require.md=: cautionary tale for
+  Phase 4 macro-expansion work.

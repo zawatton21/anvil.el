@@ -1,0 +1,227 @@
+#+title: anvil-bisect — Test-Driven Regression Localizer
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       bf0c3afa-2f59-4718-a679-b15619dccb88
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 1 of Week-2 roadmap.  Automates ~git bisect~ against ERT tests
+(or arbitrary elisp expressions) so "what broke this?" becomes a
+1-call question.
+
+* Motivation
+
+Today's regression hunt:
+
+1. Notice failing ert test on current HEAD.
+2. Check out ~HEAD~1~, run tests, note pass/fail.
+3. Go back N commits, re-run, narrow.
+4. Manually bisect, typically 4–7 checkouts.
+5. Each checkout: byte-compile from scratch (Windows: 5–10s), run
+   only the specific failing test.
+
+A single bisect over 30 commits is 15–30 minutes of wall-clock,
+almost all of which is mechanical.  The task happens frequently
+(today's session found 5 stale conflict markers in a journal dating
+from an un-remembered merge — that's exactly the kind of question
+bisect answers if asked).
+
+Git already ships ~git bisect run~ which automates this, but:
+
+- It requires a standalone shell script that returns exit 0/1.
+- It does a full checkout each time, polluting the working tree.
+- It doesn't integrate with ERT — you'd script ~emacs --batch -l
+  tests/... --eval ...~ by hand, with all the LOAD-PATH hazards.
+- No worktree isolation, so it stomps on in-flight work.
+
+Doc 13 is a thin but opinionated wrapper: one call, worktree-isolated,
+ERT-native, logs to disk.
+
+* Goals
+
+1. ~anvil-bisect-test TEST-NAME~ auto-bisects the git range to find
+   the commit that broke TEST-NAME.
+2. ~anvil-bisect-expr EXPR~ same, but for an arbitrary elisp form
+   (truthy = good).
+3. Runs each step in a temporary ~git worktree~ so the caller's
+   working tree is undisturbed.
+4. Per-step ert runs happen in ~emacs --batch~ subprocesses for
+   speed and isolation.  Reuses Doc 01's subprocess-tangle pattern.
+5. Result includes the SHA, author, commit message head, and the
+   diff-stat range to review.
+6. Timeout-bounded (~default~ 10 min total, ~per-step~ 60 s).  Kill
+   stuck subprocesses cleanly.
+
+* Non-goals
+
+- General-purpose test runner.  ~anvil-test-run-all~ already exists;
+  this is only about *localization*.
+- Fix suggestion.  We only report "commit X broke test Y"; the user
+  (or another Claude) decides what to do.
+- Non-ert frameworks (buttercup, ecukes).  Elisp community runs ERT
+  almost universally; others can add backends later.
+
+* Architecture
+
+** Control flow
+
+#+begin_example
+  anvil-bisect-test TEST-NAME
+    → ensure good commit exists (default: origin/main)
+    → ensure bad commit exists (default: HEAD)
+    → create tmp worktree at /tmp/anvil-bisect-<uuid>
+    → git bisect start BAD GOOD inside worktree
+    → loop:
+        git bisect run: emacs --batch -L . -l tests/all -f ert-run-tests-batch
+                        --eval "(unless (ert-test-passed-p 'TEST) (kill-emacs 1))"
+        → capture exit code
+        → git bisect good/bad
+    → read `git bisect log`, extract final SHA
+    → cleanup worktree
+    → return plist
+#+end_example
+
+** Worktree lifecycle
+
+- Create fresh worktree under ~/tmp/anvil-bisect-<uuid>~ (or
+  ~temporary-file-directory~).
+- ~git worktree prune~ on start to clean crumbs from prior runs.
+- Remove on completion (success or failure).  ~unwind-protect~.
+
+** Subprocess boundary
+
+Each bisect step is ~emacs --batch~ via ~make-process~:
+
+#+begin_src elisp
+(make-process
+ :name "anvil-bisect-step"
+ :command (list "emacs" "--batch"
+                "-Q"            ; no init for speed + isolation
+                "-L" worktree-path
+                "-l" "tests/anvil-bisect-entry.el"
+                "--eval" (format "(anvil-bisect-run %S)" test-name))
+ :sentinel ...)
+#+end_src
+
+~anvil-bisect-entry.el~ is a tiny auto-loaded entry point; kept in
+~tests/~ so it ships with the repo.
+
+** Result schema
+
+#+begin_src elisp
+(:status 'found / 'inconclusive / 'timeout
+ :breaking-sha "abcd123..."
+ :breaking-subject "feat(worker): add dispatcher lane"
+ :breaking-author "zawatton"
+ :breaking-date "2026-04-17"
+ :steps N                 ; number of bisect iterations
+ :range "origin/main..HEAD"
+ :elapsed-sec FLOAT
+ :log-path "/tmp/anvil-bisect-xxx/bisect.log"
+ :diff-files (list of filenames changed in breaking commit)
+ :test-failure-detail STR ; head of ert backtrace
+ )
+#+end_src
+
+* Public API
+
+#+begin_src elisp
+(anvil-bisect-test TEST-NAME &key good bad timeout-total timeout-per-step)
+  ;; TEST-NAME: symbol or string (ert test name)
+  ;; :good / :bad: refs, default origin/main / HEAD
+  ;; :timeout-total seconds (default 600), :timeout-per-step (default 60)
+
+(anvil-bisect-expr EXPR &key good bad timeout-total timeout-per-step
+                        feature-requires)
+  ;; EXPR: quoted elisp form, truthy = "good" commit
+  ;; :feature-requires: list of features to `require' before EXPR
+  ;; Useful for non-test invariants (e.g. "when did this defcustom's
+  ;; default become >= 5?")
+
+(anvil-bisect-last-result)
+  ;; Return the last run's plist (session-local).
+
+(anvil-bisect-cancel)
+  ;; Cancel an in-progress bisect.
+#+end_src
+
+* Public MCP tools
+
+| id                      | args                                          | returns              | notes                |
+|-------------------------+-----------------------------------------------+----------------------+----------------------|
+| ~bisect-test~           | test-name, good?, bad?, timeout-total?, ...   | result plist         | sync, can block long |
+| ~bisect-expr~           | expr (elisp source str), good?, bad?, ...     | result plist         |                      |
+| ~bisect-cancel~         | (no args)                                     | ok (bool)            | kill running worktree|
+| ~bisect-last-result~    | (no args)                                     | result plist or nil  | read-only            |
+
+For long runs prefer Doc 03 offload:  ~bisect-test~ with
+=:offload t= dispatches into anvil-offload pool, returns a cursor,
+caller polls.  Doc 03 pipe REPL pattern, no new pattern needed here.
+
+* Phases
+
+** Phase 1 — test bisect + worktree isolation
+
+- Worktree create/cleanup utils (reusable, consider promoting to
+  ~anvil-git~ if it fits).
+- ~anvil-bisect-test~ with ert-single-test runner.
+- Timeout-per-step enforcement via ~make-process~ + timer.
+- ERT 8+: synthetic git repo fixture, inject known-bad commit, assert
+  correct SHA identification.
+- *Ship criterion*: bisect a real past regression in anvil.el (pick
+  one from journal history) and get the correct SHA within 3 min.
+
+** Phase 2 — expr bisect + offload integration
+
+- ~anvil-bisect-expr~ for non-test invariants.
+- ~:offload t~ opt-in, worker-side cursor.
+- ERT +5 (expr false-at-sha detection, timeout handling).
+
+** Phase 3 — result surface polish
+
+- ~diff-files~ and ~test-failure-detail~ enrichment.
+- ~git blame~ summary for files changed in the breaking commit.
+- Dashboard row (tabulated-list integration with anvil-worker
+  dashboard if running in offload).
+
+* Testing strategy
+
+- Fixture: ~tests/fixtures/bisect-repo/~ — a tiny committed-history
+  repo generated by setup script.  Each test creates a fresh copy,
+  injects a known bad commit, runs bisect, asserts SHA.
+- Soak test (opt-out via =ANVIL_SOAK=): real anvil.el history, bisect
+  for a defcustom value change.
+- Live test (opt-out via =ANVIL_LIVE=): bisect_test that kills mid-run,
+  asserts worktree is cleaned up.
+
+* Platform notes
+
+- ~git worktree~ needs git >= 2.5; all supported platforms have this.
+- On Windows, worktree creation in =C:\temp= is faster than network
+  paths (memory: =feedback_windows_junction_not_symlink.md= adjacent
+  pattern — prefer local FS).
+- ~emacs --batch~ cold start on Windows is 5–10× Linux (memory:
+  =project_mcp_layer2_design.md=).  Budget timeouts accordingly;
+  consider loading a pre-compiled .eln cache if available.
+
+* Out of scope / future
+
+- Running bisect with multiple test selectors simultaneously (could
+  parallelize across workers; deferred).
+- Bisect-to-specific-error-message (match backtrace text rather than
+  pass/fail).  Interesting but niche.
+- Auto-open the breaking commit in magit-diff.  Interactive sugar,
+  not MCP-worthy.
+
+* References
+
+- Doc 01 (~01-worker-pool-v2.org~): subprocess-tangle pattern, offload
+  model.
+- Doc 03 (~03-offload-framework.org~): if bisect becomes long-running,
+  uses this pipe REPL.
+- Memory =feedback_subprocess_tangle_pattern.md~: the 15x speed-up
+  rationale for emacs --batch subprocesses.

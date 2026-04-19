@@ -1,0 +1,160 @@
+#+title: anvil-lint — Repo Hygiene Scanner
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       e5f55571-89d5-4dd9-94de-13c244cd9a05
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 2 of Week-2 roadmap.  Detects the classes of stale/broken state
+that silently accumulate in a fast-moving repo.
+
+* Motivation
+
+Today's session surfaced a concrete example: 5 unresolved git-merge
+conflict markers had been sitting in ~capture/journals-2026.org~ for
+days, committed by the auto-cron because nothing scans before
+committing.  Similar classes of rot exist:
+
+- Elisp: unused defuns, dead ~(require ...)~ forms, missing docstrings
+  on public functions, obsolete-but-still-referenced APIs.
+- Org: orphaned =:ID:= properties, SCHEDULED repeats with wrong
+  syntax, unresolved =<<<<<<<~/~=======~/~>>>>>>>= markers.
+- Git: auto-merged commits that left markers; branches diverged
+  silently.
+
+Existing ~anvil-dev-release-audit~ already lints a few categories.
+Doc 16 expands it into a proper scanner surface with plugin
+registration, so future classes of lint can be added incrementally.
+
+* Goals
+
+1. Pluggable scanner registry — each scanner is an elisp function
+   returning findings.
+2. Two initial scanner families: ~lint-elisp~ (code) and ~lint-org~
+   (org files).
+3. ~:severity 'error / 'warning / 'info~ on each finding; caller can
+   filter.
+4. ~:scope~ parameter: file list, directory, or "all" (consistent with
+   Doc 15 release-audit :scope).
+5. Pre-commit hook integration: a shell-callable entry point that
+   exits non-zero if any ~'error~ finding is emitted.
+
+* Non-goals
+
+- Style policing (indentation, line length).  Use ~checkdoc~ and
+  external formatters.  Anvil-lint is for *correctness* issues.
+- Performance lint (Doc 14 covers that).
+- Cross-repo analysis.
+
+* Architecture
+
+** Scanner protocol
+
+#+begin_src elisp
+(anvil-lint-register-scanner
+ :id 'lint-org/conflict-markers
+ :family 'lint-org
+ :description "Detect unresolved git merge conflict markers"
+ :scan (lambda (files) ...returns list of findings...))
+
+;; A finding:
+(:scanner 'lint-org/conflict-markers
+ :severity 'error
+ :file "capture/journals-2026.org"
+ :line 14233
+ :message "Unresolved merge marker: ======="
+ :hint "Resolve manually or abort the last merge"
+ :fix-hint nil)  ; optional auto-fix plan
+#+end_src
+
+** Initial scanners
+
+Elisp family (via Doc 11 defs index):
+- ~unused-defuns~ — defs with 0 references.  Warn (not error; some
+  are interactive-only).
+- ~missing-docstrings~ — public-looking symbols (no ~--~ prefix)
+  without docstring.  Info.
+- ~dead-requires~ — ~(require 'X)~ where none of X's symbols are
+  referenced in the file.  Warning.
+- ~obsolete-still-referenced~ — ~make-obsolete~ target still called.
+  Error.
+
+Org family:
+- ~conflict-markers~ — ~^<<<<<<< | ^=======$ | ^>>>>>>> ~ patterns.
+  Error.
+- ~orphan-ids~ — =:ID:= property that no ~[[id:...]]~ link points at.
+  Info.
+- ~broken-scheduled~ — ~SCHEDULED:~ with unparseable repeat syntax.
+  Warning.
+- ~mixed-todo-keywords~ — file uses keywords not in its configured
+  keyword list.  Warning.
+
+* Public API
+
+#+begin_src elisp
+(anvil-lint &key family scope severity-min)
+  ;; Runs all registered scanners matching :family (or all).
+  ;; :scope limits files; :severity-min filters findings.
+  ;; Returns: list of findings.
+
+(anvil-lint-scanners)
+  ;; List registered scanners.
+
+(anvil-lint-run-precommit)
+  ;; Entry for pre-commit hook.  Exits non-zero on any 'error.
+#+end_src
+
+* Public MCP tools
+
+| id                | args                              | returns               |
+|-------------------+-----------------------------------+-----------------------|
+| ~lint~            | family?, scope?, severity-min?    | findings list         |
+| ~lint-scanners~   | (none)                            | list of scanners      |
+
+Read-only.  Pre-commit entry is CLI-only (not MCP).
+
+* Phases
+
+** Phase 1 — registry + org scanners
+
+Conflict-markers + orphan-ids + broken-scheduled.  Would have caught
+today's journal issue in <1s.  ERT 6.
+
+** Phase 2 — elisp scanners (depends on Doc 11)
+
+unused-defuns, dead-requires, missing-docstrings using defs index.
+ERT +5.
+
+** Phase 3 — pre-commit integration
+
+Shell script that calls lint-run-precommit via emacsclient; exits
+non-zero on error.  Integrate with anvil-ship (user init.org).  ERT
+scripted.
+
+* Testing strategy
+
+- Fixture files per scanner (known-bad org + known-bad elisp).
+- Assert correct severity + line number.
+
+* Platform notes
+
+- Pre-commit hook: Unix-y via bash.  Windows users: call via
+  emacsclient -e, wrapped in .bat or .cmd shim.  anvil-ship pattern
+  applies.
+
+* Out of scope / future
+
+- Auto-fix application (would compose with Doc 12 sexp edits).
+- Warning suppression pragma (~;; lint-disable: unused-defuns~).
+  Delay until we accumulate false-positive pressure.
+
+* References
+
+- Doc 11 (~11-defs-index.org~): elisp scanners read the index.
+- Memory =feedback_anvil_deprecated_path_audit.md~: shape of release
+  audit, continuity.
+- ~checkdoc.el~ / ~elint.el~ — inspiration.

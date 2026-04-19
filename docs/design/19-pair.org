@@ -1,0 +1,98 @@
+#+title: anvil-pair — Multi-Agent Peer Review Pattern
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       7016882a-6cc2-484e-b13d-d28386ac2a07
+  :END:
+~DRAFT~ (2026-04-19)
+
+Tier 3 of Week-2 roadmap.  Extends anvil-orchestrator with a
+peer-review primitive: one Claude's output is reviewed by another AI
+(or a codex judge) before the user ever sees it.
+
+* Motivation
+
+Memory =feedback_orchestrator_role_split.md~ already establishes a
+claude=architect / codex=coder pattern.  Doc 10 Phase 4b gave us the
+meta-LLM judge primitive.  Doc 19 composes those into a reusable
+"pair review" that:
+
+1. Claude A produces a diff or plan.
+2. Claude B / codex / gemini reviews it (critique + suggested
+   amendments).
+3. Judge merges the critique into an actionable punch list.
+
+Today this composes by hand via orchestrator-submit calls.  Doc 19
+packages it as one MCP call.
+
+* Goals
+
+1. ~pair-review DIFF :reviewers '(claude codex)~ dispatches 2+
+   reviewers in parallel, collects their critiques, returns merged.
+2. ~pair-iterate~ loop: apply patches → re-review → stop when judge
+   says "ready" or max N rounds.
+3. Reuse Doc 10 providers + concurrency caps; no new subprocess logic.
+
+* Non-goals
+
+- Code execution sandboxing (Doc 13 bisect does this separately).
+- Human-in-the-loop prompts.  If the user wants to intervene, they
+  kill the batch.
+
+* Architecture
+
+Thin layer over Doc 10.  ~pair-review~ constructs a DAG:
+
+#+begin_example
+  [reviewer-1]  [reviewer-2]  [reviewer-N]
+        \          |            /
+         \         |           /
+             [judge-merge]
+#+end_example
+
+Uses ~orchestrator-submit~ with ~:depends-on~ (already supported, Doc
+10 Phase 1b).  Judge prompt template is a defcustom.
+
+* Public API
+
+#+begin_src elisp
+(anvil-pair-review DIFF &key reviewers judge system-prompt-append)
+  ;; Returns batch-id.
+
+(anvil-pair-iterate PROMPT &key reviewers judge max-rounds apply-fn)
+  ;; Loop.  apply-fn called with each round's diff; caller decides
+  ;; how to apply (default: show diff, no auto-apply).
+#+end_src
+
+* Public MCP tools
+
+| id               | args                                       | notes              |
+|------------------+--------------------------------------------+--------------------|
+| ~pair-review~    | diff, reviewers, judge?                    | dispatches DAG     |
+| ~pair-iterate~   | prompt, reviewers, judge?, max-rounds?     | iterative          |
+
+* Phases
+
+** Phase 1 — pair-review one-shot
+
+Composes orchestrator DAG, returns merged critique.  ERT 5 (live
+gated).
+
+** Phase 2 — pair-iterate loop
+
+Round-counter state, apply-fn hook.  ERT +4.
+
+* Out of scope / future
+
+- Auto-apply reviewer suggestions (Doc 12 sexp edits could make this
+  safe later).
+- Cost-aware reviewer selection.
+
+* References
+
+- Doc 10 (~10-orchestrator.org~) Phases 4, 4b: consensus + judge.
+- Memory =feedback_orchestrator_role_split.md~: claude/codex roles.
+- Memory =feedback_orchestrator_when_to_use.md~: trigger conditions.
