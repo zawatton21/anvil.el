@@ -549,8 +549,14 @@ will refine via the Doc 11 index."
               (defun-name-positions (make-hash-table :test 'eql))
               (hits nil))
          ;; Pass 1: mark defun-name positions via the sexp metadata.
+         ;; Restricted to function-like forms — variable-binding forms
+         ;; (defvar / defcustom / etc) must fall through to Pass 2 so
+         ;; their name sites are classified as `var' by the context
+         ;; walker, matching Doc 12 Phase 2a's four-kind taxonomy.
          (dolist (f forms)
-           (when (eq (plist-get f :name) target-sym)
+           (when (and (eq (plist-get f :name) target-sym)
+                      (memq (plist-get f :kind)
+                            anvil-sexp--function-defining-forms))
              (save-excursion
                (goto-char (plist-get f :form-start))
                (when (looking-at-p "(")
@@ -606,45 +612,79 @@ will refine via the Doc 11 index."
          (sort hits (lambda (a b) (< (plist-get a :start)
                                      (plist-get b :start)))))))))
 
-(defun anvil-sexp--classify-ref-at (pos)
-  "Classify the elisp symbol occurrence starting at POS.
-Returns one of `quote', `call', or `symbol' based on the
-immediately preceding character and, when relevant, the
-enclosing list's operator.  Call this only on positions that are
-already known not to be inside a string or comment."
-  (let* ((prev (and (> pos (point-min)) (char-before pos)))
-         (prev2 (and prev (> pos (1+ (point-min)))
-                     (char-before (1- pos)))))
-    (cond
-     ;; #'foo or 'foo reader syntax
-     ((and (eql prev ?') (eql prev2 ?#)) 'quote)
-     ((eql prev ?') 'quote)
-     ;; Operator position: `(foo ...)'
-     ((eql prev ?\() 'call)
-     ;; Parent (quote X) / (function X)
-     (t
-      (let ((car-sym (anvil-sexp--enclosing-list-car pos)))
-        (cond
-         ((memq car-sym '(quote function)) 'quote)
-         ;; defvar / defcustom / defconst / defalias treat the second
-         ;; slot as a name binding.  We do not distinguish that slot
-         ;; from body references here — the kind filter in the caller
-         ;; treats `symbol' as the catch-all.
-         (t 'symbol)))))))
+(defconst anvil-sexp--var-binding-forms
+  '(defvar defvar-local defcustom defconst defconst-local
+    setq setq-local setf cl-letf cl-letf*)
+  "Forms whose second (or alternating) slot is a variable-name binding.
+Used by `anvil-sexp--classify-ref-at' to surface the `var' kind
+required by Doc 12 Phase 2a.")
 
-(defun anvil-sexp--enclosing-list-car (pos)
-  "Return the operator symbol of the list immediately enclosing POS.
-Returns nil when POS is at the top level or the operator is not a
-plain symbol."
+(defun anvil-sexp--parent-ctx (pos)
+  "Return a plist describing POS's position inside its enclosing list.
+Result: (:car OP-SYM :index N) or nil when POS is at top level.
+OP-SYM is the first sexp of the enclosing list (nil if it is not
+a bare symbol); N is the 0-based sexp index, where 0 means POS
+sits on the operator token itself."
   (save-excursion
     (goto-char pos)
     (let ((ppss (syntax-ppss)))
       (when (> (nth 0 ppss) 0)
-        (goto-char (1+ (nth 1 ppss)))
-        (forward-comment most-positive-fixnum)
-        (ignore-errors
-          (let ((s (read (current-buffer))))
-            (and (symbolp s) s)))))))
+        (let* ((open (nth 1 ppss))
+               (car-sym nil)
+               (index 0))
+          ;; Read the head of the enclosing list.
+          (goto-char (1+ open))
+          (forward-comment most-positive-fixnum)
+          (ignore-errors
+            (let ((s (read (current-buffer))))
+              (when (symbolp s) (setq car-sym s))))
+          ;; Count sexps strictly before POS within the list.  Each
+          ;; skipped sexp advances INDEX; the first skip moves us off
+          ;; the operator, so a POS on the operator returns INDEX=0.
+          (goto-char (1+ open))
+          (forward-comment most-positive-fixnum)
+          (while (and (< (point) pos)
+                      (let ((p (point)))
+                        (ignore-errors (forward-sexp))
+                        (forward-comment most-positive-fixnum)
+                        (> (point) p)))
+            (when (<= (point) pos)
+              (setq index (1+ index))))
+          (list :car car-sym :index index))))))
+
+(defun anvil-sexp--classify-ref-at (pos)
+  "Classify the elisp symbol occurrence starting at POS.
+Returns one of `defun-name', `call', `quote', `var', or `symbol'.
+Call only on positions already known not to be inside a string or
+comment.  The implementation combines cheap `char-before' hints
+with `anvil-sexp--parent-ctx' so that operator sites with
+whitespace or comments between `(' and the head (for example
+`( foo 1)' or `(;; hi\\n foo 1)') are still classified as
+`call'."
+  (let* ((prev (and (> pos (point-min)) (char-before pos)))
+         (prev2 (and (> pos (1+ (point-min))) (char-before (1- pos)))))
+    (cond
+     ;; Reader-quote shorthand: 'foo or #'foo.
+     ((and (eql prev ?') (eql prev2 ?#)) 'quote)
+     ((eql prev ?') 'quote)
+     (t
+      (let* ((ctx (anvil-sexp--parent-ctx pos))
+             (car-sym (plist-get ctx :car))
+             (index (plist-get ctx :index)))
+        (cond
+         ((null ctx) 'symbol)
+         ((memq car-sym '(quote function)) 'quote)
+         ((eql index 0) 'call)
+         ((and (eql index 1)
+               (memq car-sym anvil-sexp--var-binding-forms))
+          'var)
+         (t 'symbol)))))))
+
+(defun anvil-sexp--enclosing-list-car (pos)
+  "Return the operator symbol of the list immediately enclosing POS.
+Kept as a thin wrapper around `anvil-sexp--parent-ctx' for
+backward compatibility with early Phase 2a call sites."
+  (plist-get (anvil-sexp--parent-ctx pos) :car))
 
 (defun anvil-sexp--resolve-scope (scope)
   "Return a list of .el file paths matching SCOPE.
@@ -730,10 +770,12 @@ Returns an edit plan plist."
 
 (defun anvil-sexp--render-call-template (template args)
   "Substitute %1 %2 ... in TEMPLATE string with the printed forms of ARGS.
-Arguments that appear more than once in the template are rendered
-each time; missing positional references signal an error."
+Each %N is replaced simultaneously rather than sequentially so a
+value printed for %1 whose text contains `%2' is not rewritten
+when %2's substitution pass runs.  Missing positional references
+signal an error.  %10+ is supported — longer digit runs bind
+tighter than shorter prefixes."
   (let ((max-arg 0))
-    ;; Find highest %N used.
     (let ((start 0))
       (while (string-match "%\\([0-9]+\\)" template start)
         (let ((n (string-to-number (match-string 1 template))))
@@ -742,21 +784,38 @@ each time; missing positional references signal an error."
     (when (> max-arg (length args))
       (error "replace-call template uses %%%d but only %d arg(s) available"
              max-arg (length args)))
-    (let ((out template))
-      (dotimes (i max-arg)
-        (let ((idx (1+ i)))
-          (setq out
-                (replace-regexp-in-string
-                 (concat "%" (number-to-string idx))
-                 (prin1-to-string (nth i args))
-                 out t t))))
+    ;; Single-pass replacement: scan once, emit literal runs and
+    ;; the N-th arg's printed form on each %<digits> match.
+    (let ((i 0) (len (length template)) (out ""))
+      (while (< i len)
+        (let ((ch (aref template i)))
+          (if (and (eq ch ?%)
+                   (< (1+ i) len)
+                   (let ((d (aref template (1+ i))))
+                     (and (>= d ?0) (<= d ?9))))
+              (let ((j (1+ i)))
+                (while (and (< j len)
+                            (let ((d (aref template j)))
+                              (and (>= d ?0) (<= d ?9))))
+                  (setq j (1+ j)))
+                (let* ((n (string-to-number (substring template (1+ i) j)))
+                       (val (prin1-to-string (nth (1- n) args))))
+                  (setq out (concat out val))
+                  (setq i j)))
+            (setq out (concat out (char-to-string ch)))
+            (setq i (1+ i)))))
       out)))
 
 (defun anvil-sexp--replace-call-plan (scope fn-name new-form-template)
-  "Build an edit plan replacing calls to FN-NAME with NEW-FORM-TEMPLATE."
+  "Build an edit plan replacing calls to FN-NAME with NEW-FORM-TEMPLATE.
+Records sites that were skipped (parse failure, unreadable call,
+arity mismatch with the template) so the caller can see partial
+results in the plan summary rather than being silently given a
+count that hides the misses."
   (let* ((files (anvil-sexp--resolve-scope scope))
          (fn-name-str (if (symbolp fn-name) (symbol-name fn-name) fn-name))
          (ops nil)
+         (skips nil)
          (touched-files 0)
          (total-hits 0))
     (dolist (file files)
@@ -767,44 +826,65 @@ each time; missing positional references signal an error."
            (dolist (h (anvil-sexp--scan-symbol-refs file fn-name-str))
              (when (eq (plist-get h :kind) 'call)
                (let* ((tok-start (plist-get h :start))
-                      (call-beg (save-excursion
-                                  (goto-char tok-start)
-                                  (when (eql (char-before) ?\()
-                                    (1- tok-start))))
+                      (call-beg
+                       (save-excursion
+                         (goto-char tok-start)
+                         (ignore-errors (backward-up-list))
+                         (and (looking-at-p "(") (point))))
                       (call-end
                        (and call-beg
                             (save-excursion
                               (goto-char call-beg)
                               (ignore-errors (forward-sexp) (point))))))
-                 (when (and call-beg call-end)
+                 (cond
+                  ((or (null call-beg) (null call-end))
+                   (push (list :file file :start tok-start
+                               :reason "could not delimit call form")
+                         skips))
+                  (t
                    (let* ((call-text
                            (buffer-substring-no-properties call-beg call-end))
                           (call-sexp
                            (condition-case _
                                (car (read-from-string call-text))
-                             (error nil)))
-                          (args (and (consp call-sexp) (cdr call-sexp)))
-                          (replacement
-                           (ignore-errors
-                             (anvil-sexp--render-call-template
-                              new-form-template args))))
-                     (when replacement
-                       (cl-incf emitted)
-                       (push (list :file file
-                                   :range (cons call-beg call-end)
-                                   :replacement replacement
-                                   :reason (format "replace-call %s"
-                                                   fn-name-str))
-                             ops)))))))))
+                             (error nil))))
+                     (cond
+                      ((not (consp call-sexp))
+                       (push (list :file file :start call-beg
+                                   :reason "call text failed to read as sexp")
+                             skips))
+                      (t
+                       (let* ((args (cdr call-sexp))
+                              (render
+                               (condition-case err
+                                   (anvil-sexp--render-call-template
+                                    new-form-template args)
+                                 (error
+                                  (cons 'err (error-message-string err))))))
+                         (cond
+                          ((and (consp render) (eq (car render) 'err))
+                           (push (list :file file :start call-beg
+                                       :reason (cdr render))
+                                 skips))
+                          (t
+                           (cl-incf emitted)
+                           (push (list :file file
+                                       :range (cons call-beg call-end)
+                                       :replacement render
+                                       :reason (format "replace-call %s"
+                                                       fn-name-str))
+                                 ops))))))))))))))
         (when (> emitted 0)
           (cl-incf touched-files)
           (cl-incf total-hits emitted))))
     (list :ops (nreverse ops)
-          :summary (format "replace-call %s: %d sites across %d files"
-                           fn-name-str total-hits touched-files)
+          :skipped (nreverse skips)
+          :summary (format "replace-call %s: %d sites across %d files (%d skipped)"
+                           fn-name-str total-hits touched-files (length skips))
           :diff-preview
-          (format "# replace-call %s -> %s\n# %d sites, %d files\n"
-                  fn-name-str new-form-template total-hits touched-files))))
+          (format "# replace-call %s -> %s\n# %d sites, %d files, %d skipped\n"
+                  fn-name-str new-form-template
+                  total-hits touched-files (length skips)))))
 
 (defun anvil-sexp--tool-replace-call (fn_name new_form &optional scope apply)
   "Replace every call to FN_NAME with NEW_FORM across SCOPE.

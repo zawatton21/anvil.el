@@ -679,5 +679,100 @@
   (should (fboundp 'anvil-sexp-replace-call)))
 
 
+;;;; --- review-feedback fixes (Phase 2a round 2) -------------------------
+
+(ert-deftest anvil-sexp-test-classify-ref-at-whitespace-operator ()
+  "Operator with whitespace or comments between `(' and head is `call'."
+  (with-temp-buffer
+    (set-syntax-table emacs-lisp-mode-syntax-table)
+    (insert "(foo 1)\n"
+            "( foo 1)\n"
+            "(\n  foo 1)\n"
+            "( ;; hi\n  foo 1)\n")
+    ;; Position of each `foo' occurrence.
+    (dolist (marker '("(foo" "( foo" "(\n  foo" "( ;; hi\n  foo"))
+      (goto-char (point-min))
+      (search-forward marker)
+      (backward-char (length "foo"))
+      (let ((k (save-excursion
+                 (anvil-sexp--classify-ref-at (point)))))
+        (should (eq k 'call))))))
+
+(ert-deftest anvil-sexp-test-classify-ref-at-var-binding ()
+  "Second slot of defvar / defcustom / setq is classified `var'."
+  (with-temp-buffer
+    (set-syntax-table emacs-lisp-mode-syntax-table)
+    (insert "(defvar foo 1)\n(setq foo 2)\n")
+    (goto-char (point-min))
+    (search-forward "defvar ")
+    (let ((k (save-excursion (anvil-sexp--classify-ref-at (point)))))
+      (should (eq k 'var)))
+    (goto-char (point-min))
+    (search-forward "setq ")
+    (let ((k (save-excursion (anvil-sexp--classify-ref-at (point)))))
+      (should (eq k 'var)))))
+
+(ert-deftest anvil-sexp-test-classify-ref-at-quote-forms ()
+  "`'foo', `#'foo', `(quote foo)', `(function foo)' all classify as quote."
+  (with-temp-buffer
+    (set-syntax-table emacs-lisp-mode-syntax-table)
+    (insert "'foo\n#'foo\n(quote foo)\n(function foo)\n")
+    (dolist (prefix '("'foo" "#'foo" "(quote foo" "(function foo"))
+      (goto-char (point-min))
+      (search-forward prefix)
+      (backward-char (length "foo"))
+      (let ((k (save-excursion (anvil-sexp--classify-ref-at (point)))))
+        (should (eq k 'quote))))))
+
+(ert-deftest anvil-sexp-test-render-call-template-cascade-safe ()
+  "%N substitution is single-pass — a value containing %M is not rewritten."
+  ;; Emit the bare symbol `%2` as arg 1 and `zz` as arg 2.
+  (should (equal "(f %2 zz)"
+                 (anvil-sexp--render-call-template "(f %1 %2)" '(%2 zz))))
+  ;; %10 > %1 prefix collision: template uses %10, which is 10th arg.
+  (should (equal "(g a:10)"
+                 (anvil-sexp--render-call-template
+                  "(g a:%10)" '(_1 _2 _3 _4 _5 _6 _7 _8 _9 10))))
+  ;; Too few args signals.
+  (should-error
+   (anvil-sexp--render-call-template "(h %3)" '(a))))
+
+(ert-deftest anvil-sexp-test-replace-call-tracks-skips ()
+  "Sites that cannot be rendered are counted in :skipped and :summary."
+  (anvil-sexp-test--with-phase2a-dir
+   (lambda (dir file)
+     (ignore dir)
+     (let* ((plan (anvil-sexp--tool-replace-call
+                   "p2a-hello" "(pair %1 %2)" file))
+            (skipped (plist-get plan :skipped))
+            (summary (plist-get plan :summary)))
+       ;; The (p2a-hello \"test\") call has arity 1 but the template
+       ;; wants 2 — it must be skipped, visibly.
+       (should (>= (length skipped) 1))
+       (should (string-match-p "skipped" summary))))))
+
+(ert-deftest anvil-sexp-test-rename-var-binding-kind ()
+  "rename-symbol with kinds=var touches only LHS-binding sites."
+  (let ((tmp (make-temp-file "anvil-sexp-var-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; v.el --- -*- lexical-binding: t; -*-\n"
+                    ";;; Code:\n"
+                    "(defvar my-var 1)\n"
+                    "(setq my-var (+ my-var 1))\n"
+                    "(provide 'v)\n"
+                    ";;; v.el ends here\n"))
+          (let* ((plan (anvil-sexp--tool-rename-symbol
+                        "my-var" "my-var2" "var" tmp))
+                 (ops (plist-get plan :ops)))
+            ;; LHS of defvar + LHS of setq = 2 sites.  The `(+ my-var 1)'
+            ;; RHS is `symbol', not `var', so it stays untouched.
+            (should (= 2 (length ops)))))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
+
 (provide 'anvil-sexp-test)
 ;;; anvil-sexp-test.el ends here
