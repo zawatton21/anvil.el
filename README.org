@@ -768,6 +768,34 @@ parallel tasks).  Every call runs =git --no-pager -c
 core.quotepath=false ...= so Japanese paths round-trip cleanly
 and pager-configured repos don't leak terminal escapes.
 
+** HTTP module (optional)
+
+The =http= module is a thin wrapper around Emacs' built-in
+=url-retrieve-synchronously= that adds a SQLite-backed ETag/TTL cache
+(via =anvil-state=).  It is the right tool for static HTTP/JSON
+resources where a full browser session would be wasteful — REST APIs,
+=.json= endpoints that JS-challenge Chrome, RSS feeds, public docs
+polling.
+
+Add =http= to =anvil-optional-modules=.  The registered tools are:
+
+- =http-fetch= — GET with cache awareness.  Within
+  =anvil-http-cache-ttl-sec= (default 300 s) the response is served
+  without any network call; otherwise a conditional GET with
+  =If-None-Match= / =If-Modified-Since= is issued and a =304= refreshes
+  the cached entry with zero body transfer.  Retries =5xx= / =408= /
+  =429= with exponential backoff (=Retry-After= honoured on 429).
+- =http-head= — HEAD probe for cheap metadata checks; never cached.
+- =http-cache-clear= — drop a single URL or flush the whole http
+  namespace.
+
+Scheme guard: only =http= / =https= are accepted
+(=anvil-http-allowed-schemes=), so =file://= / =javascript:= are
+refused.  =url-max-redirections= is clamped to 5 per call, well below
+Emacs' default 30.
+
+Requires Emacs 29+ (for the built-in =sqlite-*= used by =anvil-state=).
+
 * Client setup — connecting your AI to Anvil
 
 After Anvil is running inside Emacs, you need to register it as

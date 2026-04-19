@@ -4,9 +4,14 @@
 #+property: status DRAFT
 
 * STATUS
-~APPROVED~ (2026-04-18) — Review Questions Q1-Q10 すべて既定案で
-resolved、Windows libxml fallback を明記した上で確定。Phase 1a 着手可能。
-Doc 07 Vision 節の Phase C1 を本 doc に切り出したもの。
+~Phase 1a SHIPPED~ (2026-04-18) — =anvil-http.el= (core GET/HEAD +
+ETag/TTL cache via =anvil-state=) + =tests/anvil-http-test.el= (15
+pass / 1 live skipped) + README section + =anvil-optional-modules=
+registration。byte-compile clean。commit =4d6a398=。
+
+Phase 1b-1e (selector / json-path extract, body-overflow, batch
+fetch, robots.txt) は次スロット。Review Questions Q1-Q10 resolved の
+ままキープ。
 
 * Goal
 
