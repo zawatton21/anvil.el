@@ -1,0 +1,411 @@
+#+title: anvil-ts + anvil-js — Tree-sitter Structural Edits for TypeScript and JavaScript
+#+date: 2026-04-19
+#+author: zawatton
+#+property: status DRAFT
+
+* STATUS
+  :PROPERTIES:
+  :ID:       d157a927-ac3a-4d51-b3d2-f132810ac087
+  :END:
+~DRAFT~ (2026-04-19)
+
+Sibling of Doc 12 (anvil-sexp, elisp).  Provides tree-sitter-backed
+structural editing for TypeScript and JavaScript files, with a thin
+per-language front-end over a shared core.  Phase 1 covers read-only
+structural locators; edits and rename follow in later phases.
+
+/Why combined:/ TypeScript is a syntactic superset of JavaScript and
+shares the vast majority of the node kinds we care about (functions,
+classes, imports, exports, variables).  One design doc covers both
+to avoid duplication; the implementation splits into
+~anvil-treesit.el~ (shared core), ~anvil-ts.el~ (TS / TSX queries),
+~anvil-js.el~ (JS / JSX queries).
+
+* Vision — completing the Emacs-as-AI-editor bet
+
+Doc 12 (anvil-sexp) argued that elisp is the most important
+programming language for AI to master.  That alone is not enough:
+AI users edit TypeScript, JavaScript, Python, Rust, and Go far more
+often than elisp.  For Emacs + anvil to be the environment in which
+AI editing peaks, tooling for those languages must be as structural
+as the elisp path — not a regex fallback.
+
+Tree-sitter is the vehicle.  Where elisp has a reader and live
+reflection (Doc 12), brace-and-keyword languages have tree-sitter
+grammars that parse into precise, query-able syntax trees.  Layering
+anvil tools on top of the ~treesit.el~ builtin (Emacs 29+) gives AI:
+
+- *Structural locate* — find every function definition, every
+  import, every class, every decorated method, without grep false
+  positives.
+- *Scoped rename / replace* — operate on identifier references, not
+  substrings in strings / comments.
+- *Idempotent edit plans* — preview / apply semantics matching the
+  anvil-sexp (Doc 12) and ~code-add-field-by-map~ (Doc 06)
+  convention.
+
+anvil-ts and anvil-js are the first step.  Python, Rust, Go, Ruby
+follow in separate modules once the pattern proves out in
+production.  The combined bet — elisp via reader (Doc 12) +
+everything else via tree-sitter (this doc and successors) — is
+what distinguishes Emacs + anvil from any other AI editing
+environment.
+
+* Motivation
+
+Claude's current TS / JS editing uses the same regex stack that
+Doc 12 documented for elisp: ~file-replace-string~,
+~file-replace-regexp~, ~file-batch~, plus a brace-counting hack in
+~code-extract-pattern~ and the TS-specific ~code-add-field-by-map~
+(Doc 06).
+
+These work for simple cases but fail on the same structural lines:
+
+- Renaming ~foo~ rewrites the substring inside strings and comments.
+- Removing an import line breaks when the import is part of a
+  multi-binding destructure (~{ foo, bar } from '...'~).
+- Adding a decorator to a class method requires paren / brace
+  counting that regex cannot do reliably across multi-line args.
+- Wrapping a JSX element needs balanced-tag awareness.
+- Replacing a function body whose body contains template literals
+  with embedded braces defeats naive brace counting.
+
+Tree-sitter handles all of these natively because the grammar
+encodes the brace / bracket structure.  The ~treesit.el~ API
+provides ~treesit-parser-create~, ~treesit-node-at~,
+~treesit-query-compile~, ~treesit-query-capture~,
+~treesit-node-start~ / ~-end~.  We layer edit primitives on top.
+
+* Why tree-sitter (not regex, not LSP)
+
+- *Regex* — known fragile (Doc 12 motivation).  Worse on brace
+  languages because nesting and string escapes interact in non-
+  regular ways; template literals make it strictly unsalvageable.
+- *LSP (tsserver / typescript-language-server)* — powerful but
+  heavy: requires a Node process, project context, TS install, and
+  an async round-trip per query.  For Phase 1 locate operations
+  that is excessive.  tsserver remains useful for /semantic/
+  refactors (type-aware rename across implicit ~any~, for example);
+  we keep it as a future peer backend, not a Phase 1 dependency.
+- *Tree-sitter* — compiled grammar, in-process, sub-millisecond
+  queries, built into Emacs 29+.  Right tool for structural work,
+  and for elisp-vs-other-languages parity with Doc 12.
+
+* Goals
+
+1. Read-only structural locators first: list imports, list exports,
+   find function / class by name, list methods of a class.
+2. Edit primitives layered on ~file-batch~ for atomicity: replace
+   function body, add / remove import, rename import alias, wrap
+   expression.
+3. Preview-by-default.  ~:apply t~ is the only write gate, matching
+   Doc 12 and Doc 06.
+4. Language routing by file extension (~.ts~, ~.tsx~, ~.js~,
+   ~.jsx~, ~.mjs~, ~.cjs~) dispatched by the shared core.
+5. Grammar install must work cross-platform.  Windows native-compile
+   is a known hazard (~anvil-host~ sentinel memory); the module
+   surfaces clear errors and fallbacks, never silent regex.
+
+* Non-goals
+
+- Other languages (Python, Rust, Go, Ruby).  Those get their own
+  modules when Phase 1 of this one ships.
+- Type-aware operations (use-before-def detection, generic
+  inference, rename across declaration-merged interfaces).  Those
+  need tsserver — future work, not Phase 1.
+- JSX / TSX semantic edits that require JSX-type checking.
+  Structural JSX manipulation (wrap, unwrap, rename attribute) is
+  in scope; type-correct wrapping is not.
+- Automatic import path resolution.  We add the import line
+  literally as the caller supplies it; resolving ~'@/foo/bar'~ vs
+  ~'../foo/bar'~ needs tsconfig parsing, deferred.
+- Formatting.  We do not run Prettier, Biome, ESLint, or dprint.
+  The caller handles post-edit formatting.
+
+* Architecture
+
+** Three-file split
+
+- ~anvil-treesit.el~ — shared core.  Grammar registry, query
+  compile cache, node-range helpers, edit-plan serializer, file-to-
+  language dispatch.  No language-specific knowledge.
+- ~anvil-ts.el~ — TypeScript queries and dispatch.  Handles ~.ts~
+  and ~.tsx~.
+- ~anvil-js.el~ — JavaScript queries and dispatch.  Handles ~.js~,
+  ~.jsx~, ~.mjs~, ~.cjs~.
+
+The split lets TS-specific queries (decorators, type annotations,
+interfaces, generics) stay out of the JS module, while the shared
+core avoids duplicated plumbing.  Both surface modules register
+their MCP tools through the same ~anvil-server-register~ entry
+points, so grammar bootstrap and edit-plan handling are
+single-sourced.
+
+** Grammar bootstrap
+
+On first use, ~anvil-treesit--ensure-grammar LANG~ checks whether
+the grammar is available via ~treesit-language-available-p~.  If
+not, it looks up ~treesit-language-source-alist~ and returns a
+structured error to the caller — we do *not* silently compile
+grammars on the user's behalf.
+
+The MCP error shape is:
+
+#+begin_src elisp
+(:kind 'grammar-missing
+ :lang 'typescript
+ :install-hint "M-x treesit-install-language-grammar RET typescript RET"
+ :source-url "https://github.com/tree-sitter/tree-sitter-typescript")
+#+end_src
+
+Claude can relay this to the user, who runs the install once per
+machine.  Subsequent sessions pick up the compiled grammar
+transparently.
+
+Windows note: native-compile friction with ~anvil-host~ sentinels
+makes the default ~treesit-install-language-grammar~ path slow and
+occasionally fragile.  A prebuilt-binary resolver is tracked as
+future work (separate doc when it lands); Phase 1 simply surfaces
+the upstream error cleanly.
+
+** Query protocol
+
+Each language module registers queries keyed by operation name:
+
+#+begin_src elisp
+(defconst anvil-ts--queries
+  '((list-imports   . "(import_statement) @im")
+    (list-exports   . "(export_statement) @ex")
+    (function-def   . "(function_declaration name: (identifier) @name) @fn")
+    (class-def      . "(class_declaration name: (type_identifier) @name) @cls")
+    (method-def     . "(method_definition name: (property_identifier) @name) @m")
+    (interface-def  . "(interface_declaration name: (type_identifier) @name) @if")
+    (type-alias     . "(type_alias_declaration name: (type_identifier) @name) @ty")
+    ...))
+#+end_src
+
+Queries compile once per Emacs session via
+~treesit-query-compile~ and cache in
+~anvil-treesit--compiled-cache~ keyed by ~(lang . operation)~.
+
+** Edit model
+
+Identical to Doc 12 anvil-sexp: ~:ops~ list of ~(:file :range
+:replacement :reason)~ plists, plus ~:summary~ and
+~:diff-preview~.  ~:apply nil~ (default) previews; ~:apply t~
+writes via ~file-batch-across~ so every mutation passes through
+one audit point.
+
+** Comment / string awareness
+
+Tree-sitter gives this for free — the grammar distinguishes
+identifiers from string literals and comment contents.  A rename
+or replace operation only matches identifier nodes; template
+literal interiors are skipped unless the caller opts in with
+~:include '(strings)~.
+
+* Public API
+
+** Phase 1 — read-only locators
+
+#+begin_src elisp
+(anvil-ts-list-imports FILE)
+(anvil-ts-list-exports FILE)
+(anvil-ts-list-functions FILE)
+(anvil-ts-list-classes FILE)
+(anvil-ts-list-methods FILE CLASS-NAME)
+(anvil-ts-list-interfaces FILE)            ; TS-only
+(anvil-ts-list-type-aliases FILE)          ; TS-only
+(anvil-ts-find-definition FILE NAME)
+  ;; -> (:name :kind :range :bounds :docstring?).  :kind is one of
+  ;; 'function / 'class / 'interface / 'type / 'const / 'let / 'method.
+
+(anvil-ts-surrounding-form FILE POINT &key kind)
+  ;; Nearest enclosing structural form, matching anvil-sexp shape.
+#+end_src
+
+~anvil-js-*~ has the same surface minus TypeScript-only kinds (no
+interfaces, no type aliases).  The dispatcher
+~anvil-treesit-for-file FILE~ routes to the right module based on
+extension.
+
+** Phase 2 — structural edits
+
+#+begin_src elisp
+(anvil-ts-replace-function FILE NAME NEW-BODY &key apply)
+(anvil-ts-add-import FILE SPEC &key apply)
+  ;; SPEC is (:from MODULE :default NAME? :named (NAME ...)? :type-only?).
+  ;; Idempotent — merges into existing import from same module when
+  ;; safe (e.g. two :named adds collapse to one statement).
+(anvil-ts-remove-import FILE SPEC &key apply)
+(anvil-ts-rename-import FILE OLD-NAME NEW-NAME &key apply)
+(anvil-ts-wrap-expr FILE RANGE WRAPPER &key apply)
+  ;; WRAPPER is a source template containing `|anvil-hole|`.
+#+end_src
+
+~anvil-js-*~ mirrors this surface for JS / JSX.
+
+** Phase 3 — cross-file rename
+
+~anvil-ts-rename-symbol~ — scope-aware rename within a file /
+project.  Requires one of:
+
+- A reference index analogous to Doc 11 (anvil-defs) for TS / JS,
+  /or/
+- tsserver integration for semantic rename (type-aware).
+
+Decision deferred to when Phase 1–2 are in production and real
+usage surfaces the constraints.
+
+** Phase 4 — extract / inline
+
+~anvil-ts-extract-function~, ~anvil-ts-inline-function~.  Layered
+on Phase 2 + scope analysis via tree-sitter identifier-reference
+queries.  Safety gates adapted for JS semantics (closure capture,
+~this~ binding, generator / async modifiers).
+
+* Public MCP tools
+
+| id                          | phase | lang    | args                                 | returns     | notes              |
+|-----------------------------+-------+---------+--------------------------------------+-------------+--------------------|
+| ~ts-list-imports~           |     1 | ts/tsx  | file                                 | list        | read-only          |
+| ~ts-list-exports~           |     1 | ts/tsx  | file                                 | list        | read-only          |
+| ~ts-list-functions~         |     1 | ts/tsx  | file                                 | list        | read-only          |
+| ~ts-list-classes~           |     1 | ts/tsx  | file                                 | list        | read-only          |
+| ~ts-list-methods~           |     1 | ts/tsx  | file, class-name                     | list        | read-only          |
+| ~ts-list-interfaces~        |     1 | ts/tsx  | file                                 | list        | TS-only, read-only |
+| ~ts-list-type-aliases~      |     1 | ts/tsx  | file                                 | list        | TS-only, read-only |
+| ~ts-find-definition~        |     1 | ts/tsx  | file, name                           | form+bound  | read-only          |
+| ~ts-surrounding-form~       |     1 | ts/tsx  | file, point, kind?                   | form+bound  | read-only          |
+| ~js-list-imports~           |     1 | js/jsx  | file                                 | list        | read-only          |
+| ~js-list-exports~           |     1 | js/jsx  | file                                 | list        | read-only          |
+| ~js-list-functions~         |     1 | js/jsx  | file                                 | list        | read-only          |
+| ~js-list-classes~           |     1 | js/jsx  | file                                 | list        | read-only          |
+| ~js-list-methods~           |     1 | js/jsx  | file, class-name                     | list        | read-only          |
+| ~js-find-definition~        |     1 | js/jsx  | file, name                           | form+bound  | read-only          |
+| ~js-surrounding-form~       |     1 | js/jsx  | file, point, kind?                   | form+bound  | read-only          |
+| ~ts-replace-function~       |     2 | ts/tsx  | file, name, new-body, apply?         | plan        | preview default    |
+| ~ts-add-import~             |     2 | ts/tsx  | file, spec, apply?                   | plan        | idempotent merge   |
+| ~ts-remove-import~          |     2 | ts/tsx  | file, spec, apply?                   | plan        |                    |
+| ~ts-rename-import~          |     2 | ts/tsx  | file, old, new, apply?               | plan        |                    |
+| ~ts-wrap-expr~              |     2 | ts/tsx  | file, range, wrapper, apply?         | plan        | placeholder sym    |
+| ~js-replace-function~       |     2 | js/jsx  | file, name, new-body, apply?         | plan        |                    |
+| ~js-add-import~             |     2 | js/jsx  | file, spec, apply?                   | plan        |                    |
+| ~js-remove-import~          |     2 | js/jsx  | file, spec, apply?                   | plan        |                    |
+| ~js-rename-import~          |     2 | js/jsx  | file, old, new, apply?               | plan        |                    |
+| ~js-wrap-expr~              |     2 | js/jsx  | file, range, wrapper, apply?         | plan        |                    |
+| ~ts-rename-symbol~          |     3 | ts/tsx  | old, new, scope?, apply?             | plan        | needs index or LSP |
+| ~js-rename-symbol~          |     3 | js/jsx  | old, new, scope?, apply?             | plan        | needs index or LSP |
+| ~ts-extract-function~       |     4 | ts/tsx  | file, range, new-name, apply?        | plan        |                    |
+| ~js-extract-function~       |     4 | js/jsx  | file, range, new-name, apply?        | plan        |                    |
+
+All writing tools default to ~apply=false~ (preview).
+
+* Phases
+
+** Phase 1 — grammar bootstrap + read-only locators
+
+- ~anvil-treesit.el~ shared core: grammar registry, query cache,
+  node-range helpers, file-to-language dispatch, grammar-missing
+  structured error.
+- ~anvil-ts.el~ and ~anvil-js.el~ with the Phase 1 locators.
+- Entries in ~treesit-language-source-alist~ for ~typescript~,
+  ~tsx~, ~javascript~ (vendored or documented install command).
+- ERT 20+ tests against golden fixtures in
+  ~tests/fixtures/ts-sample/~, ~tests/fixtures/tsx-sample/~,
+  ~tests/fixtures/js-sample/~, ~tests/fixtures/jsx-sample/~.
+- *Ship criterion*: ~ts-list-imports~ and ~js-list-imports~ return
+  the expected lists against fixture files; grammar-missing error
+  round-trips cleanly; works on Linux and Windows.
+
+** Phase 2 — structural edits
+
+- ~add-import~ with merge-into-existing logic (same-module named
+  imports collapse to one statement; type-only is preserved).
+- ~replace-function~ body using tree-sitter node bounds.
+- ~wrap-expr~ with ~|anvil-hole|~ placeholder substitution.
+- ~remove-import~ and ~rename-import~ (alias only; reference
+  renaming is Phase 3).
+- ERT +15: round-trip, idempotency (double-apply is a no-op),
+  string / comment exclusion.
+- *Ship criterion*: ~ts-add-import~ called twice with the same
+  spec is a no-op; ~ts-replace-function~ on a fixture round-trips;
+  ~tsc --noEmit~ still passes on the fixture after edit.
+
+** Phase 3 — cross-file rename
+
+- Choose backend: reference index (lighter) vs tsserver (heavier
+  but type-aware).  Start with the lighter path; gate tsserver
+  behind ~:semantic t~ when available.
+- ERT +10: cross-file, conflict detection, kind-filtering.
+- *Ship criterion*: rename a function across 3+ files in a demo
+  project; ~tsc --noEmit~ passes.
+
+** Phase 4 — extract / inline
+
+- Extract with free-variable analysis via tree-sitter identifier-
+  reference queries.
+- Inline with safety gates (no ~this~-capture changes, no
+  generator / async mismatch, no body with side effects on closure
+  variables).
+- ERT +8.
+- *Ship criterion*: extract a 20-line block into a new function,
+  ~tsc --noEmit~ passes, call site becomes a single-line call.
+
+* Testing strategy
+
+- Golden fixtures per language:
+  ~tests/fixtures/ts-sample/~, ~tsx-sample/~, ~js-sample/~,
+  ~jsx-sample/~.
+- Round-trip property test: read fixture → apply edit → apply
+  reverse edit → assert byte-identical.
+- Integration: run Phase 1 locators against a small real project
+  under ~tests/fixtures/mini-app/~; verify output shapes are
+  stable across ~tree-sitter-typescript~ grammar bumps.
+- Grammar-install smoke test: on a fresh checkout with no grammars
+  installed, tools return structured ~grammar-missing~ errors (not
+  backtraces).
+
+* Platform notes
+
+- Emacs 29+ required (~treesit.el~ is built in).  Loader refuses
+  on older versions with a clear error.
+- Grammar install via ~treesit-install-language-grammar~ compiles
+  C with the system compiler.  On Windows this couples with the
+  same native-compile friction documented in ~anvil-host~ sentinel
+  memory; a prebuilt-binary fallback is tracked as a separate
+  future task.
+- CRLF vs LF: tree-sitter parses whatever the file holds; we
+  enforce LF via existing ~.gitattributes~ union-merge rules, and
+  edit plans return point-based positions rather than byte offsets
+  to stay CRLF-safe on the edge cases.
+
+* Out of scope / future
+
+- *Other languages.*  Python (~anvil-py~), Rust (~anvil-rs~),
+  Go (~anvil-go~), Ruby (~anvil-rb~) follow the same shape and
+  reuse ~anvil-treesit.el~.  Each gets its own design doc when it
+  comes up.
+- *Type-aware refactors.*  tsserver integration deferred.  When
+  needed, it fits as a peer backend to tree-sitter (preview plans
+  come from tsserver; apply goes through the same ~file-batch~
+  audit point).
+- *JSX / TSX prop-type-aware wrapping.*  Out of scope; structural
+  wrapping is in scope.
+- *Formatting on write.*  Prettier / Biome / ESLint / dprint are
+  not invoked.  The caller is responsible for formatting post-edit.
+- *Prebuilt grammar distribution.*  A Windows-first convenience
+  layer that avoids native-compile is its own design doc; Phase 1
+  requires explicit user opt-in to install.
+
+* References
+
+- Doc 06 (~06-code-transform-tools.org~): preview-by-default +
+  plist plan style we inherit.
+- Doc 12 (~12-sexp-edits.org~): elisp companion; this doc is its
+  non-elisp counterpart.  The two together realize the Emacs + AI
+  thesis: reader-native for elisp, tree-sitter for everything else.
+- Emacs 29 ~treesit.el~ manual: (info "(elisp) Parsing Program Source").
+- Memory =project_windows_claude_backends.md=: background on the
+  Windows native-compile friction that shapes the grammar-install
+  strategy.

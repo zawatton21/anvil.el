@@ -55,7 +55,7 @@ Tier 1 から順に実装。Tier 1 完了で Claude の tool hop が構造的に
 | #  | Doc                                         | 依存           | 想定工数 | Tier | 状態  |
 |----+---------------------------------------------+----------------+----------+------+-------|
 | 11 | [[file:11-defs-index.org][Elisp Symbol Index]]                          | なし           | 中       | 1    | DRAFT |
-| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits]]                            | 11             | 中       | 1    | DRAFT |
+| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits (elisp, reader-only)]]       | 11 (Ph2+)      | 中       | 1    | DRAFT |
 | 13 | [[file:13-bisect.org][Test-Driven Bisect]]                          | 01             | 小       | 1    | DRAFT |
 | 14 | [[file:14-bench-profile.org][Bench + Profile]]                             | なし           | 小       | 2    | DRAFT |
 | 15 | [[file:15-git-msg.org][Commit / PR Synthesis]]                       | なし           | 小       | 2    | DRAFT |
@@ -69,6 +69,16 @@ Tier 凡例:
 - *Tier 1* — 10x multiplier.  Claude の日常的な hop 数を構造的に減らす。
 - *Tier 2* — 大きな生産性向上.  Tier 1 の上に乗る使い勝手と安全性。
 - *Tier 3* — 増幅器.  他 AI 連携、cross-session、semantic 検索、Windows TUI。
+
+** Week-3 Wave (Doc 21–, DRAFT, 2026-04-19 提案)
+
+Emacs を AI にとって最も価値ある editor にする戦略的ベット
+(Doc 12 の続き)。elisp は reader-only (Doc 12)、非 elisp 言語は
+tree-sitter で構造編集する。
+
+| #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
+|----+---------------------------------------------+--------+----------+------+-------|
+| 21 | [[file:21-ts-js-edits.org][TS / JS Tree-sitter Edits]]                   | 06     | 大       | 2    | DRAFT |
 
 * Status Legend
 
