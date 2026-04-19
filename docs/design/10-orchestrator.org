@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -68,9 +68,26 @@
   ERT +15 (= 80 pass / 1 live skip in anvil-orchestrator-test.el,
   391 total across the suite, 2 live skips).
 
-Phase 4b (meta-LLM judge: submit outputs back to a 3rd provider
-for an adjudicated merge) は design 残し。Review Questions Q1-Q12
-resolved 状態キープ。
+- Phase 4b (commit 7221ad8, branch feat/orchestrator-phase-4b):
+  meta-LLM judge.  =anvil-orchestrator-judge-consensus= submits a
+  synthesis prompt (original question + numbered candidate block
+  with provider / status / summary) to a judge provider (default
+  claude) as a new single-task batch.  =-judge-collect= returns
+  the judge task's slim plist.  Template customisable via
+  =anvil-orchestrator-judge-prompt-template= (2 =%s= slots:
+  question, candidates); =anvil-orchestrator-judge-default-provider=
+  selects the judge.  Per-call =:judge= / =:judge-model= /
+  =:extra= (appended instruction) / =:wait= / =:timeout-sec=.
+  The judge task_id / batch_id / provider / model / submitted-at
+  are merged into the consensus meta so daemon restart rehydrates
+  the linkage.  2 MCP tools (orchestrator-consensus-judge /
+  -judge-collect).  ERT +10 (= 90 pass / 1 live skip in
+  anvil-orchestrator-test.el, 401 total across the suite, 2 live
+  skips).
+
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b) を
+develop branch 上で ship 済み。Review Questions Q1-Q12 resolved
+状態キープ。
 
 * Goal
 
