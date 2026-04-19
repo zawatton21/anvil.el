@@ -1638,5 +1638,81 @@ so post-finalize :elapsed-ms of task A does not appear on task B."
         (should (eq 'done (plist-get r :status)))
         (should (stringp (plist-get r :summary)))))))
 
+;; --- Phase 6C MVP tests ---
+
+(ert-deftest anvil-orchestrator--phase-6c-compute-delay-default-within-jitter-range ()
+  (let ((values nil))
+    (dotimes (_ 100)
+      (push (anvil-orchestrator--compute-retry-delay-ms 0) values))
+    (dolist (v values)
+      (should (and (>= v 150) (<= v 250))))))
+
+(ert-deftest anvil-orchestrator--phase-6c-compute-delay-cap-enforced ()
+  (let ((result (anvil-orchestrator--compute-retry-delay-ms 20)))
+    (should (<= result 37500))))
+
+(ert-deftest anvil-orchestrator--phase-6c-compute-delay-no-jitter-deterministic ()
+  (let ((anvil-orchestrator-auto-retry-jitter-pct 0))
+    (should (= 1600
+               (anvil-orchestrator--compute-retry-delay-ms 3)))))
+
+(ert-deftest anvil-orchestrator--phase-6c-auto-retry-on-includes-network ()
+  (should (memq 'network
+                (default-value 'anvil-orchestrator-auto-retry-on))))
+
+(ert-deftest anvil-orchestrator--phase-6c-maybe-auto-retry-sets-retry-reason ()
+  (let ((anvil-orchestrator--tasks (make-hash-table :test 'equal))
+        (anvil-orchestrator--batches (make-hash-table :test 'equal)))
+    (let* ((id (anvil-orchestrator--uuid))
+           (task (list :status 'failed
+                       :auto-retry-code 429
+                       :retry-count 0
+                       :id id
+                       :batch-id "test-batch"))
+           clone-id
+           clone)
+      (puthash id task anvil-orchestrator--tasks)
+      (puthash "test-batch" (list id) anvil-orchestrator--batches)
+      (unwind-protect
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (&rest _args) nil))
+                    ((symbol-function 'anvil-orchestrator--persist)
+                     (lambda (tk)
+                       (puthash (plist-get tk :id) tk
+                                anvil-orchestrator--tasks)
+                       tk)))
+            (anvil-orchestrator--maybe-auto-retry id)
+            (maphash
+             (lambda (task-id task-plist)
+               (when (equal (plist-get task-plist :retry-of) id)
+                 (setq clone-id task-id)
+                 (setq clone task-plist)))
+             anvil-orchestrator--tasks)
+            (should clone)
+            (should (equal 429 (plist-get clone :retry-reason))))
+        (remhash id anvil-orchestrator--tasks)
+        (when clone-id
+          (remhash clone-id anvil-orchestrator--tasks))))))
+
+(ert-deftest anvil-orchestrator--phase-6c-dashboard-entry-shows-retry-count ()
+  (let ((anvil-orchestrator--tasks (make-hash-table :test 'equal)))
+    (let* ((id (anvil-orchestrator--uuid))
+           (task (list :retry-count 2
+                       :status 'done
+                       :name "t"
+                       :provider 'claude
+                       :id id
+                       :batch-id "b"))
+           entry)
+      (puthash id task anvil-orchestrator--tasks)
+      (unwind-protect
+          (progn
+            (setq entry
+                  (cl-find-if (lambda (it) (equal (car it) id))
+                              (anvil-orchestrator--dashboard-entries)))
+            (should entry)
+            (should (equal "done×2" (aref (cadr entry) 1))))
+        (remhash id anvil-orchestrator--tasks)))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

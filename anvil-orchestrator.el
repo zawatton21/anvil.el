@@ -122,7 +122,7 @@ Individual tasks may override via `:system-prompt-append'."
   :type 'string
   :group 'anvil-orchestrator)
 
-(defcustom anvil-orchestrator-auto-retry-on '(429 500 502 503 504)
+(defcustom anvil-orchestrator-auto-retry-on '(429 500 502 503 504 network)
   "HTTP status codes (or the symbol `network') that trigger an auto-retry.
 Parsed from the failed task's stderr / stream-json result when
 available.  Other failures must be retried manually via
@@ -132,6 +132,28 @@ available.  Other failures must be retried manually via
 
 (defcustom anvil-orchestrator-auto-retry-max 2
   "Maximum number of automatic retries per task."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-auto-retry-base-ms 200
+  "Base delay (ms) for the exponential-backoff schedule.
+Actual delay = base-ms * 2^retry-count, capped by
+`anvil-orchestrator-auto-retry-max-delay-ms' and optionally jittered by
+`anvil-orchestrator-auto-retry-jitter-pct'."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-auto-retry-max-delay-ms 30000
+  "Upper bound (ms) on any single retry delay.
+Applied before jitter so the post-jitter value may slightly exceed this."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-auto-retry-jitter-pct 25
+  "Full-jitter percentage applied to each computed retry delay.
+Final delay is uniformly sampled from [raw*(1-pct/100), raw*(1+pct/100)].
+Set to 0 to disable jitter.
+Clamped internally to [0, 100]."
   :type 'integer
   :group 'anvil-orchestrator)
 
@@ -1358,6 +1380,26 @@ everything else runs when global concurrency permits."
 
 ;;;; --- auto-retry ---------------------------------------------------------
 
+(defun anvil-orchestrator--compute-retry-delay-ms (tries)
+  "Return retry delay in milliseconds for TRIES using capped exponential backoff with jitter.
+The raw delay is `min(cap, base * 2^tries)`, where `base` is
+`anvil-orchestrator-auto-retry-base-ms' and `cap' is
+`anvil-orchestrator-auto-retry-max-delay-ms'.  Jitter percentage is taken from
+`anvil-orchestrator-auto-retry-jitter-pct' and clamped to the range 0..100.
+When jitter is zero, return the raw delay.  Otherwise compute a symmetric range
+around the raw delay with `spread = raw * pct / 100', then return a random
+integer in the inclusive range `[raw - spread, raw + spread]'."
+  (let* ((base anvil-orchestrator-auto-retry-base-ms)
+         (cap anvil-orchestrator-auto-retry-max-delay-ms)
+         (raw (min cap (* base (expt 2 tries))))
+         (pct (max 0 (min 100 anvil-orchestrator-auto-retry-jitter-pct))))
+    (if (= pct 0)
+        raw
+      (let* ((spread (/ (* raw pct) 100))
+             (low (- raw spread))
+             (high (+ raw spread)))
+        (+ low (random (1+ (- high low))))))))
+
 (defun anvil-orchestrator--maybe-auto-retry (id)
   "Spawn an auto-retry of task ID when its failure matches policy."
   (let* ((task (anvil-orchestrator--task-get id))
@@ -1370,7 +1412,7 @@ everything else runs when global concurrency permits."
                (memq code anvil-orchestrator-auto-retry-on)
                (< tries anvil-orchestrator-auto-retry-max)
                (eq (plist-get task :status) 'failed))
-      (let* ((delay-ms (* 200 (expt 2 tries)))
+      (let* ((delay-ms (anvil-orchestrator--compute-retry-delay-ms tries))
              (new-id   (anvil-orchestrator--uuid))
              (clone    (copy-sequence task)))
         (setq clone (plist-put clone :id new-id))
@@ -1384,6 +1426,7 @@ everything else runs when global concurrency permits."
         (setq clone (plist-put clone :submitted-at (float-time)))
         (setq clone (plist-put clone :retry-count (1+ tries)))
         (setq clone (plist-put clone :retry-of id))
+        (setq clone (plist-put clone :retry-reason code))
         (anvil-orchestrator--persist clone)
         (let* ((bid (plist-get clone :batch-id))
                (cur (gethash bid anvil-orchestrator--batches)))
@@ -2187,21 +2230,26 @@ MCP Parameters:
   (let (entries)
     (maphash
      (lambda (id task)
-       (let ((row (vector
-                   (or (plist-get task :name) "")
-                   (format "%s" (or (plist-get task :status) ""))
-                   (format "%s" (or (plist-get task :provider) ""))
-                   (or (plist-get task :model) "")
-                   (if (plist-get task :elapsed-ms)
-                       (number-to-string (plist-get task :elapsed-ms))
-                     "")
-                   (if (plist-get task :cost-usd)
-                       (format "$%.4f" (plist-get task :cost-usd))
-                     "")
-                   (substring (or (plist-get task :batch-id) "") 0
-                              (min 8 (length (or (plist-get task :batch-id) ""))))
-                   (or (plist-get task :summary)
-                       (or (plist-get task :error) "")))))
+       (let* ((status (format "%s" (or (plist-get task :status) "")))
+              (retry-count (plist-get task :retry-count))
+              (status-cell (if (and (integerp retry-count) (> retry-count 0))
+                               (format "%s×%d" status retry-count)
+                             status))
+              (row (vector
+                    (or (plist-get task :name) "")
+                    status-cell
+                    (format "%s" (or (plist-get task :provider) ""))
+                    (or (plist-get task :model) "")
+                    (if (plist-get task :elapsed-ms)
+                        (number-to-string (plist-get task :elapsed-ms))
+                      "")
+                    (if (plist-get task :cost-usd)
+                        (format "$%.4f" (plist-get task :cost-usd))
+                      "")
+                    (substring (or (plist-get task :batch-id) "") 0
+                               (min 8 (length (or (plist-get task :batch-id) ""))))
+                    (or (plist-get task :summary)
+                        (or (plist-get task :error) "")))))
          (push (list id row) entries)))
      anvil-orchestrator--tasks)
     entries))
