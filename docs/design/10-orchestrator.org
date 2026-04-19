@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -85,9 +85,25 @@
   anvil-orchestrator-test.el, 401 total across the suite, 2 live
   skips).
 
-Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b) を
-develop branch 上で ship 済み。Review Questions Q1-Q12 resolved
-状態キープ。
+- Phase 5 (commit f5d8170, branch feat/orchestrator-phase-5):
+  codex native adapter — ChatGPT Plus OAuth 経路で OpenAI Codex
+  CLI を provider 化。=codex exec --json --sandbox read-only -m
+  MODEL PROMPT= argv、JSONL イベントを行単位 parse して
+  =agent_message.text= を要約採用、=turn.completed.usage= を
+  =:cost-tokens= に通す。API キー不要 (`codex login' で
+  =~/.codex/auth.json= に credentials)。3 defcustoms
+  (default-model "gpt-5.4"、extra-args、sandbox "read-only"),
+  per-task =:sandbox= override 対応。Cost estimator は常に 0
+  (Plus subscription 内、per-token 課金なし)。Capabilities:
+  tool-use=t、worktree=nil、budget=nil、sys-prompt-append=nil。
+  Per-provider concurrency cap =(codex . 3)= を alist に追加。
+  ERT +12 (= 102 pass / 1 live skip in anvil-orchestrator-test.el,
+  414 total across the suite, 2 live skips).
+
+Doc 10 の全 Phase (1a / 1b / 2 / 2b / 3 / 3b / 4 / 4b / 5) を
+develop branch 上で ship 済み。さらに同日の 2 件 bug fix (commit
+31d2f3f stdin EOF / 5a2610f shared-tail copy-sequence) も含む。
+Review Questions Q1-Q12 resolved 状態キープ。
 
 * Goal
 
