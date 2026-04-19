@@ -3,7 +3,27 @@
 #+property: status DRAFT
 
 * STATUS
-~DRAFT~ — レビュー前。~ccih-pty-broker~ (2026-04-12 MVP 済) の知見を正式設計に昇格。
+~APPROVED~ (2026-04-19) — Phase 1 実装着手可。~ccih-pty-broker~ (2026-04-12 MVP 済)
+の知見と ~feedback_eat_daemon_filter_starvation.md~ / ~feedback_conpty_headless_stdin_unidirectional.md~
+で確立した pattern を正式化。
+
+** Decisions
+
+1. *Transport*: TCP localhost-only (全 platform 共通)。Windows の Unix socket 対応は
+   壊れ気味なので MVP から除外。
+2. *Port*: default 7641、~anvil-pty-broker-port~ で上書き可。0 指定で動的割当。
+3. *Auth*: token 必須 (起動時に random 生成 or env ~ANVIL_PTY_TOKEN~)。token 無しリクエストは即切断。
+4. *Protocol*: JSON lines (LF delimited)、output は base64 encode で binary safe。
+5. *Emacs I/O*: ~make-network-process~ で接続、filter は **使わない**、~run-at-time~ で
+   定期 drain。同期 filter 禁止 (daemon starvation 回避、memory 参照)。
+6. *Node package*: anvil repo 内 ~pty-broker/~ サブディレクトリに npm package として配置、
+   ~npm install --production~ で ready。~node_modules/node-pty~ に依存。
+7. *Phase 1 scope*: 単一 pty、~spawn~ / ~input~ / ~output~ / ~exit~ / ~kill~ のみ。
+   ~resize~ / multi-pty / render は Phase 2+。
+8. *Security default*: ~anvil-pty-allowed-commands~ は **空 list** でデフォルト無効。
+   ユーザが明示的に ~'(claude bash)~ 等を設定した時のみ spawn 可能。
+9. *Render layer の扱い*: Phase 1 は raw 出力を buffer にダンプするのみ。
+   ANSI 解釈は Phase 3。
 
 * Goal
 
@@ -189,9 +209,13 @@ Part 2 が主戦略。Part 1 は「どうしても TUI が必要な場合」の 
 * Implementation Plan
 
 1. *Phase 1 — Broker MVP 正式化* (~1 週間)
-   - 既存 ~my-claude-code-ide-broker.el~ の知見を ~anvil-pty-broker~ (Node + Elisp client) に移植
-   - protocol 固定、auth token、単一 pty セッション
-   - tests: bash を spawn、"echo hello" → "hello\n" 受信
+   Scope lock:
+   - ~pty-broker/anvil-pty-broker.js~ (Node): node-pty + net.createServer + JSON line protocol
+   - ~anvil-pty-broker.el~ (Elisp client): ~anvil-pty-enable~ / ~anvil-pty-spawn~ /
+     ~anvil-pty-send~ / ~anvil-pty-kill~ / ~anvil-pty-list~、timer-only I/O
+   - auth token 必須 (起動時生成 + env 経由)
+   - 単一 pty セッション / ~resize~ は Phase 2
+   - ERT: bash spawn → ~echo hello\n~ 受信 (subprocess 内で完結)、token 不一致で切断
 
 2. *Phase 2 — Multi-pty + resize + kill* (~3 日)
    - 複数 pty を同時管理
