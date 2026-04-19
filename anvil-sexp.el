@@ -191,9 +191,20 @@ valid after later replacements shift text."
      by-file)
     (append plan (list :applied-at (format-time-string "%FT%T%z")))))
 
+(defun anvil-sexp--truthy (v)
+  "Non-nil when V is a non-empty truthy MCP value.
+Treats the strings \"nil\", \"false\", \"0\", \"\", and the elisp
+symbol nil as falsy; everything else is truthy.  Used to unify
+the apply/byte_compile/checkdoc/all argument shapes coming over
+the MCP wire."
+  (cond ((null v) nil)
+        ((stringp v)
+         (not (member (downcase v) '("" "nil" "false" "0"))))
+        (t t)))
+
 (defun anvil-sexp--maybe-apply (plan apply)
-  "Apply PLAN when APPLY is non-nil; otherwise return preview plan."
-  (if (and apply (not (equal apply "")))
+  "Apply PLAN when APPLY is truthy; otherwise return preview PLAN."
+  (if (anvil-sexp--truthy apply)
       (anvil-sexp--apply-plan plan)
     plan))
 
@@ -248,7 +259,7 @@ when the point is between top-level forms."
                      ((and (stringp point) (string-match "\\`[0-9]+\\'" point))
                       (string-to-number point))
                      (t (error "point must be an integer, got %S" point))))
-          (want-kind (and kind (not (equal kind "")) (intern kind)))
+          (want-kind (and (stringp kind) (not (string-empty-p kind)) (intern kind)))
           (forms (anvil-sexp--read-file file))
           (hit (cl-find-if
                 (lambda (f) (and (<= (plist-get f :start) pos)
@@ -277,7 +288,7 @@ dependencies."
      (unless form
        (error "anvil-sexp-macroexpand: no form named %s in %s" name file))
      (let* ((sexp (plist-get form :sexp))
-            (expanded (if (and all (not (equal all "")))
+            (expanded (if (anvil-sexp--truthy all)
                           (macroexpand-all sexp)
                         (macroexpand-1 sexp))))
        (list :name (symbol-name (plist-get form :name))
@@ -502,12 +513,9 @@ later phase when needed."
   (anvil-server-with-error-handling
    (unless (file-readable-p file)
      (error "anvil-sexp-verify: cannot read %s" file))
-   (let* ((do-bc (not (or (equal byte_compile "nil")
-                          (equal byte_compile "false")
-                          (equal byte_compile "0"))))
-          (do-cd (not (or (equal checkdoc "nil")
-                          (equal checkdoc "false")
-                          (equal checkdoc "0"))))
+   (let* (;; Default ON for both checks; opt out with a falsy string.
+          (do-bc (or (null byte_compile) (anvil-sexp--truthy byte_compile)))
+          (do-cd (or (null checkdoc) (anvil-sexp--truthy checkdoc)))
           (diags '())
           (bc-ok t))
      (when do-bc
