@@ -2274,6 +2274,134 @@ hash).  Cleans the task + batch tables on exit."
                      (plist-get coerced :prompt)))
       (should-not (plist-get coerced :preamble-ref)))))
 
+;;;; --- Phase 7c: live streaming -------------------------------------------
+
+(ert-deftest anvil-orchestrator--stream-opt-in-default-off ()
+  "A task without :stream t does not accumulate stream events."
+  (anvil-orchestrator-test--with-fresh
+    (let ((batch (anvil-orchestrator-submit
+                  '((:name "no-stream" :provider test :prompt "x")))))
+      (anvil-orchestrator-test--wait-batch batch)
+      (let* ((id (car (gethash batch anvil-orchestrator--batches)))
+             (task (anvil-orchestrator--task-get id)))
+        (should-not (plist-get task :stream-events))
+        (should-not (anvil-orchestrator-stream id))))))
+
+(ert-deftest anvil-orchestrator--stream-event-push-appends ()
+  "A streaming task accumulates one event per stream-json line."
+  (anvil-orchestrator-test--with-fresh
+    (let ((batch (anvil-orchestrator-submit
+                  '((:name "s1" :provider test :prompt "x" :stream t)))))
+      (anvil-orchestrator-test--wait-batch batch)
+      (let* ((id (car (gethash batch anvil-orchestrator--batches)))
+             (events (anvil-orchestrator-stream id)))
+        ;; Default stub emits assistant + result (2 JSON lines).
+        (should (>= (length events) 2))
+        (should (equal "assistant" (plist-get (nth 0 events) :type)))
+        (should (equal "result"    (plist-get (nth 1 events) :type)))
+        (should (plist-get (nth 0 events) :data))
+        ;; Seq counter begins at 0 and increments monotonically.
+        (should (= 0 (plist-get (nth 0 events) :seq)))
+        (should (= 1 (plist-get (nth 1 events) :seq)))))))
+
+(ert-deftest anvil-orchestrator--stream-compress-overflow ()
+  "Overflow compresses oldest uncompressed events; count/seq/ts preserved."
+  (let* ((now (float-time))
+         (events (cl-loop for i below 10
+                          collect (list :seq i :ts now :type "x"
+                                        :data `(:i ,i) :line "body")))
+         (capped (anvil-orchestrator--stream-compress-overflow events 3)))
+    (should (= 10 (length capped)))
+    ;; Oldest 7 are compressed, newest 3 keep bodies.
+    (should (plist-get (nth 0 capped) :compressed))
+    (should (plist-get (nth 6 capped) :compressed))
+    (should-not (plist-get (nth 7 capped) :compressed))
+    (should-not (plist-get (nth 9 capped) :compressed))
+    ;; Seq + ts survive.
+    (should (= 0 (plist-get (nth 0 capped) :seq)))
+    (should (= 9 (plist-get (nth 9 capped) :seq)))
+    (should (eq now (plist-get (nth 0 capped) :ts)))
+    ;; Body gone on compressed entries.
+    (should-not (plist-get (nth 0 capped) :data))
+    (should-not (plist-get (nth 0 capped) :line))
+    ;; A second pass is a no-op (already at cap).
+    (let ((re-capped (anvil-orchestrator--stream-compress-overflow capped 3)))
+      (should (equal capped re-capped)))))
+
+(ert-deftest anvil-orchestrator--stream-since-seq-filters ()
+  "anvil-orchestrator-stream :since-seq returns only strictly-newer events."
+  (anvil-orchestrator-test--with-fresh
+    (let ((task (list :id "sid" :batch-id "b" :status 'done :stream t
+                      :stream-events (list (list :seq 0 :ts 1.0 :type "a")
+                                           (list :seq 1 :ts 1.0 :type "b")
+                                           (list :seq 2 :ts 1.0 :type "c")))))
+      (puthash "sid" task anvil-orchestrator--tasks)
+      (should (= 3 (length (anvil-orchestrator-stream "sid"))))
+      (should (= 2 (length (anvil-orchestrator-stream "sid" :since-seq 0))))
+      (should (= 1 (length (anvil-orchestrator-stream "sid" :since-seq 1))))
+      (should (= 0 (length (anvil-orchestrator-stream "sid" :since-seq 2))))
+      ;; :since-seq nil falls through to unfiltered.
+      (should (= 3 (length (anvil-orchestrator-stream "sid" :since-seq nil)))))))
+
+(ert-deftest anvil-orchestrator--stream-tool-wrapper-shape ()
+  "MCP wrapper returns :events / :last-seq / :task-status (string coerce)."
+  (anvil-orchestrator-test--with-fresh
+    (let ((task (list :id "tid" :batch-id "b" :status 'done :stream t
+                      :stream-events (list (list :seq 0 :ts 1.0 :type "a")
+                                           (list :seq 1 :ts 1.0 :type "b")))))
+      (puthash "tid" task anvil-orchestrator--tasks)
+      (let ((r (anvil-orchestrator--tool-stream "tid")))
+        (should (= 2 (length (plist-get r :events))))
+        (should (= 1 (plist-get r :last-seq)))
+        (should (eq 'done (plist-get r :task-status))))
+      ;; since_seq as numeric string drops older events.
+      (let ((r (anvil-orchestrator--tool-stream "tid" "0")))
+        (should (= 1 (length (plist-get r :events))))
+        (should (= 1 (plist-get r :last-seq))))
+      ;; Empty since_seq = no filter.
+      (let ((r (anvil-orchestrator--tool-stream "tid" "")))
+        (should (= 2 (length (plist-get r :events))))))))
+
+(ert-deftest anvil-orchestrator--stream-on-event-callback-invoked ()
+  "`:on-event' fires once per pushed event with (task-id event-plist)."
+  (anvil-orchestrator-test--with-fresh
+    (let* ((calls nil)
+           (cb (lambda (id ev)
+                 (push (cons id (plist-get ev :seq)) calls)))
+           (batch (anvil-orchestrator-submit
+                   `((:name "cb1" :provider test :prompt "x"
+                            :stream t :on-event ,cb)))))
+      (anvil-orchestrator-test--wait-batch batch)
+      (should (>= (length calls) 2))
+      (should (cl-every (lambda (c) (integerp (cdr c))) calls))
+      (should (cl-every (lambda (c) (stringp (car c))) calls)))))
+
+(ert-deftest anvil-orchestrator--stream-non-json-line-recorded-raw ()
+  "Non-JSON output still becomes an event with :line set, :data nil."
+  (anvil-orchestrator-test--with-fresh
+    (anvil-orchestrator-test--register-stub "hello world")
+    (let ((batch (anvil-orchestrator-submit
+                  '((:name "raw1" :provider test :prompt "x" :stream t)))))
+      (anvil-orchestrator-test--wait-batch batch)
+      (let* ((id (car (gethash batch anvil-orchestrator--batches)))
+             (events (anvil-orchestrator-stream id)))
+        (should (>= (length events) 1))
+        (should-not (plist-get (car events) :data))
+        (should (equal "hello world" (plist-get (car events) :line)))))))
+
+(ert-deftest anvil-orchestrator--persist-strips-volatile-fields ()
+  "sanitize-for-persist drops :stream-events / :on-event but keeps core."
+  (let* ((task (list :id "x1" :name "n" :provider 'test :prompt "p"
+                     :stream-events (list (list :seq 0))
+                     :on-event #'identity
+                     :status 'done))
+         (sanitized (anvil-orchestrator--sanitize-for-persist task)))
+    (should (plist-get sanitized :id))
+    (should (plist-get sanitized :provider))
+    (should (plist-get sanitized :status))
+    (should-not (plist-get sanitized :stream-events))
+    (should-not (plist-get sanitized :on-event))))
+
 ;;;; --- DAG resume (Phase 6C'') --------------------------------------------
 
 (defmacro anvil-orchestrator-test--with-pool (tasks &rest body)

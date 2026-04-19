@@ -7,7 +7,7 @@
   :PROPERTIES:
   :ID:       019da30b-92e3-7674-976d-020f7465940b
   :END:
-~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a + 7b SHIPPED (develop branch)~ (2026-04-19)
+~Phase 1a + 1b + 2 + 2b + 3 + 3b + 4 + 4b + 5 + 6C MVP + 6C' + 6C'' + gemma4-strip + observability + glue-helpers + 7a + 7b + 7c SHIPPED (develop branch)~ (2026-04-19)
 
 - Phase 1a (commit 45468b2): provider abstraction, claude provider,
   spawn + sentinel + timeout, pool + concurrency cap, state
@@ -198,6 +198,24 @@ Review Questions Q1-Q12 resolved 状態キープ。
   300 → 4000 に引き上げて common case の再 parse round-trip を排除。
   MCP tools =orchestrator-extract-result / -submit-one / -tail= も同時 land。
   ERT +11。
+
+- Phase 7c (branch feat/orchestrator-phase7c-streaming): stream-json
+  event を live 取得可能に。=--spawn= に恒常 =:filter= attach、task が
+  =:stream t= 指定時のみ行単位で =--stream-push-event= が走り
+  =:stream-events= list に ~(:seq :ts :type :data :line)~ を append。
+  ~anvil-orchestrator-stream (task-id :since-seq)~ で incremental read、
+  MCP tool =orchestrator-stream= 同時 land。=:on-event CB= callback は
+  in-memory only で filter から =(funcall CB task-id event-plist)= を
+  invoke。RAM cap =anvil-orchestrator-stream-max-events= (既定 500)、
+  超過時は最古 event の body を discard して =:seq :ts :compressed t=
+  marker のみ残す。Volatile fields 分離のため新 const
+  =--volatile-task-fields= + helper =--sanitize-for-persist= +
+  =--task-update-volatile= in-memory-only update を追加、SQLite write
+  を per-event で撃たずに完結。submit-one / submit-and-collect 両 API
+  に =:stream= / =:on-event= 通し。ERT +8 (opt-in default / event push /
+  cap compress / since-seq / MCP shape / callback / non-JSON raw /
+  persist strips volatile) = 161 pass / 1 skip in
+  anvil-orchestrator-test.el, 497 pass / 5 skip across suite。
 
 - Phase 7b (branch feat/orchestrator-phase7b-preamble): 共通 context
   preamble の KV 登録 + ~:preamble-ref~ による prompt 冒頭 inject。
@@ -959,28 +977,45 @@ Phase 7 はこの 3 項目を sub-phase に分けて潰す。
 forms including errors / coerce-task prepend+drop).  Total
 489 / 484 pass / 0 fail / 5 skip across the suite.
 
-*** Phase 7c — live streaming (所要 1-2 日)
+*** Phase 7c — live streaming *SHIPPED* (2026-04-19)
 
 **Scope:**
-- claude CLI は ~--output-format stream-json~ で 1 行 1 event、既に parser
-  あり。現状は sentinel 完了時に最終 message を抽出するのみ
-- partial-output を task state (~:stream-events~ list) に push、~tail~ では
-  stderr-file 読みだが、新 API ~orchestrator-stream~ で accumulated events
-  を取れる
-- ~:on-event CALLBACK~ option で Elisp hook も流す (dashboard live update、
-  parent Claude session への通知 hook 等)
-- MCP tool ~orchestrator-stream~ は since-seq 指定の増分 read
+- ~--spawn~ に恒常的 ~:filter~ attach (~--process-filter~)。buffer insert を
+  デフォルト挙動と等価に replay しつつ、task の ~:stream t~ 時に行単位で
+  ~--stream-push-event~ を叩く。既存 ~--finalize~ の post-mortem parse は無改修
+- ~--stream-push-event~ が JSON 行を ~plist~ parse し
+  ~:seq/:ts/:type/:data/:line~ を新規 event として ~:stream-events~ list に append。
+  JSON でない行も ~:data nil :line <raw>~ で保存 (ollama / claude 以外の provider 対応)
+- RAM cap ~anvil-orchestrator-stream-max-events~ (既定 500) + helper
+  ~--stream-compress-overflow~ で最古 event の body を discard、
+  ~:seq/:ts/:compressed t~ のみ残して count 整合性維持
+- 公開 Elisp API: ~anvil-orchestrator-stream (task-id &key since-seq)~ —
+  since-seq 指定時は厳密 ~>~ で新規 event のみ返す incremental read
+- MCP tool ~orchestrator-stream~ (read-only) が ~(:events L :last-seq N
+  :task-status S)~ plist を返す、since_seq は string coerce 可
+- ~:on-event CB~ callback option: submit-one / submit-and-collect 両 API 面で
+  受け取り、filter から ~(funcall CB task-id event-plist)~ を ignore-errors 内で
+  呼ぶ。in-memory only (function は prin1-roundtrip 不可なので persist 対象外)
+- Volatile fields 分離機構: 新 const ~--volatile-task-fields~ = ~(:stream-events
+  :on-event)~ + helper ~--sanitize-for-persist~ + 新 ~--task-update-volatile~
+  in-memory-only update。SQLite row の bloat と per-event write 多発を同時回避
 
-**Decisions:**
-1. memory 書き込み量を cap (~anvil-orchestrator-stream-max-events~ 既定 500、
-   超過時は圧縮: 古い event の body を discard、meta のみ保持)
-2. stream は opt-in (~:stream t~ 指定時のみ parser が event push)、default off で
-   互換性維持
-3. provider 対応は claude 先行、他 provider は next phase
-4. dashboard は Phase 7c 完了で auto-refresh に昇格 (filenotify or timer)
+**Decisions (SHIPPED):**
+1. memory cap 既定 500、超過時は ~:seq/:ts/:compressed t~ marker のみ残す
+2. stream は opt-in (~:stream t~ 指定時のみ filter が push)、default off で
+   従来 task 挙動と完全互換
+3. provider agnostic — claude (stream-json)、ollama / aider / codex (plain text)
+   の全 provider で動作。JSON parse 失敗時は raw ~:line~ に格納
+4. filter は恒常 attach、条件分岐は filter 内で行う (make-process 呼び出し
+   site の複雑化を回避、1 plist-get のオーバーヘッドは microsec)
+5. ~:on-event~ は in-memory only、daemon restart で消える (task も
+   ~:interrupted t~ flip するので stream は実質終了、整合)
+6. dashboard の auto-refresh 昇格は deferred — Phase 7c は基盤整備のみ
 
-**Tests:** +8 ERT (event push / cap / since-seq / MCP tool / opt-in default /
-callback invocation / multi-provider stub / overflow discard)
+**Tests:** +8 ERT (opt-in default off / event push append / compress overflow
+/ since-seq filter / MCP wrapper shape / on-event callback invocation /
+non-JSON raw line / persist strips volatile) = 161 pass / 1 skip in
+anvil-orchestrator-test.el, 497 pass / 5 skip across the suite.
 
 *** Phase 7 全体 依存関係
 

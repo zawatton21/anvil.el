@@ -212,6 +212,15 @@ support.  Override per task with `:no-worktree t'."
   :type 'integer
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-stream-max-events 500
+  "Maximum number of full `:stream-events' retained per task (Phase 7c).
+When a streaming task emits more than this, the oldest uncompressed
+events have their `:data' / `:line' / `:type' bodies discarded; the
+`:seq' / `:ts' / `:compressed t' trio survives so callers can still
+see how many events were truncated."
+  :type 'integer
+  :group 'anvil-orchestrator)
+
 ;;;; --- provider abstraction ----------------------------------------------
 
 (cl-defstruct anvil-orchestrator-provider
@@ -1005,12 +1014,29 @@ malformed lines so a partial stream does not poison the summary."
 
 ;;;; --- state persistence -------------------------------------------------
 
+(defconst anvil-orchestrator--volatile-task-fields
+  '(:stream-events :on-event)
+  "Task plist keys kept in-memory only (Phase 7c).
+Stripped before `anvil-state' persistence because (a) they grow
+unbounded under streaming, swamping SQLite writes, and (b)
+`:on-event' holds a function object that is not `read'-roundtrip
+safe through prin1.  Recovery after a daemon restart reasonably
+loses these — the task flips to `failed :interrupted t' anyway.")
+
+(defun anvil-orchestrator--sanitize-for-persist (task)
+  "Return a copy of TASK with volatile fields stripped."
+  (cl-loop for (k v) on task by #'cddr
+           unless (memq k anvil-orchestrator--volatile-task-fields)
+           append (list k v)))
+
 (defun anvil-orchestrator--persist (task)
   "Write TASK plist to `anvil-state'.  Returns TASK."
   (let ((id (plist-get task :id)))
     (when id
       (ignore-errors
-        (anvil-state-set id task :ns anvil-orchestrator--state-ns))
+        (anvil-state-set id
+                         (anvil-orchestrator--sanitize-for-persist task)
+                         :ns anvil-orchestrator--state-ns))
       (puthash id task anvil-orchestrator--tasks))
     task))
 
@@ -1029,6 +1055,136 @@ malformed lines so a partial stream does not poison the summary."
           (setq task (plist-put task (car tail) (cadr tail)))
           (setq tail (cddr tail))))
       (anvil-orchestrator--persist task))))
+
+(defun anvil-orchestrator--task-update-volatile (id &rest updates)
+  "Apply keyword UPDATES to task ID in-memory only.  No SQLite write.
+Used for `:stream-events' (Phase 7c) and other high-frequency
+volatile fields to keep per-event cost at the hash-table level."
+  (let ((task (gethash id anvil-orchestrator--tasks)))
+    (when task
+      (let ((tail updates))
+        (while tail
+          (setq task (plist-put task (car tail) (cadr tail)))
+          (setq tail (cddr tail))))
+      (puthash id task anvil-orchestrator--tasks))))
+
+;;;; --- Phase 7c: live streaming ------------------------------------------
+;;
+;; Opt-in per task via `:stream t'.  The filter is always attached at
+;; spawn time — non-streaming tasks pay the cost of one cheap plist
+;; lookup per chunk to decide that no event push is needed, versus the
+;; branching complexity of two separate `make-process' call sites.
+;;
+;; Memory discipline: events accrue into `:stream-events' which is
+;; declared volatile (see `--volatile-task-fields'), so the SQLite
+;; row is never bloated by per-chunk output.  A soft cap
+;; `anvil-orchestrator-stream-max-events' compresses oldest events to
+;; metadata-only (`:seq' / `:ts' / `:compressed t') so a runaway
+;; provider cannot blow RAM unbounded either.
+
+(defun anvil-orchestrator--stream-compress-overflow (events max-n)
+  "Return EVENTS with oldest uncompressed entries compressed down to
+`:seq' / `:ts' / `:compressed t' so at most MAX-N full entries remain.
+Order is preserved; count is preserved; only body is discarded."
+  (let* ((uncompressed (cl-count-if-not (lambda (e) (plist-get e :compressed))
+                                        events))
+         (to-compress (max 0 (- uncompressed max-n)))
+         (remaining to-compress))
+    (if (zerop to-compress)
+        events
+      (mapcar (lambda (e)
+                (cond
+                 ((plist-get e :compressed) e)
+                 ((> remaining 0)
+                  (setq remaining (1- remaining))
+                  (list :seq (plist-get e :seq)
+                        :ts  (plist-get e :ts)
+                        :compressed t))
+                 (t e)))
+              events))))
+
+(defun anvil-orchestrator--stream-push-event (id line)
+  "Parse LINE as one stream-json event and append to TASK ID's events.
+Silently no-ops when ID is unknown, when the task does not opt into
+streaming (`:stream' nil), or when the line is empty.  Invokes
+`:on-event' (held in-memory) for each pushed event."
+  (when (and id line (not (string-empty-p line)))
+    (let ((task (gethash id anvil-orchestrator--tasks)))
+      (when (and task (plist-get task :stream))
+        (let* ((data (condition-case _err
+                         (json-parse-string line
+                                            :object-type 'plist
+                                            :array-type  'list
+                                            :null-object nil
+                                            :false-object nil)
+                       (error nil)))
+               (type (and (listp data) (plist-get data :type)))
+               (events (plist-get task :stream-events))
+               (seq (length events))
+               (event (list :seq  seq
+                            :ts   (float-time)
+                            :type type
+                            :data data
+                            :line line))
+               (new-events (append events (list event)))
+               (capped (anvil-orchestrator--stream-compress-overflow
+                        new-events anvil-orchestrator-stream-max-events)))
+          (anvil-orchestrator--task-update-volatile
+           id :stream-events capped)
+          (let ((cb (plist-get task :on-event)))
+            (when (functionp cb)
+              (condition-case _err
+                  (funcall cb id event)
+                (error nil)))))))))
+
+(defun anvil-orchestrator--process-filter (proc chunk)
+  "Process filter that mirrors the default buffer behaviour and, when
+the owning task has `:stream t', splits CHUNK into newline-delimited
+events to push via `--stream-push-event'.  The buffer insert path
+keeps the existing post-mortem `--finalize' parse intact."
+  ;; 1. Default-filter emulation — append CHUNK at the process mark.
+  ;;    Without this, :filter overrides Emacs' built-in buffer fill
+  ;;    and `--finalize' finds an empty buffer.
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((moving (= (point) (process-mark proc))))
+        (save-excursion
+          (goto-char (process-mark proc))
+          (insert chunk)
+          (set-marker (process-mark proc) (point)))
+        (when moving (goto-char (process-mark proc))))))
+  ;; 2. Line-delimited stream event extraction (opt-in per task).
+  (let ((id (process-get proc 'anvil-task-id)))
+    (when id
+      (let* ((accum (concat (or (process-get proc 'anvil-stream-accum) "")
+                            chunk))
+             (lines nil)
+             (pos 0))
+        (while (string-match "\n" accum pos)
+          (push (substring accum pos (match-beginning 0)) lines)
+          (setq pos (match-end 0)))
+        (process-put proc 'anvil-stream-accum (substring accum pos))
+        (dolist (line (nreverse lines))
+          (anvil-orchestrator--stream-push-event id line))))))
+
+;;;###autoload
+(cl-defun anvil-orchestrator-stream (task-id &key since-seq)
+  "Return the `:stream-events' recorded for TASK-ID, newest last.
+When :SINCE-SEQ is a non-negative integer, only events with
+`:seq' strictly greater than SINCE-SEQ are returned — the common
+incremental-read idiom for dashboards and parent-session polls.
+Returns nil when TASK-ID is unknown or has no events.
+
+Phase 7c: the task must have been submitted with `:stream t' for
+this list to accumulate; non-streaming tasks return nil."
+  (let* ((task (anvil-orchestrator--task-get task-id))
+         (events (and task (plist-get task :stream-events)))
+         (since (and (integerp since-seq) since-seq)))
+    (if since
+        (cl-remove-if-not
+         (lambda (e) (> (plist-get e :seq) since))
+         events)
+      events)))
 
 (defun anvil-orchestrator--restore-from-state ()
   "Re-hydrate task records from anvil-state into memory.
@@ -1221,6 +1377,7 @@ stream-json NDJSON survives round-trip."
                 :connection-type 'pipe
                 :coding   'utf-8-unix
                 :noquery  t
+                :filter   #'anvil-orchestrator--process-filter
                 :sentinel #'anvil-orchestrator--sentinel)))
     ;; Providers pass the prompt via argv, not stdin; ollama / claude
     ;; wait on the input pipe indefinitely if we leave it open, so the
@@ -2721,7 +2878,7 @@ majority of single-turn responses."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-one
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref)
+          preamble-ref stream on-event)
   "Submit a single task and return its task-id (not the batch-id).
 
 A light convenience over `anvil-orchestrator-submit' for the
@@ -2734,7 +2891,15 @@ retry, and budget rules as any other batch.
 
 :preamble-ref accepts a preamble key string (or list of strings)
 registered via `anvil-orchestrator-preamble-set'; the stored text
-is prepended to PROMPT at submit time (Phase 7b)."
+is prepended to PROMPT at submit time (Phase 7b).
+
+:stream (Phase 7c) opts the task into live per-line event capture.
+With :stream t, every newline-delimited chunk of stdout is parsed
+as JSON (claude stream-json format is the native fit) and pushed
+onto the task's `:stream-events' list, readable via
+`anvil-orchestrator-stream'.  :on-event FN registers an Elisp
+callback invoked with `(task-id event-plist)' for each pushed
+event; the callback lives in-memory only and is not persisted."
   (unless (and provider prompt)
     (user-error "submit-one: :provider and :prompt are required"))
   (let* ((auto-name (or name
@@ -2751,7 +2916,9 @@ is prepended to PROMPT at submit time (Phase 7b)."
                        (when budget-usd  (list :budget-usd budget-usd))
                        (when timeout-sec (list :timeout-sec timeout-sec))
                        (when preamble-ref
-                         (list :preamble-ref preamble-ref))))
+                         (list :preamble-ref preamble-ref))
+                       (when stream      (list :stream t))
+                       (when on-event    (list :on-event on-event))))
          (batch-id (anvil-orchestrator-submit (list task)))
          (ids      (gethash batch-id anvil-orchestrator--batches)))
     (car ids)))
@@ -2759,7 +2926,7 @@ is prepended to PROMPT at submit time (Phase 7b)."
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-and-collect
     (&key provider prompt model name cwd budget-usd timeout-sec
-          preamble-ref
+          preamble-ref stream on-event
           (collect-timeout-sec 180) (poll-interval-sec 0.5) full)
   "Submit a single task and wait (non-blocking) for its result.
 
@@ -2769,8 +2936,8 @@ poll + `anvil-orchestrator-extract-result' so short-running tasks
 submit → poll → tail → extract hop chain.
 
 :provider / :prompt are forwarded to `submit-one'; :model / :name
-/ :cwd / :budget-usd / :timeout-sec / :preamble-ref likewise when
-non-nil.
+/ :cwd / :budget-usd / :timeout-sec / :preamble-ref / :stream /
+:on-event likewise when non-nil.
 
 :collect-timeout-sec (default 180) is the wall-clock cap on the
 poll loop.  :poll-interval-sec (default 0.5) tunes the
@@ -2792,7 +2959,9 @@ re-collect via `extract-result' later."
                    :cwd cwd
                    :budget-usd budget-usd
                    :timeout-sec timeout-sec
-                   :preamble-ref preamble-ref))
+                   :preamble-ref preamble-ref
+                   :stream stream
+                   :on-event on-event))
          (deadline (+ (float-time) collect-timeout-sec)))
     (while (let ((task (anvil-orchestrator--task-get task-id)))
              (and task
@@ -2942,6 +3111,38 @@ MCP Parameters:
                        :stream (or stream "stdout")
                        :bytes n)
                       "")))))
+
+(defun anvil-orchestrator--tool-stream (task_id &optional since_seq)
+  "MCP wrapper for `anvil-orchestrator-stream' (Phase 7c).
+
+Returns a plist `(:events LIST :last-seq N :task-status STATUS)'
+where LIST contains each event's :seq / :ts / :type / :data / :line
+(or :seq / :ts / :compressed t for overflow-compressed entries).
+LAST-SEQ is the highest seq returned or nil when LIST is empty.
+TASK-STATUS echoes the task's current status so callers can stop
+polling after terminal transitions.
+
+MCP Parameters:
+  task_id   - Task id string.  Required.
+  since_seq - Optional integer-as-string.  When supplied, only events
+              with seq > since_seq are returned; the typical
+              incremental-read pattern.  Empty / non-numeric =
+              return all events."
+  (anvil-server-with-error-handling
+    (let* ((since (and since_seq
+                       (stringp since_seq)
+                       (not (string-empty-p since_seq))
+                       (let ((n (string-to-number since_seq)))
+                         (and (integerp n) n))))
+           (events (anvil-orchestrator-stream
+                    task_id
+                    :since-seq since))
+           (task   (anvil-orchestrator--task-get task_id))
+           (last   (and events
+                        (plist-get (car (last events)) :seq))))
+      (list :events      (or events (list))
+            :last-seq    last
+            :task-status (and task (plist-get task :status))))))
 
 ;;;; --- Phase 7b: context preamble registry -------------------------------
 ;;
@@ -3376,7 +3577,20 @@ Read-only snapshot, sorted by key."
    :server-id anvil-orchestrator--server-id
    :description
    "Remove the preamble registered under KEY.  Returns
-:deleted t when a row existed, :deleted nil when KEY was absent."))
+:deleted t when a row existed, :deleted nil when KEY was absent.")
+
+  (anvil-server-register-tool
+   #'anvil-orchestrator--tool-stream
+   :id "orchestrator-stream"
+   :server-id anvil-orchestrator--server-id
+   :description
+   "Return the live stream-event list recorded for TASK_ID
+(Phase 7c).  Tasks must have been submitted with :stream t for
+events to accumulate — otherwise returns an empty list.  Optional
+since_seq returns only events with seq > since_seq (incremental
+poll idiom for dashboards / parent session notifications).
+Response plist includes :events / :last-seq / :task-status."
+   :read-only t))
 
 (defun anvil-orchestrator--unregister-tools ()
   (dolist (id '("orchestrator-submit" "orchestrator-status"
@@ -3396,7 +3610,8 @@ Read-only snapshot, sorted by key."
                 "orchestrator-preamble-set"
                 "orchestrator-preamble-get"
                 "orchestrator-preamble-list"
-                "orchestrator-preamble-delete"))
+                "orchestrator-preamble-delete"
+                "orchestrator-stream"))
     (anvil-server-unregister-tool id anvil-orchestrator--server-id)))
 
 ;;;###autoload
