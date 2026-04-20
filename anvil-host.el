@@ -61,7 +61,17 @@ on Japanese Windows. Other OSes default to utf-8."
 
 (defun anvil-host--run (command coding cwd timeout)
   "Run COMMAND in shell asynchronously and wait up to TIMEOUT seconds.
-Returns (EXIT STDOUT STDERR). Errors on timeout."
+Returns (EXIT STDOUT STDERR). Errors on timeout.
+
+`:connection-type' is forced to `pipe' (rather than the Emacs default
+PTY).  With a PTY the spawned shell becomes a session leader, and
+when the shell exits the kernel sends SIGHUP to every process in
+that session — which kills detached / disowned / nohup'd background
+descendants that clipboard helpers such as `wl-copy' rely on (see
+issue #10).  Pipe mode leaves the shell in Emacs's session; detached
+children survive the shell exiting.  `isatty(0/1/2)' becomes false
+for the shell and its children, but the helpers we invoke (wmic /
+wl-copy / xclip / pbcopy / ...) are all fine with non-tty I/O."
   (let* ((stdout-buf (generate-new-buffer " *anvil-host-stdout*"))
          (stderr-buf (generate-new-buffer " *anvil-host-stderr*"))
          (default-directory (or cwd default-directory))
@@ -77,6 +87,7 @@ Returns (EXIT STDOUT STDERR). Errors on timeout."
                  :buffer stdout-buf
                  :stderr stderr-buf
                  :noquery t
+                 :connection-type 'pipe
                  ;; Emacs' default process sentinel writes a
                  ;; "Process NAME finished" status line into the
                  ;; process buffer on exit, which then shows up in
