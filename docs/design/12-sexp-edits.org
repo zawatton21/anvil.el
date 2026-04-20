@@ -7,7 +7,13 @@
   :PROPERTIES:
   :ID:       192939f5-33ad-4c4d-bd26-737ee1292895
   :END:
-~DRAFT~ (revised 2026-04-19)
+~Phase 1 + 2a + 2b SHIPPED~ (2026-04-19 / 2026-04-20, develop branch)
+— commits ~49a02bd~ (Phase 1 initial) + ~a49200a~ / ~87e82a2~
+(Phase 1 follow-ups) + ~6957a1d~ (Phase 2a reader-only
+rename-symbol / replace-call) + ~64240fb~ (Phase 2a review
+fixes) + ~4c66560~ (Phase 2b Doc 11 fast path + walker fix) +
+~33ba85d~ (Phase 2b consensus review fixes).  Full suite at
+616 ERT cases after ship; anvil-sexp-test.el alone carries 48.
 
 Tier 1 of Week-2 roadmap.  Phase 1 is independent; rename-symbol in
 Phase 2 depends on Doc 11 (anvil-defs) for reference discovery.
@@ -20,11 +26,9 @@ languages (TS / Python / Rust / Go), but belongs to a separate
 module (see ~Out of scope / future~).  Rationale in ~Why reader-only
 for elisp~ below.
 
-/Revision 2026-04-19 (late):/ Phase 1 SHIPPED (develop @ 87e82a2,
-28 ERT cases, 524/529 full suite green).  Phase 2 split into
-Phase 2a (reader-only, no Doc 11 dependency) and Phase 2b (Doc 11
-backend swap) so the dogfood rename-symbol can land before Doc 11
-is built.
+/Revision 2026-04-19 (mid):/ Phase 2 split into Phase 2a (reader-only,
+no Doc 11 dependency) and Phase 2b (Doc 11 backend swap) so the
+dogfood rename-symbol can land before Doc 11 is built.
 
 * Vision — elisp as AI's primary language
 

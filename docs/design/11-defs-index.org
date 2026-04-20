@@ -7,19 +7,18 @@
   :PROPERTIES:
   :ID:       6f61ae23-9615-4632-8ba8-5f734a973d65
   :END:
-~DRAFT~ (revised 2026-04-19)
+~Phase 1 + 2 (minus filenotify) SHIPPED~ (2026-04-19, develop branch)
+— commits ~283a8fb~ (Phase 1+2 initial) + ~4c66560~ (Phase 2b fast
+path via ~anvil-sexp~) + ~33ba85d~ (consensus review fixes).
+Phase 3 (filenotify incremental updates) and Phase 4 (macro expansion)
+are deferred to a separate ship cycle.  Reader helpers are taken
+directly from `anvil-sexp' (Doc 12 Phase 1 / 2a) so we do not duplicate
+top-level form parsing or kind classification.
 
 Tier 1 of Week-2 roadmap.  Sister to Doc 02 (anvil-org-index) but for
 elisp.  Provides the SQLite-backed symbol index that Doc 12 (sexp
 edits), Doc 13 (bisect), Doc 14 (bench), Doc 16 (lint), Doc 19 (pair)
 all query against.
-
-/Revision 2026-04-19 (late):/ scope for the initial ship narrowed to
-"Phase 1 + Phase 2 minus filenotify" — enough to unblock Doc 12 Phase 2b.
-Phase 3 (filenotify incremental updates) and Phase 4 (macro expansion)
-are deferred to a separate ship cycle.  Reader helpers are taken
-directly from `anvil-sexp' (Doc 12 Phase 1 / 2a) so we do not duplicate
-top-level form parsing or kind classification.
 
 * Motivation
 

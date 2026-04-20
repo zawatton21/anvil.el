@@ -55,7 +55,7 @@ Tier 1 から順に実装。Tier 1 完了で Claude の tool hop が構造的に
 | #  | Doc                                         | 依存           | 想定工数 | Tier | 状態  |
 |----+---------------------------------------------+----------------+----------+------+-------|
 | 11 | [[file:11-defs-index.org][Elisp Symbol Index]]                          | なし           | 中       | 1    | Ph1+2 SHIPPED |
-| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits (elisp, reader-only)]]       | 11 (Ph2b)      | 中       | 1    | Ph1+2a SHIPPED |
+| 12 | [[file:12-sexp-edits.org][Sexp / AST Edits (elisp, reader-only)]]       | 11 (Ph2b)      | 中       | 1    | Ph1+2a+2b SHIPPED |
 | 13 | [[file:13-bisect.org][Test-Driven Bisect]]                          | 01             | 小       | 1    | Ph1 SHIPPED |
 | 14 | [[file:14-bench-profile.org][Bench + Profile]]                             | なし           | 小       | 2    | DRAFT |
 | 15 | [[file:15-git-msg.org][Commit / PR Synthesis]]                       | なし           | 小       | 2    | DRAFT |

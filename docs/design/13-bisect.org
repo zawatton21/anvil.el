@@ -7,7 +7,9 @@
   :PROPERTIES:
   :ID:       bf0c3afa-2f59-4718-a679-b15619dccb88
   :END:
-~DRAFT~ (2026-04-19)
+~Phase 1 SHIPPED~ (2026-04-19, develop branch) — commits ~8e836c7~
+(Phase 1 initial) + ~19c655d~ (consensus review fixes).  16 ERT
+cases in ~anvil-bisect-test.el~.
 
 Tier 1 of Week-2 roadmap.  Automates ~git bisect~ against ERT tests
 (or arbitrary elisp expressions) so "what broke this?" becomes a
