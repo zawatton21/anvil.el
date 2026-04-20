@@ -867,10 +867,14 @@ MCP Parameters: (none)"
    :id "defs-search"
    :server-id anvil-defs--server-id
    :description
-   "Search the elisp symbol index for defining forms (defun, defvar,
+   "Layer 2 of anvil progressive disclosure (see `disclosure-help').
+Search the elisp symbol index for defining forms (defun, defvar,
 defmacro, cl-defun, ...).  Exact match by default; pass fuzzy=t
 for substring matching.  Restrict by kind with a comma-separated
-list.  1 hop for \"where is X defined?\"."
+list.  Each row carries :file + :line and can be turned into a
+`defs://0/SYM' citation URI (see also `defs-index' Layer 1 for a
+slim listing).  Escalate to Layer 3 (`elisp-get-function-definition')
+once you picked the definition."
    :read-only t)
 
   (anvil-server-register-tool

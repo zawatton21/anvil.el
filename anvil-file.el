@@ -1057,22 +1057,51 @@ MCP Parameters:
                                           (string-to-number start-line)
                                           (string-to-number end-line)))))
 
+(defun anvil-file--tool-read--strip-uri (path offset limit)
+  "Return (PATH OFFSET LIMIT) with `file://' citation URI expanded.
+When PATH is a `file://PATH[#L<s>[-<e>]]' URI the scheme is stripped,
+and if the URI carries a line range it seeds OFFSET (start-1) and
+LIMIT (end-start+1) when the caller did not supply explicit values."
+  (if (and (stringp path) (string-prefix-p "file://" path))
+      (let* ((parsed (and (fboundp 'anvil-uri-parse)
+                          (anvil-uri-parse path))))
+        (if parsed
+            (let* ((p  (plist-get parsed :path))
+                   (s  (plist-get parsed :line-start))
+                   (e  (plist-get parsed :line-end))
+                   (o  (or offset
+                           (and s (number-to-string (max 0 (1- s))))))
+                   (l  (or limit
+                           (and s e
+                                (number-to-string
+                                 (max 1 (1+ (- e s))))))))
+              (list p o l))
+          ;; Fallback: naive prefix strip.
+          (list (substring path (length "file://")) offset limit)))
+    (list path offset limit)))
+
 (defun anvil-file--tool-read (path &optional offset limit)
   "Read file at PATH and return its content.
-Supports optional line-based pagination.
+Supports optional line-based pagination.  PATH may also be a
+`file://PATH[#L<s>-<e>]' citation URI emitted by the disclosure
+Layer-1 / Layer-2 tools; the embedded line range seeds offset/limit
+when the caller did not supply them.
 
 MCP Parameters:
-  path - Absolute path to the file to read
+  path - Absolute path to the file to read (or `file://' citation URI)
   offset - Lines to skip from start (optional, 0-indexed, e.g. \"100\")
   limit - Maximum lines to return (optional, e.g. \"50\")"
   (anvil-server-with-error-handling
-    (let ((off (if (and offset (not (string-empty-p offset)))
-                   (string-to-number offset)
-                 nil))
-          (lim (if (and limit (not (string-empty-p limit)))
-                   (string-to-number limit)
-                 nil)))
-      (format "%S" (anvil-file-read path off lim)))))
+    (require 'anvil-uri nil t)
+    (pcase-let ((`(,p ,off-str ,lim-str)
+                 (anvil-file--tool-read--strip-uri path offset limit)))
+      (let ((off (if (and off-str (not (string-empty-p off-str)))
+                     (string-to-number off-str)
+                   nil))
+            (lim (if (and lim-str (not (string-empty-p lim-str)))
+                     (string-to-number lim-str)
+                   nil)))
+        (format "%S" (anvil-file-read p off lim))))))
 
 (defun anvil-file--tool-append (path content)
   "Append CONTENT to end of file at PATH.
@@ -2294,9 +2323,14 @@ Safe for files over 1.2MB."
    #'anvil-file--tool-read
    :id "file-read"
    :description
-   "Read file contents with optional line-based pagination.
-Returns the file content as a string.  For large files, use offset
-and limit to read specific sections."
+   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
+Read file contents with optional line-based pagination.  Accepts
+either a plain absolute path or a `file://PATH[#L<start>[-<end>]]'
+citation URI emitted by Layer 1 (`file-outline') / Layer 2
+(`file-read-snippet') — the URI's line range becomes the default
+offset/limit.  Returns the file content as a string.  For large
+files, use `file-read-snippet' (Layer 2) or pass offset/limit to
+read specific sections."
    :read-only t
    :server-id anvil-file--server-id)
 
@@ -2364,11 +2398,14 @@ coordinated multi-file refactors."
    #'anvil-file--tool-outline
    :id "file-outline"
    :description
-   "Return a compact structural outline of a file without reading
-its body.  Infers format from extension (.el / .org / .md) or accepts
-a format= override.  Emits (:kind :name :line) entries for Elisp
-def-forms, org headlines, or Markdown headings.  Use this to orient
-in large files before deciding what to Read."
+   "Layer 1 of anvil progressive disclosure (see `disclosure-help').
+Return a compact structural outline of a file without reading its
+body.  Infers format from extension (.el / .org / .md) or accepts a
+format= override.  Emits (:kind :name :line) entries for Elisp
+def-forms, org headlines, or Markdown headings.  Use this FIRST
+to orient in large files before deciding whether to escalate to
+Layer 2 (`file-read-snippet') or Layer 3 (`file-read').  Tool
+descriptions and disclosure-help cover the full contract."
    :read-only t
    :offload t
    :server-id anvil-file--server-id)

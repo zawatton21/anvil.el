@@ -11,11 +11,18 @@
 ~APPROVED~ (2026-04-20) — Week-3 Ship 3, 競合 token-savior の
 =memory_index= → =memory_search= → =memory_get= 3 層契約を
 anvil-org-index / anvil-defs / anvil-file に移植。
-*Phase 1 SHIPPED* (feat/doc-28-progressive-disclosure): citation URI
-scheme + =org-index-index= (Layer 1) + =disclosure-help= tool +
-=org-index-search= (Layer 2) / =org-read-by-id= (Layer 3) の
-description 更新 + 23 ERT (anvil-uri 15 + anvil-disclosure 8) 全 pass。
-Phase 2 (file / defs 3 層化) 未着手。
+*Phase 1 + Phase 2 SHIPPED* (develop に merge 済):
+- Phase 1: citation URI scheme + =org-index-index= (Layer 1) +
+  =disclosure-help= tool + =org-index-search= (Layer 2) /
+  =org-read-by-id= (Layer 3) description + URI auto-strip。
+- Phase 2: =file-read-snippet= (Layer 2 for files) + =defs-index=
+  (Layer 1 for defs) + =file-outline= / =file-read= / =defs-search= /
+  =elisp-get-function-definition= の Layer 1/2/3 description 統一 +
+  =file://= / =defs://= citation URI auto-strip (file-read,
+  elisp-get-function-definition)。
+- 全体 ERT: anvil-uri 15 + anvil-disclosure 26 = 41。全 pass。
+Phase 3 (cross-layer =anvil-uri-fetch= resolver) + Phase 4
+(journal / http-cache) 未着手。
 
 * Motivation
 
@@ -210,18 +217,49 @@ develop merge 後に残タスクとして:
 - file/defs tool description の Layer 表記統一 (Phase 2 前哨)。
 - =README.org= の Week-3 section に Layer 1/2/3 table を追記。
 
-** Phase 2 — file / defs 3 層化
+** Phase 2 — file / defs 3 層化 (~SHIPPED 2026-04-20~)
 
-=file-outline= (既存) が Layer 1、=file-read-snippet= 新設
-(Layer 2)、=file-read= が Layer 3。
-=defs-index= 新設、=defs-search= と =elisp-get-function-definition=
-の 3 層構成。
+Ship 内容 (feat/doc-28-phase2-file-defs):
 
-** Phase 3 — cross-layer resolver
+1. =file-read-snippet= 新設 (Layer 2 for files)。path + line +
+   window (default 20、max 100) を受けて =file://PATH#L<s>-<e>=
+   citation URI 付きの window 抜粋を返す。=anvil-file-read-region=
+   に delegate。bottom-edge では start を上方 shift して window
+   を満たす (=anvil-disclosure--snippet-bounds= が担当)。
+2. =defs-index= 新設 (Layer 1 for defs)。query (fuzzy) に対して
+   =anvil-defs-search= を delegate し =(:id defs://0/SYM :symbol :file
+   :kind)= に slim。SHA segment は Phase 2 では ="0"= placeholder
+   (=anvil-disclosure--defs-sha-placeholder= で集中管理)。
+3. =file-outline= description を Layer 1 template に、=file-read= を
+   Layer 3 template に更新。
+4. =file-read= が =file://PATH[#L<s>-<e>]= URI を受け取ると scheme を
+   strip し、range があれば offset/limit を自動計算
+   (=anvil-file--tool-read--strip-uri= helper)。caller 指定の
+   offset/limit は URI より優先。
+5. =defs-search= description を Layer 2 template に、
+   =elisp-get-function-definition= を Layer 3 template に更新。
+6. =elisp-get-function-definition= が =defs://SHA/SYM= を受け取ると
+   SHA を無視して SYM を解決 (=anvil-elisp--strip-defs-uri= helper)。
+7. =disclosure-help= 本文を Phase 2 tool (=file-read-snippet=、
+   =defs-index=、=file-outline= Layer 1 化) に追従。
+8. ERT: 18 件追加 (snippet bounds / clamp / file-read-snippet round-
+   trip / truncated / defs projection / defs-index handler /
+   empty-query guard / defs budget / URI strip 4 件 + defs-uri strip
+   3 件)。tool-specs に MCP 2 tool 追加 (計 4 tool)。
+
+意図的先送り:
+
+- =defs://= SHA の row-hash 化 (schema version 付き) は Phase 3 扱い。
+  現状は 全 row 共通 ="0"= を使うので、同名 symbol (別 file) は
+  citation URI が衝突する — Layer 3 dispatch は symbol 名 resolve
+  なのでユーザ影響は小 (fn 同名は稀)。
+
+** Phase 3 — cross-layer resolver (~DRAFT~)
 
 =anvil-uri-fetch= tool: 任意の citation URI を渡すと、URI の prefix
 を見て適切な Layer 3 tool を自動 dispatch。LLM が URI だけ覚えれば
-良い状態を作る。
+良い状態を作る。defs:// の SHA row-hash 化もこの Phase で同時に扱う
+(Phase 2 の "0" placeholder を実 hash に切替)。
 
 ** Phase 4 — journal / http-cache
 

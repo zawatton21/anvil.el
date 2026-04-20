@@ -521,18 +521,33 @@ FN-INFO is the result from `anvil-elisp--extract-function-info`."
       (anvil-elisp--get-function-definition-interactive
        function sym fn)))))
 
+(defun anvil-elisp--strip-defs-uri (fn)
+  "Return FN with a leading `defs://SHA/' citation prefix stripped."
+  (if (and (stringp fn) (string-prefix-p "defs://" fn))
+      (let ((rest (substring fn (length "defs://"))))
+        ;; defs://<sha>/<symbol> — take everything after the first /.
+        (if (string-match "\\`[^/]+/\\(.+\\)\\'" rest)
+            (match-string 1 rest)
+          rest))
+    fn))
+
 (defun anvil-elisp--get-function-definition (function)
   "Get the source code definition for Emacs Lisp FUNCTION.
+FUNCTION may also be a `defs://SHA/SYMBOL' citation URI from the
+disclosure Layer-1 / Layer-2 tools; the symbol part is extracted
+transparently.
 
 MCP Parameters:
-  function - The name of the function to retrieve"
-  (let* ((sym (anvil-elisp--validate-symbol function "function" t))
+  function - The name of the function to retrieve
+             (or `defs://SHA/SYMBOL' citation URI)"
+  (let* ((name (anvil-elisp--strip-defs-uri function))
+         (sym (anvil-elisp--validate-symbol name "function" t))
          (fn-info (anvil-elisp--extract-function-info sym)))
     (unless fn-info
       (anvil-server-tool-throw
-       (format "Function %s is not found" function)))
+       (format "Function %s is not found" name)))
     (anvil-elisp--get-function-definition-dispatch
-     function sym fn-info)))
+     name sym fn-info)))
 
 ;;; Info Documentation Helpers
 
@@ -1018,8 +1033,11 @@ Error cases:
    :id "elisp-get-function-definition"
    :server-id anvil-elisp--server-id
    :description
-   "Get the source code definition of an Emacs Lisp function with any header
-comments. Returns source code with file path and 1-based line numbers. For
+   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
+Get the source code definition of an Emacs Lisp function with any header
+comments. Accepts either a bare symbol name or a `defs://SHA/SYMBOL'
+citation URI emitted by Layer 1 (`defs-index') / Layer 2 (`defs-search').
+Returns source code with file path and 1-based line numbers. For
 functions defined in C, returns a suggestion to call elisp-describe-function
 tool instead.
 
