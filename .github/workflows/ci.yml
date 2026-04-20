@@ -65,6 +65,22 @@ jobs:
         with:
           version: ${{ matrix.emacs-version }}
 
+      - name: Install tree-sitter-python grammar
+        run: |
+          # anvil-py tests (Doc 21 Phase 1a) need the python grammar.
+          # Pin to v0.21.x — current tree-sitter-python master tags its
+          # parser at ABI 15, which Emacs 30's libtree-sitter 0.22 runtime
+          # refuses to load.  Without this step the 17 grammar-dependent
+          # tests silently ert-skip and the suite is a false green.
+          emacs --batch \
+            --eval "(require 'treesit)" \
+            --eval "(setq treesit-language-source-alist \
+                          '((python \"https://github.com/tree-sitter/tree-sitter-python\" \"v0.21.0\")))" \
+            --eval "(let ((default-directory \"/tmp/\")) \
+                      (treesit-install-language-grammar 'python))" \
+            --eval "(unless (treesit-language-available-p 'python) \
+                      (error \"grammar install failed\"))"
+
       - name: Run full ERT suite
         run: |
           # `setup-emacs` lays down a Unix-style $HOME; nothing else to
