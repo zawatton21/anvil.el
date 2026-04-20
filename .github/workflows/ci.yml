@@ -2,17 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: ['**']
   pull_request:
-    branches: [main, master]
+    branches: ['**']
 
 jobs:
-  test:
+  smoke:
+    # Fast, cross-platform smoke: byte-compile the core + run the flat
+    # `tests/anvil-test.el` suite.  Matches the sub-minute gate most
+    # anvil contributors ran manually before we had CI.
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        emacs-version: ['28.2', '29.4']
+        emacs-version: ['29.4', '30.1']
       fail-fast: false
 
     steps:
@@ -23,8 +26,8 @@ jobs:
         with:
           version: ${{ matrix.emacs-version }}
 
-      - name: Byte-compile (Unix)
-        if: runner.os != 'Windows'
+      - name: Byte-compile core
+        shell: bash
         run: |
           emacs --batch -L . \
             -f batch-byte-compile \
@@ -34,20 +37,79 @@ jobs:
             anvil.el \
             anvil-eval.el
 
-      - name: Byte-compile (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          emacs --batch -L . -f batch-byte-compile anvil-server-metrics.el anvil-server.el anvil-server-commands.el anvil.el anvil-eval.el
-
-      - name: Run tests (Unix)
-        if: runner.os != 'Windows'
+      - name: Run smoke tests
+        shell: bash
         run: |
           emacs --batch -L . -L tests \
             -l ert \
             -l tests/anvil-test.el \
             -f ert-run-tests-batch-and-exit
 
-      - name: Run tests (Windows)
-        if: runner.os == 'Windows'
+  full-suite:
+    # Full ERT run — every `tests/anvil-*-test.el' file loaded into one
+    # emacs --batch so the 640+ test suite runs in a single process.
+    # Ubuntu only: the Windows setup-emacs on 30.1 occasionally hangs on
+    # the sexp test fixtures, and live smoke tests (orchestrator, browser)
+    # are skip-guarded for all platforms but don't add CI value on Windows.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        emacs-version: ['29.4', '30.1']
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: jcs090218/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs-version }}
+
+      - name: Run full ERT suite
         run: |
-          emacs --batch -L . -L tests -l ert -l tests/anvil-test.el -f ert-run-tests-batch-and-exit
+          # `setup-emacs` lays down a Unix-style $HOME; nothing else to
+          # configure.  Load every anvil-*-test.el via a shell expansion
+          # so CI mirrors the `make test-all' outcome without needing
+          # eask / anvil-dev's subprocess-per-file spawner (which is
+          # slower and flakier in constrained CI runners).
+          LOADS=""
+          for f in tests/anvil-*-test.el; do
+            [ -f "$f" ] || continue
+            LOADS="$LOADS -l $f"
+          done
+          emacs --batch -Q -L . -L tests \
+            -l ert \
+            $LOADS \
+            -f ert-run-tests-batch-and-exit
+
+  release-audit:
+    # Fails on any non-informational hazard reported by
+    # `anvil-dev-release-audit' (arglist-strip, missing-params,
+    # plist-return).  Non-shipped design docs are left as warnings —
+    # they never gate merges, only the pre-master-merge review.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: jcs090218/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Run release audit
+        run: |
+          emacs --batch -Q -L . \
+            --eval "(require 'anvil-dev)" \
+            --eval "(let* ((r (anvil-dev-release-audit default-directory)) \
+                           (arglist (plist-get r :arglist-strip)) \
+                           (params  (plist-get r :missing-params)) \
+                           (plists  (plist-get r :plist-return)) \
+                           (docs    (plist-get r :non-shipped-docs))) \
+                      (princ (anvil-dev--audit-format-report r)) \
+                      (when docs \
+                        (princ (format \"\\nINFO: %d design doc(s) still DRAFT — not gated by CI.\\n\" \
+                                       (length docs)))) \
+                      (when (or arglist params plists) \
+                        (princ \"\\nFAIL: release audit surfaced bug-class hazards.\\n\") \
+                        (kill-emacs 1)))"
