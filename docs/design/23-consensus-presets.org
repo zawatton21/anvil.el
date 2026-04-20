@@ -7,7 +7,14 @@
   :PROPERTIES:
   :ID:       019da400-c22a-7000-0002-consensus-presets
   :END:
-~DRAFT~ (2026-04-19)
+~Phase 1 SHIPPED~ (2026-04-20, develop branch) — new
+=anvil-orchestrator-presets.el= module with CRUD API
+(=-preset-{set,get,list,delete}=) + =:preset= keyword on
+=anvil-orchestrator-submit-consensus= + 4 built-in defaults
+(=fast= / =cheap= / =broad= / =rigorous=) via
+=anvil-orchestrator-consensus-preset-defaults= defcustom.  16 ERT
+cases green.  Phase 2 (anvil-state persistence + MCP tools) and
+Phase 3 (auto-judge on preset-driven fan-out) deferred.
 
 Observation driving this doc: the v1 benchmark
 (=benchmarks/results/report-2026-04-19.org=) showed that a 3-way

@@ -54,6 +54,10 @@
                   "anvil-orchestrator-routing")
 (declare-function anvil-orchestrator-routing--unregister-tools
                   "anvil-orchestrator-routing")
+(declare-function anvil-orchestrator--preset-resolve
+                  "anvil-orchestrator-presets"
+                  (preset caller-providers caller-overrides
+                          caller-timeout-sec caller-budget-usd))
 
 ;;;; --- configuration ------------------------------------------------------
 
@@ -2127,7 +2131,7 @@ fallbacks per task (each per-provider override wins over a default)."
 
 ;;;###autoload
 (cl-defun anvil-orchestrator-submit-consensus
-    (&key prompt providers overrides timeout-sec budget-usd)
+    (&key prompt preset providers overrides timeout-sec budget-usd)
   "Dispatch PROMPT to each provider in PROVIDERS and return a plist.
 Result: (:consensus-id STR :batch-id STR :providers (SYM...) :task-ids (STR...)).
 
@@ -2135,32 +2139,54 @@ PROVIDERS must be a list of registered provider symbols with
 length >= 2.  OVERRIDES is an alist ((provider . (:key val ...)))
 whose per-provider plist is merged into the corresponding task
 (e.g. per-provider :model).  TIMEOUT-SEC and BUDGET-USD apply as
-defaults for every fan-out task unless already set in OVERRIDES."
+defaults for every fan-out task unless already set in OVERRIDES.
+
+PRESET (optional symbol) names a registered consensus preset
+(see `anvil-orchestrator-consensus-preset-set', Doc 23).  When
+supplied, any of the other keywords the caller omits are filled
+from the preset — caller-supplied keywords always win.  Unknown
+preset names signal `user-error'.  Phase 3 of Doc 23 will extend
+preset resolution with an auto-judge opt-in."
   (unless (and (stringp prompt) (not (string-empty-p prompt)))
     (user-error "consensus: prompt must be a non-empty string"))
-  (unless (and (listp providers) (>= (length providers) 2))
-    (user-error "consensus: providers must be a list of length >= 2"))
-  (dolist (p providers)
-    (unless (anvil-orchestrator--provider p)
-      (user-error "consensus: unknown provider %S" p)))
-  (let* ((consensus-id (anvil-orchestrator--uuid))
-         (defaults (append
-                    (and timeout-sec (list :timeout-sec timeout-sec))
-                    (and budget-usd  (list :budget-usd budget-usd))))
-         (tasks    (anvil-orchestrator--consensus-build-tasks
-                    prompt providers overrides defaults))
-         (batch-id (anvil-orchestrator-submit tasks))
-         (task-ids (gethash batch-id anvil-orchestrator--batches))
-         (meta     (list :batch-id batch-id
-                         :providers providers
-                         :task-ids task-ids
-                         :created-at (float-time))))
-    (puthash consensus-id meta anvil-orchestrator--consensus-groups)
-    (anvil-orchestrator--consensus-persist consensus-id meta)
-    (list :consensus-id consensus-id
-          :batch-id batch-id
-          :providers providers
-          :task-ids task-ids)))
+  (let* ((resolved (if preset
+                       (progn (require 'anvil-orchestrator-presets)
+                              (anvil-orchestrator--preset-resolve
+                               preset providers overrides
+                               timeout-sec budget-usd))
+                     (list :providers providers
+                           :overrides overrides
+                           :timeout-sec timeout-sec
+                           :budget-usd budget-usd
+                           :preset-name nil)))
+         (providers   (plist-get resolved :providers))
+         (overrides   (plist-get resolved :overrides))
+         (timeout-sec (plist-get resolved :timeout-sec))
+         (budget-usd  (plist-get resolved :budget-usd)))
+    (unless (and (listp providers) (>= (length providers) 2))
+      (user-error "consensus: providers must be a list of length >= 2"))
+    (dolist (p providers)
+      (unless (anvil-orchestrator--provider p)
+        (user-error "consensus: unknown provider %S" p)))
+    (let* ((consensus-id (anvil-orchestrator--uuid))
+           (defaults (append
+                      (and timeout-sec (list :timeout-sec timeout-sec))
+                      (and budget-usd  (list :budget-usd budget-usd))))
+           (tasks    (anvil-orchestrator--consensus-build-tasks
+                      prompt providers overrides defaults))
+           (batch-id (anvil-orchestrator-submit tasks))
+           (task-ids (gethash batch-id anvil-orchestrator--batches))
+           (meta     (list :batch-id batch-id
+                           :providers providers
+                           :task-ids task-ids
+                           :preset (plist-get resolved :preset-name)
+                           :created-at (float-time))))
+      (puthash consensus-id meta anvil-orchestrator--consensus-groups)
+      (anvil-orchestrator--consensus-persist consensus-id meta)
+      (list :consensus-id consensus-id
+            :batch-id batch-id
+            :providers providers
+            :task-ids task-ids))))
 
 (defun anvil-orchestrator--consensus-similarity-matrix (tasks)
   "Return an alist ((\"PROV_A x PROV_B\" . SCORE) ...) for TASKS.
@@ -3873,6 +3899,11 @@ Response plist includes :events / :last-seq / :task-status."
   (anvil-orchestrator--register-tools)
   (require 'anvil-orchestrator-routing)
   (anvil-orchestrator-routing--register-tools)
+  ;; Doc 23 Phase 1 — preset CRUD API exposed at enable time so
+  ;; `M-x anvil-orchestrator-consensus-preset-set` is interactive-
+  ;; callable without a manual `require'.  MCP tool registration
+  ;; lands with Phase 2.
+  (require 'anvil-orchestrator-presets)
   (anvil-orchestrator--ensure-pump-timer))
 
 (defun anvil-orchestrator-disable ()

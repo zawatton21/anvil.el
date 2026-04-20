@@ -90,7 +90,7 @@ combinations (presets).
 | #  | Doc                                         | 依存   | 想定工数 | Tier | 状態  |
 |----+---------------------------------------------+--------+----------+------+-------|
 | 22 | [[file:22-provider-routing.org][Provider Latency Routing]]                    | 10     | 小       | 2    | Ph1 SHIPPED |
-| 23 | [[file:23-consensus-presets.org][Consensus Presets]]                           | 10, 22 | 小       | 2    | DRAFT |
+| 23 | [[file:23-consensus-presets.org][Consensus Presets]]                           | 10, 22 | 小       | 2    | Ph1 SHIPPED |
 
 * Status Legend
 
