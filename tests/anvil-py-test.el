@@ -209,6 +209,45 @@ in tree order, which breaks naive pair-grouping state machines."
       (should (member "inner" names))
       (should-not (member "" names)))))
 
+(ert-deftest anvil-py-test-list-functions-sets-class-name-on-methods ()
+  "A method's entry in `py-list-functions' carries the enclosing
+class via :class-name; a top-level function carries nil."
+  (anvil-py-test--requires-grammar
+    (let* ((fns (anvil-py-list-functions anvil-py-test--fixture))
+           (by-name (lambda (n)
+                      (cl-find n fns
+                               :key (lambda (p) (plist-get p :name))
+                               :test #'string=))))
+      (should (null (plist-get (funcall by-name "plain_func") :class-name)))
+      (should (null (plist-get (funcall by-name "outer") :class-name)))
+      ;; Nested def inside a function is not a method — no enclosing
+      ;; class crosses the function boundary.
+      (should (null (plist-get (funcall by-name "inner") :class-name)))
+      (should (string= "ReportWriter"
+                       (plist-get (funcall by-name "write") :class-name)))
+      (should (string= "ReportWriter"
+                       (plist-get (funcall by-name "default_name") :class-name)))
+      (should (string= "Config"
+                       (plist-get (funcall by-name "describe") :class-name))))))
+
+(ert-deftest anvil-py-test-find-definition-method-has-class-name ()
+  "py-find-definition returning a method carries :class-name."
+  (anvil-py-test--requires-grammar
+    (let ((d (anvil-py-find-definition anvil-py-test--fixture "describe")))
+      (should d)
+      (should (string= "Config" (plist-get d :class-name))))))
+
+(ert-deftest anvil-py-test-list-methods-entry-uses-class-name ()
+  "Methods list carries :class-name (not :class) for plist shape
+parity with `py-list-functions'."
+  (anvil-py-test--requires-grammar
+    (let ((ms (anvil-py-list-methods anvil-py-test--fixture "ReportWriter")))
+      (should (cl-every (lambda (m)
+                          (string= "ReportWriter" (plist-get m :class-name)))
+                        ms))
+      ;; Legacy :class key is gone.
+      (should (cl-every (lambda (m) (null (plist-get m :class))) ms)))))
+
 ;;;; --- error paths --------------------------------------------------------
 
 (ert-deftest anvil-py-test-list-imports-errors-on-missing-file ()

@@ -136,13 +136,33 @@ Reads the `name' field directly, returning empty string if missing."
   (let ((n (treesit-node-child-by-field-name def-node "name")))
     (if n (anvil-treesit-node-text n) "")))
 
+(defun anvil-py--enclosing-class-name (fn-node)
+  "Return the name of the class directly containing FN-NODE, or nil.
+Climbs past `decorated_definition', `block', and `class_definition'
+as needed.  Returns nil if FN-NODE is not a direct method of any
+class (e.g. a module-level function, or a nested def inside another
+function)."
+  (let* ((outer (anvil-py--outer-node fn-node))
+         (parent (treesit-node-parent outer)))
+    (when (and parent (string= (treesit-node-type parent) "block"))
+      (let ((grand (treesit-node-parent parent)))
+        (when (and grand (string= (treesit-node-type grand) "class_definition"))
+          (anvil-py--node-name grand))))))
+
 (defun anvil-py--collect-named (root op kind-sym)
   "Collect one plist per definition captured by OP.
 Each capture's node is a bare `function_definition' or
 `class_definition'; the collector climbs to a `decorated_definition'
 parent when present so :bounds includes the decorator block.  The
 name is read from the node's `name' field — reliable regardless of
-tree-traversal order for nested defs."
+tree-traversal order for nested defs.
+
+`:class-name' is set to the enclosing class's name when the def is
+a direct method of a class (a nested function inside a function
+keeps :class-name nil — the enclosing class relationship only
+crosses one level of block).  This lets callers of
+`anvil-py-find-definition' / `anvil-py-list-functions' distinguish
+methods from top-level defs without a second walk."
   (let ((q (anvil-py--query op))
         results)
     (dolist (cap (treesit-query-capture root q))
@@ -150,9 +170,12 @@ tree-traversal order for nested defs."
              (outer (anvil-py--outer-node inner))
              (decorated (not (eq outer inner)))
              (async (and (eq kind-sym 'function)
-                         (anvil-py--async-node-p inner))))
+                         (anvil-py--async-node-p inner)))
+             (class-name (and (eq kind-sym 'function)
+                              (anvil-py--enclosing-class-name inner))))
         (push (list :kind kind-sym
                     :name (anvil-py--node-name inner)
+                    :class-name class-name
                     :decorated decorated
                     :async (and async t)
                     :bounds (anvil-treesit-node-bounds outer))
@@ -175,22 +198,9 @@ plist shape parity with functions."
   (anvil-treesit-with-root file anvil-py--lang root
     (anvil-py--collect-named root 'classes 'class)))
 
-(defun anvil-py--enclosing-class-name (fn-node)
-  "Return the name of the class directly containing FN-NODE, or nil.
-Climbs past `decorated_definition', `block', and `class_definition'
-as needed.  Returns nil if FN-NODE is not a direct method of any
-class (e.g. a module-level function, or a nested def inside another
-function)."
-  (let* ((outer (anvil-py--outer-node fn-node))
-         (parent (treesit-node-parent outer)))
-    (when (and parent (string= (treesit-node-type parent) "block"))
-      (let ((grand (treesit-node-parent parent)))
-        (when (and grand (string= (treesit-node-type grand) "class_definition"))
-          (anvil-py--node-name grand))))))
-
 (defun anvil-py-list-methods (file class-name)
   "Return methods defined directly inside class CLASS-NAME in FILE.
-Each entry: (:kind 'method :class STR :name STR :decorated BOOL
+Each entry: (:kind 'method :class-name STR :name STR :decorated BOOL
 :async BOOL :bounds PLIST).  Nested classes' methods are excluded;
 only the first-level body of a class named CLASS-NAME matches.
 Decorator lines above a method are included in :bounds via the
@@ -207,7 +217,7 @@ Decorator lines above a method are included in :bounds via the
                      (decorated (not (eq outer inner)))
                      (async (anvil-py--async-node-p inner)))
                 (push (list :kind 'method
-                            :class cls
+                            :class-name cls
                             :name (anvil-py--node-name inner)
                             :decorated decorated
                             :async (and async t)
