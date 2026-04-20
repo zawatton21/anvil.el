@@ -77,7 +77,7 @@ Returns nil if clipboard is empty or unavailable."
                ('gnu/linux
                 (let ((cmd (anvil-clipboard--linux-get-command)))
                   (unless cmd
-                    (error "anvil-clipboard: wl-paste (Wayland), xclip, or xsel required on Linux"))
+                    (error "anvil-clipboard: wl-clipboard (Wayland), xclip, or xsel required on Linux"))
                   (anvil-shell cmd '(:coding utf-8 :timeout 5))))
                (_ (error "anvil-clipboard: unsupported system-type %s" system-type)))))
     (when (eql (plist-get res :exit) 0)
@@ -110,7 +110,7 @@ Returns nil if clipboard is empty or unavailable."
                 ('gnu/linux
                  (let ((cmd (anvil-clipboard--linux-set-command string)))
                    (unless cmd
-                     (error "anvil-clipboard: wl-copy (Wayland), xclip, or xsel required on Linux"))
+                     (error "anvil-clipboard: wl-clipboard (Wayland), xclip, or xsel required on Linux"))
                    (anvil-shell cmd '(:coding utf-8 :timeout 5))))
                 (_ (error "anvil-clipboard: unsupported system-type %s" system-type)))
             (when tmpfile (ignore-errors (delete-file tmpfile))))))
