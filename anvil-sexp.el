@@ -1,4 +1,5 @@
 ;;; anvil-sexp.el --- Reader-based structural edits for elisp  -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2025-2026 zawatton
 
@@ -367,13 +368,12 @@ dependencies."
             (expanded (if (anvil-sexp--truthy all)
                           (macroexpand-all sexp)
                         (macroexpand-1 sexp))))
-       (anvil-server-encode-for-mcp
-        (list :name (symbol-name (plist-get form :name))
-              :expanded (with-output-to-string
-                          (let ((print-level nil)
-                                (print-length nil))
-                            (pp expanded)))
-              :original (prin1-to-string sexp)))))))
+       (list :name (symbol-name (plist-get form :name))
+             :expanded (with-output-to-string
+                         (let ((print-level nil)
+                               (print-length nil))
+                           (pp expanded)))
+             :original (prin1-to-string sexp))))))
 
 
 ;;;; --- edit tool implementations ------------------------------------------
@@ -1105,13 +1105,12 @@ later phase when needed."
          (setq diags (append diags (plist-get bc :diagnostics)))))
      (when do-cd
        (setq diags (append diags (anvil-sexp--run-checkdoc file))))
-     (anvil-server-encode-for-mcp
-      (list :file file
-            :passed (and bc-ok
-                         (null (cl-find-if
-                                (lambda (d) (eq (plist-get d :kind) 'error))
-                                diags)))
-            :diagnostics diags)))))
+     (list :file file
+           :passed (and bc-ok
+                        (null (cl-find-if
+                               (lambda (d) (eq (plist-get d :kind) 'error))
+                               diags)))
+           :diagnostics diags))))
 
 
 ;;;; --- public elisp API (Doc 12 Phase 1) ---------------------------------
@@ -1195,7 +1194,7 @@ NEW-FORM may reference positional arguments via %1 %2 etc.  See
 (defun anvil-sexp--register-tools ()
   "Register sexp-* MCP tools under `anvil-sexp--server-id'."
   (anvil-server-register-tool
-   #'anvil-sexp--tool-read-file
+   (anvil-server-encode-handler #'anvil-sexp--tool-read-file)
    :id "sexp-read-file"
    :server-id anvil-sexp--server-id
    :description
@@ -1207,7 +1206,7 @@ or comment can leak into the result."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-surrounding-form
+   (anvil-server-encode-handler #'anvil-sexp--tool-surrounding-form)
    :id "sexp-surrounding-form"
    :server-id anvil-sexp--server-id
    :description
@@ -1217,7 +1216,7 @@ operator (e.g. \"defun\")."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-macroexpand
+   (anvil-server-encode-handler #'anvil-sexp--tool-macroexpand)
    :id "sexp-macroexpand"
    :server-id anvil-sexp--server-id
    :description
@@ -1228,7 +1227,7 @@ macros not yet loaded pass through unchanged."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-verify
+   (anvil-server-encode-handler #'anvil-sexp--tool-verify)
    :id "sexp-verify"
    :server-id anvil-sexp--server-id
    :description
@@ -1239,7 +1238,7 @@ check."
    :read-only t)
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-replace-defun
+   (anvil-server-encode-handler #'anvil-sexp--tool-replace-defun)
    :id "sexp-replace-defun"
    :server-id anvil-sexp--server-id
    :description
@@ -1249,7 +1248,7 @@ writing requires apply=t explicitly.  Refuses when the new form
 does not parse or when no form matches the given name.")
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-wrap-form
+   (anvil-server-encode-handler #'anvil-sexp--tool-wrap-form)
    :id "sexp-wrap-form"
    :server-id anvil-sexp--server-id
    :description
@@ -1259,7 +1258,7 @@ the original sexp replaces the placeholder.  Preview by default;
 apply=t writes to disk.")
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-rename-symbol
+   (anvil-server-encode-handler #'anvil-sexp--tool-rename-symbol)
    :id "sexp-rename-symbol"
    :server-id anvil-sexp--server-id
    :description
@@ -1271,7 +1270,7 @@ list of files.  Preview by default; apply=t writes.
 (Doc 12 Phase 2a reader-only backend.)")
 
   (anvil-server-register-tool
-   #'anvil-sexp--tool-replace-call
+   (anvil-server-encode-handler #'anvil-sexp--tool-replace-call)
    :id "sexp-replace-call"
    :server-id anvil-sexp--server-id
    :description

@@ -1,4 +1,5 @@
 ;;; anvil-pty-broker.el --- node-pty TCP broker client -*- lexical-binding: t; -*-
+;;; anvil-audit: tools-wrapped-at-registration
 
 ;; Copyright (C) 2026 zawatton
 
@@ -407,7 +408,7 @@ MCP Parameters:
   text - UTF-8 text to write into the pty's stdin.  Append \"\\n\"
          yourself if the command needs a newline."
   (anvil-pty-send id text)
-  (anvil-server-encode-for-mcp (list :sent (length text))))
+  (list :sent (length text)))
 
 (defun anvil-pty-broker--tool-kill (id &optional signal)
   "MCP wrapper for `anvil-pty-kill'.
@@ -418,11 +419,11 @@ MCP Parameters:
   (anvil-pty-kill id (and (stringp signal)
                           (not (string-empty-p signal))
                           signal))
-  (anvil-server-encode-for-mcp (list :killed id)))
+  (list :killed id))
 
 (defun anvil-pty-broker--tool-list ()
   "MCP wrapper for `anvil-pty-list'."
-  (anvil-server-encode-for-mcp (list :ids (or (anvil-pty-list) nil))))
+  (list :ids (or (anvil-pty-list) nil)))
 
 (defun anvil-pty-broker--tool-read (id &optional consume)
   "MCP wrapper for `anvil-pty-read'.
@@ -437,38 +438,40 @@ MCP Parameters:
                 ((stringp consume)
                  (not (member (downcase consume) '("" "nil" "false" "0"))))
                 (t t))))
-    (anvil-server-encode-for-mcp
-     (list :id id
-           :output (anvil-pty-read id consume-p)
-           :consumed consume-p))))
+    (list :id id
+          :output (anvil-pty-read id consume-p)
+          :consumed consume-p)))
 
 (defun anvil-pty-broker--register-tools ()
-  "Register pty-broker MCP tools.  Idempotent."
+  "Register pty-broker MCP tools.  Idempotent.
+Handlers return plists / strings / nil.  The registration wrapper
+`anvil-server-encode-handler' JSON-encodes non-string non-nil shapes
+so direct Elisp / ERT callers keep the raw plist."
   (anvil-server-register-tool
-   #'anvil-pty-broker--tool-spawn
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-spawn)
    :id "pty-spawn"
    :server-id anvil-pty-broker--server-id
    :description "Spawn a program under the node-pty broker. Requires
 the program to appear in `anvil-pty-broker-allowed-commands'. Returns
 the pty-id string to use with pty-send / pty-read / pty-kill.")
   (anvil-server-register-tool
-   #'anvil-pty-broker--tool-send
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-send)
    :id "pty-send"
    :server-id anvil-pty-broker--server-id
    :description "Write TEXT into an existing pty's stdin.")
   (anvil-server-register-tool
-   #'anvil-pty-broker--tool-kill
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-kill)
    :id "pty-kill"
    :server-id anvil-pty-broker--server-id
    :description "Send a signal (default SIGTERM) to an existing pty.")
   (anvil-server-register-tool
-   #'anvil-pty-broker--tool-list
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-list)
    :id "pty-list"
    :server-id anvil-pty-broker--server-id
    :description "Return the list of active pty ids."
    :read-only t)
   (anvil-server-register-tool
-   #'anvil-pty-broker--tool-read
+   (anvil-server-encode-handler #'anvil-pty-broker--tool-read)
    :id "pty-read"
    :server-id anvil-pty-broker--server-id
    :description "Return buffered output for a pty; consume=t clears
