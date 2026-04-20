@@ -109,9 +109,17 @@ included."
 (defvar anvil-bisect--cancelled nil
   "Set by `anvil-bisect-cancel' to interrupt the control loop.")
 
-(defvar anvil-bisect--debug nil
+(defvar anvil-bisect--debug
+  ;; Default to t in CI environments (the `CI' env var is set by
+  ;; GitHub Actions, GitLab, CircleCI, Jenkins, etc.).  CI runs are
+  ;; the case where the verbose log actually helps: failures there
+  ;; are notoriously hard to reproduce locally, and the per-step
+  ;; output is the fastest path to "why did this commit skip?".
+  ;; Interactive / local runs stay quiet.
+  (and (getenv "CI") t)
   "When non-nil, log step stdout/stderr and exit codes to `*Messages*'.
-Useful for test diagnosis; never left on in production.")
+Useful for test diagnosis; never left on in production except under
+CI where the debug output is the primary regression triage signal.")
 
 
 ;;;; --- git helpers ------------------------------------------------------
