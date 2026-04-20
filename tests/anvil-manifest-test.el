@@ -79,16 +79,16 @@ SERVER-ID defaults to \"default\" and is resolved through
 (ert-deftest anvil-manifest-test-visibility-full-shows-everything ()
   "Under `full' every tool id is visible regardless of registration."
   (let ((anvil-manifest-profile 'full))
-    (should (anvil-manifest--tool-visible-p "stub-ultra" nil))
-    (should (anvil-manifest--tool-visible-p "stub-hidden" nil))
-    (should (anvil-manifest--tool-visible-p "totally-unknown" nil))))
+    (should (anvil-manifest--visible-p "stub-ultra" nil))
+    (should (anvil-manifest--visible-p "stub-hidden" nil))
+    (should (anvil-manifest--visible-p "totally-unknown" nil))))
 
 (ert-deftest anvil-manifest-test-visibility-ultra-hides-non-listed ()
   "Under `ultra' only listed tool ids are visible."
   (let ((anvil-manifest-profile 'ultra))
-    (should (anvil-manifest--tool-visible-p "file-read" nil))
-    (should-not (anvil-manifest--tool-visible-p "stub-hidden" nil))
-    (should-not (anvil-manifest--tool-visible-p "orchestrator-submit" nil))))
+    (should (anvil-manifest--visible-p "file-read" nil))
+    (should-not (anvil-manifest--visible-p "stub-hidden" nil))
+    (should-not (anvil-manifest--visible-p "orchestrator-submit" nil))))
 
 ;;;; --- tools/list filter round-trip --------------------------------------
 
@@ -119,7 +119,7 @@ SERVER-ID defaults to \"default\" and is resolved through
       (unwind-protect
           (progn
             (should (eq anvil-server-tool-filter-function
-                        #'anvil-manifest--tool-visible-p))
+                        #'anvil-manifest--visible-p))
             (let ((names (anvil-manifest-test--tools-list-names)))
               (should (member "manifest-cost" names))
               (should-not (member "stub-hidden" names))))
@@ -203,19 +203,19 @@ SERVER-ID defaults to \"default\" and is resolved through
     (let ((anvil-manifest-profile 'full)
           (anvil-manifest-server-profiles '(("slim" . ultra))))
       ;; Default server-id: no override, uses global `full'
-      (should (anvil-manifest--tool-visible-p "stub-hidden" nil "default"))
+      (should (anvil-manifest--visible-p "stub-hidden" nil "default"))
       ;; Virtual server-id with `ultra' override: stub-hidden is hidden
-      (should-not (anvil-manifest--tool-visible-p "stub-hidden" nil "slim"))
+      (should-not (anvil-manifest--visible-p "stub-hidden" nil "slim"))
       ;; An ultra tool id (e.g. `file-read') would pass under `slim'
-      (should (anvil-manifest--tool-visible-p "file-read" nil "slim")))))
+      (should (anvil-manifest--visible-p "file-read" nil "slim")))))
 
 (ert-deftest anvil-manifest-test-legacy-two-arg-filter-still-works ()
-  "Calling `anvil-manifest--tool-visible-p' with the pre-Phase-1a 2-arg
+  "Calling `anvil-manifest--visible-p' with the pre-Phase-1a 2-arg
 signature continues to use the global profile.  Keeps third-party
 filter subclasses from breaking during the upgrade."
   (let ((anvil-manifest-profile 'full)
         (anvil-manifest-server-profiles nil))
-    (should (anvil-manifest--tool-visible-p "anything" nil))))
+    (should (anvil-manifest--visible-p "anything" nil))))
 
 (ert-deftest anvil-manifest-test-enable-installs-default-aliases ()
   "`anvil-manifest-enable' adds `anvil-manifest--default-aliases'."

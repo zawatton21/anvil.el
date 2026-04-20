@@ -185,7 +185,7 @@ server-id is absent from `anvil-manifest-server-profiles'."
   (or (cdr (assoc server-id anvil-manifest-server-profiles))
       anvil-manifest-profile))
 
-(defun anvil-manifest--tool-visible-p (tool-id _tool-plist &optional server-id)
+(defun anvil-manifest--visible-p (tool-id _tool-plist &optional server-id)
   "Return non-nil if TOOL-ID should appear in tools/list for SERVER-ID.
 Used as `anvil-server-tool-filter-function' when the module is
 enabled.  When called without SERVER-ID (legacy two-argument callers),
@@ -202,7 +202,7 @@ the global `anvil-manifest-profile' applies."
   (let ((text (format "%S" schema)))
     (max 1 (/ (length text) 4))))
 
-(defun anvil-manifest--tool-entry-token-count (tool-id tool)
+(defun anvil-manifest--entry-token-count (tool-id tool)
   "Estimate the per-tool cost of advertising TOOL-ID with TOOL plist.
 Counts the name, description and schema, matching what ends up in
 the MCP response."
@@ -227,10 +227,10 @@ MCP Parameters: (none)"
         (maphash
          (lambda (tool-id tool)
            (cl-incf all)
-           (when (anvil-manifest--tool-visible-p tool-id tool)
+           (when (anvil-manifest--visible-p tool-id tool)
              (cl-incf advertised)
              (cl-incf tokens
-                      (anvil-manifest--tool-entry-token-count
+                      (anvil-manifest--entry-token-count
                        tool-id tool))))
          tools-table))
       (list :profile profile
@@ -260,7 +260,7 @@ receive the matching filtered manifest without duplicating tool
 registrations."
   (interactive)
   (setq anvil-server-tool-filter-function
-        #'anvil-manifest--tool-visible-p)
+        #'anvil-manifest--visible-p)
   (dolist (alias anvil-manifest--default-aliases)
     (cl-pushnew alias anvil-server-id-aliases :test #'equal))
   (anvil-server-register-tools "default" anvil-manifest--tool-specs))
@@ -271,7 +271,7 @@ Also removes `anvil-manifest--default-aliases' from
 `anvil-server-id-aliases'."
   (interactive)
   (when (eq anvil-server-tool-filter-function
-            #'anvil-manifest--tool-visible-p)
+            #'anvil-manifest--visible-p)
     (setq anvil-server-tool-filter-function nil))
   (dolist (alias anvil-manifest--default-aliases)
     (setq anvil-server-id-aliases

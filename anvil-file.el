@@ -1057,7 +1057,7 @@ MCP Parameters:
                                           (string-to-number start-line)
                                           (string-to-number end-line)))))
 
-(defun anvil-file--tool-read--strip-uri (path offset limit)
+(defun anvil-file--read-normalize-uri-args (path offset limit)
   "Return (PATH OFFSET LIMIT) with `file://' citation URI expanded.
 When PATH is a `file://PATH[#L<s>[-<e>]]' URI the scheme is stripped,
 and if the URI carries a line range it seeds OFFSET (start-1) and
@@ -1094,7 +1094,7 @@ MCP Parameters:
   (anvil-server-with-error-handling
     (require 'anvil-uri nil t)
     (pcase-let ((`(,p ,off-str ,lim-str)
-                 (anvil-file--tool-read--strip-uri path offset limit)))
+                 (anvil-file--read-normalize-uri-args path offset limit)))
       (let ((off (if (and off-str (not (string-empty-p off-str)))
                      (string-to-number off-str)
                    nil))

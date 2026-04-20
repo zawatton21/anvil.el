@@ -292,12 +292,12 @@ rather than leaving a short tail."
 (ert-deftest anvil-disclosure-test-file-read-strip-uri-plain-path ()
   "A plain absolute path is passed through unchanged."
   (should (equal (list "/a/b" "3" "5")
-                 (anvil-file--tool-read--strip-uri "/a/b" "3" "5"))))
+                 (anvil-file--read-normalize-uri-args "/a/b" "3" "5"))))
 
 (ert-deftest anvil-disclosure-test-file-read-strip-uri-with-range ()
   "A file:// URI with a line range seeds offset/limit when unset."
   (pcase-let ((`(,p ,o ,l)
-               (anvil-file--tool-read--strip-uri
+               (anvil-file--read-normalize-uri-args
                 "file:///tmp/x.el#L10-14" nil nil)))
     (should (equal "/tmp/x.el" p))
     (should (equal "9" o))
@@ -306,7 +306,7 @@ rather than leaving a short tail."
 (ert-deftest anvil-disclosure-test-file-read-strip-uri-caller-wins ()
   "Explicit offset/limit override the URI-embedded range."
   (pcase-let ((`(,_p ,o ,l)
-               (anvil-file--tool-read--strip-uri
+               (anvil-file--read-normalize-uri-args
                 "file:///tmp/x.el#L10-14" "0" "3")))
     (should (equal "0" o))
     (should (equal "3" l))))
@@ -314,7 +314,7 @@ rather than leaving a short tail."
 (ert-deftest anvil-disclosure-test-file-read-strip-uri-no-range ()
   "A file:// URI without a range just strips the scheme."
   (pcase-let ((`(,p ,o ,l)
-               (anvil-file--tool-read--strip-uri
+               (anvil-file--read-normalize-uri-args
                 "file:///tmp/x.el" nil nil)))
     (should (equal "/tmp/x.el" p))
     (should (null o))

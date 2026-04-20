@@ -241,7 +241,7 @@ Ship 内容 (feat/doc-28-phase2-file-defs):
    Layer 3 template に更新。
 4. =file-read= が =file://PATH[#L<s>-<e>]= URI を受け取ると scheme を
    strip し、range があれば offset/limit を自動計算
-   (=anvil-file--tool-read--strip-uri= helper)。caller 指定の
+   (=anvil-file--read-normalize-uri-args= helper)。caller 指定の
    offset/limit は URI より優先。
 5. =defs-search= description を Layer 2 template に、
    =elisp-get-function-definition= を Layer 3 template に更新。
