@@ -1307,12 +1307,18 @@ org-read-file tool to read entire files"))
 
 (defun anvil-org--tool-read-by-id (uuid)
   "Tool wrapper for org-id://{uuid} resource template.
-UUID is the UUID from headline's ID property.
+UUID is the UUID from headline's ID property.  Accepts either the
+raw UUID or an `org://UUID' citation URI emitted by the
+progressive-disclosure Layer-1 / Layer-2 tools.
 
 MCP Parameters:
-  uuid - UUID from headline's ID property"
-  (or (anvil-org--try-index-read-by-id uuid)
-      (anvil-org--handle-id-resource `(("uuid" . ,uuid)))))
+  uuid - UUID (or org://UUID citation URI) from headline's ID property"
+  (let ((id (if (and (stringp uuid)
+                     (string-prefix-p "org://" uuid))
+                (substring uuid (length "org://"))
+              uuid)))
+    (or (anvil-org--try-index-read-by-id id)
+        (anvil-org--handle-id-resource `(("uuid" . ,id))))))
 
 (defun anvil-org-enable ()
   "Enable the anvil-org module."
@@ -1608,12 +1614,17 @@ Returns: Plain text content of the headline and its subtree"
    #'anvil-org--tool-read-by-id
    :id "org-read-by-id"
    :description
-   "Read Org headline by its unique ID property. More stable than
+   "Layer 3 of anvil progressive disclosure (see `disclosure-help').
+Read Org headline by its unique ID property.  More stable than
 path-based access since IDs don't change when headlines are renamed
-or moved. File containing the ID must be in anvil-org-allowed-files.
+or moved.  Accepts the raw UUID directly or the `org://UUID' citation
+URI returned by Layer 1 (`org-index-index') / Layer 2
+(`org-index-search').  File containing the ID must be in
+anvil-org-allowed-files.
 
 Parameters:
-  uuid - UUID from headline's ID property (string, required)
+  uuid - UUID (or org://UUID citation URI) from headline's ID
+         property (string, required)
 
 Returns: Plain text content of the headline and its subtree"
    :read-only t

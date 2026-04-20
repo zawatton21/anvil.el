@@ -440,13 +440,16 @@ Return the new headline id."
    :id "org-index-search"
    :server-id anvil-org-index--server-id
    :description
-   "Search the org-index for matching headlines (title LIKE, tag
+   "Layer 2 of anvil progressive disclosure (see `disclosure-help').
+Search the org-index for matching headlines (title LIKE, tag
 AND-match, TODO IN, scheduled/deadline date bounds, file path
-LIKE) and return a printed plist of rows.  All parameters are
-optional; omit to disable that filter.  Much cheaper than
-`org-map-entries' scans — one indexed SQL statement, no org-mode
-activation.  Results clip at `anvil-org-index-search-hard-limit'
-(1000) and mark `:truncated t' when clipped."
+LIKE) and return a printed plist of rows.  Each row carries its
+own `org://ID' citation URI under `:org-id' — reuse it as-is in
+Layer 3 (`org-read-by-id').  All parameters are optional; omit to
+disable that filter.  For a cheaper first pass use `org-index-index'
+(Layer 1, ~20 tok/row).  Results clip at
+`anvil-org-index-search-hard-limit' (1000) and mark `:truncated t'
+when clipped."
    :read-only t)
   (anvil-server-register-tool
    #'anvil-org-index--tool-rebuild

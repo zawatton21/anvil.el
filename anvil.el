@@ -116,7 +116,12 @@ These are not loaded by default.  Available modules:
                 / py-list-functions / py-list-classes / py-list-methods
                 / py-list-decorators / py-find-definition /
                 py-surrounding-form.  Requires Emacs 29+ treesit and
-                tree-sitter-python grammar (Doc 21 Phase 1a)"
+                tree-sitter-python grammar (Doc 21 Phase 1a)
+- `disclosure' — Layer-1 (slim index) + disclosure-help tools that
+                formalise the 3-layer read contract documented in
+                docs/design/28-progressive-disclosure.org.  Depends on
+                `anvil-org-index' for the org-index-index handler
+                (Doc 28 Phase 1)"
   :type '(repeat symbol)
   :group 'anvil)
 
