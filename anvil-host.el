@@ -64,14 +64,28 @@ on Japanese Windows. Other OSes default to utf-8."
 Returns (EXIT STDOUT STDERR). Errors on timeout.
 
 `:connection-type' is forced to `pipe' (rather than the Emacs default
-PTY).  With a PTY the spawned shell becomes a session leader, and
-when the shell exits the kernel sends SIGHUP to every process in
-that session — which kills detached / disowned / nohup'd background
-descendants that clipboard helpers such as `wl-copy' rely on (see
-issue #10).  Pipe mode leaves the shell in Emacs's session; detached
-children survive the shell exiting.  `isatty(0/1/2)' becomes false
-for the shell and its children, but the helpers we invoke (wmic /
-wl-copy / xclip / pbcopy / ...) are all fine with non-tty I/O."
+PTY) so `isatty(0/1/2)' stays false for the shell and any grand-
+children; helpers we invoke (wmic / wl-copy / xclip / pbcopy /
+PowerShell / ...) are all fine with non-tty I/O and this keeps the
+captured stdout / stderr byte-accurate.
+
+Detach semantics (issue #10):  pipe mode alone does NOT let an
+arbitrary `& disown' descendant outlive the wrapper shell.
+`make-process' always calls `setsid()' for its direct child so the
+spawned shell is a session leader; fd 0 is inherited from Emacs'
+stdin, which on a typical desktop or server session is a pts/
+device — that becomes the shell's controlling TTY.  `& disown'
+keeps the background job in the shell's session (just hides it
+from `jobs'), so the kernel SIGHUPs it when the shell exits and
+releases the TTY.
+
+The only reliable detach on Linux is `setsid --fork' (or
+equivalent double-fork), which moves the grandchild into a brand-
+new session with no controlling TTY.  That's what `wl-copy' /
+`pbcopy' / `xclip' already do internally for their clipboard-owner
+daemons, which is why clipboard set-then-read works over
+`anvil-shell' in practice.  Callers that need a detached descendant
+for other reasons should invoke `setsid --fork' explicitly."
   (let* ((stdout-buf (generate-new-buffer " *anvil-host-stdout*"))
          (stderr-buf (generate-new-buffer " *anvil-host-stderr*"))
          (default-directory (or cwd default-directory))
