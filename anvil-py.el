@@ -558,6 +558,85 @@ specified) matches.  No-op when the import is already absent."
               file beg end+1 ""
               (format "remove-import import %s" module)))))))))
 
+;;;; --- wrap-expr helpers (Phase 2c) ---------------------------------------
+
+(defconst anvil-py-wrap-placeholder "|anvil-hole|"
+  "Token substituted with the wrapped text inside a `py-wrap-expr' wrapper.")
+
+(defun anvil-py--count-substring (needle haystack)
+  "Return the number of non-overlapping occurrences of NEEDLE in HAYSTACK."
+  (if (string-empty-p needle)
+      0
+    (let ((i 0) (n 0) (len (length needle)))
+      (while (and (< i (length haystack))
+                  (setq i (string-match-p (regexp-quote needle) haystack i)))
+        (cl-incf n)
+        (setq i (+ i len)))
+      n)))
+
+(defun anvil-py--validate-wrapper (wrapper)
+  "Signal a user-error unless WRAPPER has exactly one placeholder.
+Returns WRAPPER unchanged when valid."
+  (let ((n (anvil-py--count-substring anvil-py-wrap-placeholder wrapper)))
+    (cond
+     ((= n 0)
+      (user-error "anvil-py-wrap-expr: wrapper missing `%s' placeholder"
+                  anvil-py-wrap-placeholder))
+     ((> n 1)
+      (user-error "anvil-py-wrap-expr: wrapper has %d `%s' placeholders \
+(want exactly 1)" n anvil-py-wrap-placeholder)))
+    wrapper))
+
+(defun anvil-py--node-at-exact-range (start end)
+  "Return the tree-sitter node whose range is exactly [START, END), or nil.
+Walks from the smallest covering node outward until the bounds match;
+if no node has that exact range we return nil so the caller can
+surface a precise error rather than accepting a misaligned wrap."
+  (let ((n (treesit-node-on start end 'python)))
+    (catch 'found
+      (while n
+        (when (and (= (treesit-node-start n) start)
+                   (= (treesit-node-end n) end))
+          (throw 'found n))
+        (setq n (treesit-node-parent n)))
+      nil)))
+
+;;;; --- rename-import helpers (Phase 2c) -----------------------------------
+
+(defun anvil-py--split-name-alias (entry)
+  "Return (cons BARE-NAME ALIAS-OR-NIL) for a from-import entry string.
+An ENTRY of \"X\" yields (\"X\" . nil), \"X as Y\" yields (\"X\" . \"Y\")."
+  (let ((parts (split-string entry "[ \t]+as[ \t]+")))
+    (cons (car parts) (cadr parts))))
+
+(defun anvil-py--render-name-entry (bare alias)
+  "Render a single from-import entry from BARE name and optional ALIAS."
+  (if (and alias (not (string-empty-p alias)))
+      (format "%s as %s" bare alias)
+    bare))
+
+(defun anvil-py--find-bare-import-node (root module)
+  "Return the bare `import MODULE [as X]' statement node in ROOT, or nil.
+Matches on the module dotted_name regardless of whether it currently
+carries an alias."
+  (let ((q (anvil-py--query 'imports))
+        found)
+    (dolist (cap (treesit-query-capture root q))
+      (unless found
+        (let ((n (cdr cap)))
+          (when (string= (treesit-node-type n) "import_statement")
+            (dolist (c (treesit-node-children n t))
+              (pcase (treesit-node-type c)
+                ("dotted_name"
+                 (when (string= (anvil-treesit-node-text c) module)
+                   (setq found n)))
+                ("aliased_import"
+                 (let ((nm (treesit-node-child-by-field-name c "name")))
+                   (when (and nm (string= (anvil-treesit-node-text nm)
+                                          module))
+                     (setq found n))))))))))
+    found))
+
 ;;;; --- replace-function helpers (Phase 2b) -------------------------------
 
 (defun anvil-py--line-beginning-at (point)
@@ -680,6 +759,105 @@ Returns the plan unless APPLY is truthy."
         (anvil-treesit-apply-plan plan)
       plan)))
 
+(cl-defun anvil-py--plan-wrap-expr (file start end wrapper)
+  "Build an edit plan wrapping the expression [START, END) of FILE.
+WRAPPER must contain exactly one `|anvil-hole|' placeholder; its
+occurrence is replaced by the original text from the file.  Returns
+a no-op plan when WRAPPER equals the literal placeholder (wrapping
+with nothing is a no-op by definition) and when the computed
+replacement matches the current text."
+  (anvil-py--validate-wrapper wrapper)
+  (anvil-treesit-with-root file anvil-py--lang root
+    (unless (and (integerp start) (integerp end) (< start end))
+      (user-error "anvil-py-wrap-expr: invalid range (%S . %S)" start end))
+    (let* ((node (anvil-py--node-at-exact-range start end))
+           (original (buffer-substring-no-properties start end))
+           (replacement (replace-regexp-in-string
+                         (regexp-quote anvil-py-wrap-placeholder)
+                         original wrapper t t))
+           (reason (format "wrap-expr [%d,%d)%s" start end
+                           (if node
+                               (format " (%s)" (treesit-node-type node))
+                             " (unaligned!)"))))
+      (unless node
+        (user-error "anvil-py-wrap-expr: range %d-%d does not align with \
+a tree-sitter node — wrapping would produce invalid Python"
+                    start end))
+      (if (string= original replacement)
+          (anvil-treesit-make-noop-plan file reason)
+        (anvil-treesit-make-plan file start end replacement reason)))))
+
+(cl-defun anvil-py--plan-rename-import (file spec)
+  "Build an edit plan renaming an import alias in FILE.
+SPEC shapes are documented on `anvil-py-rename-import'.  Signals a
+`user-error' when the import does not exist — unlike add/remove,
+renaming requires the target to be present.  Returns a no-op plan
+when the new alias already matches the current one."
+  (anvil-treesit-with-root file anvil-py--lang root
+    (pcase (anvil-py--spec-kind spec)
+      ('import
+       (let* ((module (plist-get spec :module))
+              (new-alias (plist-get spec :new-alias))
+              (node (and module (anvil-py--find-bare-import-node root module))))
+         (unless module
+           (user-error "anvil-py-rename-import: :module required"))
+         (unless node
+           (user-error
+            "anvil-py-rename-import: no `import %s' in %s"
+            module (file-name-nondirectory file)))
+         (let* ((current-text (anvil-treesit-node-text node))
+                (new-text (anvil-py--render-import module new-alias))
+                (beg (treesit-node-start node))
+                (end (treesit-node-end node)))
+           (if (string= current-text new-text)
+               (anvil-treesit-make-noop-plan
+                file (format "rename-import import %s" module))
+             (anvil-treesit-make-plan
+              file beg end new-text
+              (format "rename-import import %s → %s"
+                      module (if new-alias (format "as %s" new-alias)
+                               "(bare)")))))))
+      ('from
+       (let* ((from-mod (plist-get spec :from))
+              (target-name (plist-get spec :name))
+              (new-alias (plist-get spec :new-alias))
+              (node (and from-mod
+                         (anvil-py--find-from-import root from-mod))))
+         (unless (and from-mod target-name)
+           (user-error
+            "anvil-py-rename-import: :from and :name required for from-import"))
+         (unless node
+           (user-error
+            "anvil-py-rename-import: no `from %s import' in %s"
+            from-mod (file-name-nondirectory file)))
+         (let* ((entries (anvil-py--from-import-names node))
+                (target-idx (cl-position target-name entries
+                                         :test (lambda (want entry)
+                                                 (string=
+                                                  want
+                                                  (car (anvil-py--split-name-alias
+                                                        entry)))))))
+           (unless target-idx
+             (user-error
+              "anvil-py-rename-import: %s not in `from %s import'"
+              target-name from-mod))
+           (let* ((current-entry (nth target-idx entries))
+                  (new-entry (anvil-py--render-name-entry target-name new-alias)))
+             (if (string= current-entry new-entry)
+                 (anvil-treesit-make-noop-plan
+                  file (format "rename-import from %s:%s"
+                               from-mod target-name))
+               (let* ((new-entries (copy-sequence entries))
+                      (_ (setf (nth target-idx new-entries) new-entry))
+                      (new-text (anvil-py--render-from-import
+                                 from-mod new-entries))
+                      (beg (treesit-node-start node))
+                      (end (treesit-node-end node)))
+                 (anvil-treesit-make-plan
+                  file beg end new-text
+                  (format "rename-import from %s: %s → %s"
+                          from-mod current-entry new-entry)))))))))))
+
 (cl-defun anvil-py--plan-replace-function (file name new-source class-filter)
   "Build an edit plan replacing the def named NAME in FILE with NEW-SOURCE.
 Dedents NEW-SOURCE and reindents to the column of the existing def.
@@ -707,6 +885,51 @@ leading indent is included in the old range and reindented uniformly."
       (if (string= current replacement)
           (anvil-treesit-make-noop-plan file reason)
         (anvil-treesit-make-plan file line-beg fn-end replacement reason)))))
+
+(cl-defun anvil-py-wrap-expr (file start end wrapper &key apply)
+  "Wrap the expression [START, END) of FILE with WRAPPER.
+WRAPPER is a source template containing `anvil-py-wrap-placeholder'
+\(the literal string \"|anvil-hole|\") exactly once — that token is
+replaced with the original expression text.
+
+Example:
+  (anvil-py-wrap-expr FILE (cons 120 130) \"cached(|anvil-hole|)\")
+    turns `compute()' at columns 120-130 into `cached(compute())'.
+
+Safety: the range must align to an exact tree-sitter node boundary;
+misaligned ranges signal a user-error rather than produce invalid
+Python.  WRAPPER must contain the placeholder exactly once.
+
+Returns the plan unless APPLY is truthy.  :apply t writes via
+`anvil-treesit-apply-plan' and returns the plan with :applied-at."
+  (let ((plan (anvil-py--plan-wrap-expr file start end wrapper)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
+
+(cl-defun anvil-py-rename-import (file spec &key apply)
+  "Rename the alias of an existing import in FILE.
+SPEC is a plist:
+  (:kind 'import :module MODULE :new-alias STR-OR-NIL)
+    — rewrite `import MODULE [as OLD]' to `import MODULE [as NEW]';
+      :new-alias nil drops the alias (makes it bare).
+  (:kind 'from :from MODULE :name NAME :new-alias STR-OR-NIL)
+    — rewrite the single NAME entry inside `from MODULE import ...'.
+      Other names in the statement are preserved verbatim.
+
+Signals a `user-error' when the target import does not exist — this
+is an edit, not a create.  Returns a no-op plan when the new alias
+already matches the current one.  This is *not* a reference rename:
+the identifier's use sites in the code body are not touched (that
+needs Phase 3).
+
+Returns the edit plan unless APPLY is truthy, in which case the
+plan is applied via `anvil-treesit-apply-plan' and returned with
+:applied-at."
+  (let ((plan (anvil-py--plan-rename-import file spec)))
+    (if (anvil-treesit-truthy apply)
+        (anvil-treesit-apply-plan plan)
+      plan)))
 
 (cl-defun anvil-py-replace-function (file name new-source &key class apply)
   "Replace the body of the def named NAME in FILE with NEW-SOURCE.
@@ -837,6 +1060,30 @@ MCP Parameters:
   (anvil-server-with-error-handling
    (anvil-py-remove-import file (anvil-py--coerce-spec spec) :apply apply)))
 
+(defun anvil-py--tool-wrap-expr (file start end wrapper apply)
+  "MCP wrapper — wrap an expression.
+
+MCP Parameters:
+  file    - absolute path to the .py file to edit
+  start   - 1-based buffer point at the start of the expression
+  end     - 1-based buffer point at the end of the expression
+  wrapper - source template containing `|anvil-hole|' exactly once
+  apply   - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (let ((s (if (stringp start) (string-to-number start) start))
+         (e (if (stringp end) (string-to-number end) end)))
+     (anvil-py-wrap-expr file s e wrapper :apply apply))))
+
+(defun anvil-py--tool-rename-import (file spec apply)
+  "MCP wrapper — rename an import alias.
+
+MCP Parameters:
+  file  - absolute path to the .py file to edit
+  spec  - plist describing the rename (see `anvil-py-rename-import')
+  apply - truthy to write; default returns a preview plan"
+  (anvil-server-with-error-handling
+   (anvil-py-rename-import file (anvil-py--coerce-spec spec) :apply apply)))
+
 (defun anvil-py--tool-replace-function (file name new-source class apply)
   "MCP wrapper — replace a Python function or method.
 
@@ -887,7 +1134,9 @@ MCP Parameters:
     "py-surrounding-form"
     "py-add-import"
     "py-remove-import"
-    "py-replace-function")
+    "py-rename-import"
+    "py-replace-function"
+    "py-wrap-expr")
   "Stable list of MCP tool ids registered by `anvil-py-enable'.")
 
 (defun anvil-py--register-tools ()
@@ -977,6 +1226,18 @@ is dropped.  Idempotent: a missing import returns a no-op plan.
 Preview-default; pass :apply t to write via file-batch-across.")
 
   (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-py--tool-rename-import)
+   :id "py-rename-import"
+   :server-id anvil-py--server-id
+   :description "Rename the alias of an existing import statement.
+SPEC shape: (:kind 'import :module M :new-alias S-or-nil) for bare
+imports, or (:kind 'from :from M :name N :new-alias S-or-nil) for
+from-imports (single-name alias rename; other names in the same
+statement are preserved).  Errors when the target import is not
+present — this is an edit, not a create.  Reference renaming at
+use sites is out of scope (Phase 3).  Preview-default.")
+
+  (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-py--tool-replace-function)
    :id "py-replace-function"
    :server-id anvil-py--server-id
@@ -987,7 +1248,20 @@ column, so the same input works for top-level functions and for
 methods.  CLASS disambiguates methods with the same name across
 classes; without CLASS, an ambiguous NAME errors with the candidate
 list.  Decorators attached to the def are preserved.  Idempotent:
-replacing with identical source is a no-op.  Preview-default."))
+replacing with identical source is a no-op.  Preview-default.")
+
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-py--tool-wrap-expr)
+   :id "py-wrap-expr"
+   :server-id anvil-py--server-id
+   :description "Wrap the expression at [START, END) with WRAPPER.
+WRAPPER is a source template containing the placeholder
+`|anvil-hole|' exactly once — that token is replaced with the
+original expression text from the file.  The range must align to an
+exact tree-sitter node boundary, or the tool errors rather than
+produce invalid Python.  Example: wrapping `compute()' with
+`cached(|anvil-hole|)' yields `cached(compute())'.
+Preview-default."))
 
 (defun anvil-py-enable ()
   "Enable the Phase 1a py-* MCP tools."

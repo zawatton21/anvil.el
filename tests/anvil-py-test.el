@@ -549,6 +549,135 @@ function_definition node itself is swapped."
         (should (string-match-p "^@staticmethod\ndef static_helper" text))
         (should (string-match-p "return x \\+ 99" text))))))
 
+;;;; --- rename-import (Phase 2c) ------------------------------------------
+
+(ert-deftest anvil-py-test-rename-import-bare-alias-rename ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-rename-import
+       f '(:kind import :module "sys" :new-alias "sy") :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^import sys as sy$" text))
+        (should-not (string-match-p "^import sys as system$" text))))))
+
+(ert-deftest anvil-py-test-rename-import-drops-alias-on-nil ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-rename-import
+       f '(:kind import :module "sys" :new-alias nil) :apply t)
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^import sys$" text))
+        (should-not (string-match-p "^import sys as" text))))))
+
+(ert-deftest anvil-py-test-rename-import-from-preserves-siblings ()
+  "Renaming one name in a multi-name from-import must not touch
+the other names."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py-rename-import
+       f '(:kind from :from "openpyxl" :name "Workbook" :new-alias "WB")
+       :apply t)
+      (let* ((ims (anvil-py-list-imports f))
+             (openpyxl (cl-find-if (lambda (i)
+                                     (string-match-p "openpyxl"
+                                                     (plist-get i :text)))
+                                   ims))
+             (text (plist-get openpyxl :text)))
+        (should (string-match-p "Workbook as WB" text))
+        (should (string-match-p "load_workbook" text))))))
+
+(ert-deftest anvil-py-test-rename-import-same-alias-is-noop ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((plan (anvil-py-rename-import
+                   f '(:kind import :module "sys" :new-alias "system"))))
+        (should (null (plist-get plan :ops)))
+        (should (string-match-p "no-op" (plist-get plan :summary)))))))
+
+(ert-deftest anvil-py-test-rename-import-missing-module-errors ()
+  "Renaming an import that doesn't exist errors — rename is an edit,
+not a create (use `py-add-import' for that)."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error
+       (anvil-py-rename-import
+        f '(:kind import :module "nonexistent" :new-alias "no"))
+       :type 'user-error)
+      (should-error
+       (anvil-py-rename-import
+        f '(:kind from :from "openpyxl" :name "NotPresent" :new-alias "NP"))
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-rename-import-spec-validation ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error (anvil-py-rename-import f '(:kind import))
+                    :type 'user-error)
+      (should-error (anvil-py-rename-import f '(:kind from :from "openpyxl"))
+                    :type 'user-error))))
+
+;;;; --- wrap-expr (Phase 2c) -----------------------------------------------
+
+(ert-deftest anvil-py-test-wrap-expr-wraps-integer-literal ()
+  "Wrapping the integer `1000' of `MAX_ROWS = 1000' with int() produces
+`int(1000)'."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let* ((text (with-temp-buffer (insert-file-contents f) (buffer-string)))
+             (idx (string-match "1000\n" text))
+             (start (1+ idx))
+             (end (+ start 4)))
+        (anvil-py-wrap-expr f start end "int(|anvil-hole|)" :apply t)
+        (let ((after (with-temp-buffer
+                       (insert-file-contents f) (buffer-string))))
+          (should (string-match-p "MAX_ROWS = int(1000)" after)))))))
+
+(ert-deftest anvil-py-test-wrap-expr-missing-placeholder-errors ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error
+       (anvil-py-wrap-expr f 100 110 "no_hole_here()")
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-wrap-expr-duplicate-placeholder-errors ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error
+       (anvil-py-wrap-expr f 100 110 "f(|anvil-hole|, |anvil-hole|)")
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-wrap-expr-misaligned-range-errors ()
+  "A range that doesn't align to a tree-sitter node boundary signals
+a user-error rather than producing invalid Python."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      ;; Pick an obviously misaligned range: [500, 503) lands mid-identifier.
+      (should-error
+       (anvil-py-wrap-expr f 500 503 "f(|anvil-hole|)")
+       :type 'user-error))))
+
+(ert-deftest anvil-py-test-wrap-expr-invalid-range-errors ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (should-error (anvil-py-wrap-expr f 0 0 "f(|anvil-hole|)")
+                    :type 'user-error)
+      (should-error (anvil-py-wrap-expr f 10 5 "f(|anvil-hole|)")
+                    :type 'user-error))))
+
+(ert-deftest anvil-py-test-wrap-expr-placeholder-only-is-noop ()
+  "Wrapping with just the placeholder (no surrounding text) replaces
+the range with itself — a no-op plan."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let* ((text (with-temp-buffer (insert-file-contents f) (buffer-string)))
+             (idx (string-match "1000\n" text))
+             (start (1+ idx))
+             (end (+ start 4))
+             (plan (anvil-py-wrap-expr f start end "|anvil-hole|")))
+        (should (null (plist-get plan :ops)))))))
+
 (ert-deftest anvil-py-test-replace-function-handles-leading-indent-in-input ()
   "Caller source with leading indent (e.g. copied from inside a
 class) is dedented before being re-indented to the target column.
