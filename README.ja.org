@@ -211,6 +211,26 @@ Emacs はバックグラウンドで daemon 1 つを常駐させるだけ。Emac
 
 ** 最小セットアップ (Emacs 未経験前提)
 
+*最短手順* — OS ごとに 1 コマンド。詳細は
+[[file:docs/QUICKSTART.org][docs/QUICKSTART.org]] (Emacs 未経験者向け完全ガイド) 参照:
+
+#+begin_src bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/zawatton/anvil.el/master/install.sh | bash
+#+end_src
+
+#+begin_src powershell
+# Windows (PowerShell)
+iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1 | iex
+#+end_src
+
+インストーラーは Emacs の自動インストール (=apt= / =dnf= / =brew= /
+=winget=)、anvil.el の clone、daemon 起動、MCP bridge 配置、
+=~/.claude.json= への登録まで一気に行います。Emacs が既に入っている
+なら =--skip-emacs= (Windows では =-SkipEmacs=) を付けて下さい。
+
+*手動でやる場合*:
+
 1. *Emacs を入れる* — daemon が動けば良いので普段使い設定は不要
    - Linux: =sudo apt install emacs= / =sudo dnf install emacs=
    - macOS: =brew install --cask emacs=

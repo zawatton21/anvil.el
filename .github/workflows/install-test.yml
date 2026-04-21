@@ -1,0 +1,199 @@
+name: install-test
+
+# Regression gate for install.sh / install.ps1.  Fires only when
+# installer-related files change — the existing CI workflow still runs on
+# every push.  Each job runs the real installer on a fresh runner, then
+# asserts the post-install state (init files / daemon / ~/.claude.json
+# entry) matches what a non-Emacs Claude Code user would expect.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'scripts/**'
+      - 'docs/QUICKSTART.org'
+      - '.github/workflows/install-test.yml'
+  pull_request:
+    branches: ['**']
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'scripts/**'
+      - 'docs/QUICKSTART.org'
+      - '.github/workflows/install-test.yml'
+  workflow_dispatch:
+
+jobs:
+  install-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/checkout leaves the working tree at a detached HEAD on
+      # push events and at a synthesised merge commit on pull_request.
+      # install.sh/ps1 pass the ref to `git clone --branch`, which needs
+      # a real branch name.  Create one at HEAD so both paths work.
+      - name: Create named branch for --branch clone
+        shell: bash
+        run: |
+          git checkout -B install-test-ref
+
+      - name: Set up Emacs
+        uses: jcs090218/setup-emacs@master
+        with:
+          version: '29.4'
+
+      # -----------------------------------------------------------------
+      # Linux + macOS
+      # -----------------------------------------------------------------
+
+      - name: Run install.sh (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash install.sh --yes --skip-emacs \
+            --repo "$PWD" \
+            --branch install-test-ref
+
+      - name: Assert post-install state (Linux / macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          test -f "$HOME/.emacs.d/anvil-init.el"   || fail "anvil-init.el missing"
+          test -x "$HOME/.emacs.d/anvil-stdio.sh"  || fail "anvil-stdio.sh not executable"
+          grep -Fq anvil-init.el "$HOME/.emacs.d/init.el" \
+            || fail "init.el does not load anvil-init"
+          test -f "$HOME/.emacs.d/external-packages/anvil.el/anvil.el" \
+            || fail "anvil clone missing"
+
+          # The installer backgrounds `emacs --daemon`; give it a moment
+          # to create its socket before probing.
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            emacsclient -e t >/dev/null 2>&1 && break
+            sleep 1
+          done
+          emacsclient -e t >/dev/null 2>&1 || fail "daemon not responding"
+
+          emacsclient -e '(featurep (quote anvil))' | grep -Fq t \
+            || fail "anvil feature not loaded"
+          emacsclient -e '(fboundp (quote anvil-server-start))' | grep -Fq t \
+            || fail "anvil-server-start not bound (autoload regression?)"
+
+          python3 - <<'PY'
+          import json, os, sys
+          cfg = json.load(open(os.path.expanduser('~/.claude.json')))
+          e = cfg['mcpServers']['anvil']
+          assert e['command'].endswith('anvil-stdio.sh'), e
+          assert '--server-id=anvil' in e['args'], e
+          print('mcpServers.anvil ok')
+          PY
+
+          echo "PASS"
+
+      # -----------------------------------------------------------------
+      # Windows
+      # -----------------------------------------------------------------
+
+      - name: Run install.ps1 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./install.ps1 -Yes -SkipEmacs `
+            -Repo $pwd.Path `
+            -Branch install-test-ref
+
+      - name: Assert post-install state (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
+
+          if (-not (Test-Path "$EmacsDir\anvil-init.el"))  { throw "anvil-init.el missing" }
+          if (-not (Test-Path "$EmacsDir\anvil-stdio.sh")) { throw "anvil-stdio.sh missing" }
+          if (-not (Test-Path "$EmacsDir\anvil-stdio.cmd")) { throw "anvil-stdio.cmd missing" }
+          if (-not (Select-String -Path "$EmacsDir\init.el" -SimpleMatch 'anvil-init.el' -Quiet)) {
+              throw "init.el does not load anvil-init"
+          }
+
+          # Give the backgrounded daemon a moment to come up.
+          $up = $false
+          for ($i = 0; $i -lt 10; $i++) {
+              try {
+                  $probe = & emacsclient.exe -e 't' 2>$null
+                  if ($probe -match 't') { $up = $true; break }
+              } catch {}
+              Start-Sleep -Seconds 1
+          }
+          if (-not $up) { throw "daemon not responding" }
+
+          $probe = & emacsclient.exe -e '(featurep (quote anvil))'
+          if ($probe -notmatch 't') { throw "anvil feature not loaded (got: $probe)" }
+
+          $probe = & emacsclient.exe -e '(fboundp (quote anvil-server-start))'
+          if ($probe -notmatch 't') { throw "anvil-server-start not bound (got: $probe)" }
+
+          $cfg = Get-Content -Raw -Path "$env:USERPROFILE\.claude.json" | ConvertFrom-Json
+          if (-not $cfg.mcpServers.anvil.command.EndsWith('.cmd')) {
+              throw "mcpServers.anvil.command should point at anvil-stdio.cmd on Windows (got: $($cfg.mcpServers.anvil.command))"
+          }
+
+          Write-Host "PASS"
+
+      # -----------------------------------------------------------------
+      # Diagnostics — only on failure, so successful runs stay quiet.
+      # -----------------------------------------------------------------
+
+      - name: Diagnostics on failure (Linux / macOS)
+        if: failure() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "--- env ---"
+          echo "HOME=$HOME"
+          which emacs || true
+          emacs --version | head -1 || true
+          echo "--- anvil-init.el ---"
+          sed 's/^/    /' "$HOME/.emacs.d/anvil-init.el" 2>/dev/null || echo "    (missing)"
+          echo "--- init.el ---"
+          sed 's/^/    /' "$HOME/.emacs.d/init.el" 2>/dev/null || echo "    (missing)"
+          echo "--- ~/.emacs ---"
+          sed 's/^/    /' "$HOME/.emacs" 2>/dev/null || echo "    (missing)"
+          echo "--- ~/.claude.json ---"
+          sed 's/^/    /' "$HOME/.claude.json" 2>/dev/null || echo "    (missing)"
+          echo "--- emacs processes ---"
+          ps aux | grep -i emacs | grep -v grep || true
+          echo "--- daemon probe ---"
+          emacsclient -e t 2>&1 || true
+
+      - name: Diagnostics on failure (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
+          Write-Host "--- env ---"
+          Write-Host "USERPROFILE=$env:USERPROFILE"
+          Get-Command emacs.exe -ErrorAction SilentlyContinue | Format-List
+          Write-Host "--- anvil-init.el ---"
+          Get-Content "$EmacsDir\anvil-init.el" -ErrorAction SilentlyContinue
+          Write-Host "--- init.el ---"
+          Get-Content "$EmacsDir\init.el" -ErrorAction SilentlyContinue
+          Write-Host "--- anvil-stdio.cmd ---"
+          Get-Content "$EmacsDir\anvil-stdio.cmd" -ErrorAction SilentlyContinue
+          Write-Host "--- ~/.claude.json ---"
+          Get-Content "$env:USERPROFILE\.claude.json" -ErrorAction SilentlyContinue
+          Write-Host "--- emacs processes ---"
+          Get-Process emacs -ErrorAction SilentlyContinue | Format-Table
+          Write-Host "--- daemon probe ---"
+          & emacsclient.exe -e 't' 2>&1

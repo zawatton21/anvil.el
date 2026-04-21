@@ -214,6 +214,28 @@ Workload-dependent, but a typical refactoring session saves
 
 ** Minimal setup (no prior Emacs experience required)
 
+*Fastest path* — one command per OS.  Full walkthrough in
+[[file:docs/QUICKSTART.org][docs/QUICKSTART.org]] (recommended if you
+are new to Emacs):
+
+#+begin_src bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/zawatton/anvil.el/master/install.sh | bash
+#+end_src
+
+#+begin_src powershell
+# Windows
+iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1 | iex
+#+end_src
+
+The installer auto-installs Emacs (via =apt= / =dnf= / =brew= /
+=winget=), clones the repo, starts the daemon, drops the MCP bridge
+into =~/.emacs.d/=, and registers the server in =~/.claude.json=.
+Add =--skip-emacs= (or =-SkipEmacs= on Windows) if Emacs is already
+installed.
+
+*Manual path* — if you prefer to do it step-by-step:
+
 1. *Install Emacs* — only the daemon needs to run; no day-to-day config required
    - Linux: =sudo apt install emacs= / =sudo dnf install emacs=
    - macOS: =brew install --cask emacs=

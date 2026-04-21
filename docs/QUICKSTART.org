@@ -1,0 +1,225 @@
+#+title: anvil.el — Quick Start for Non-Emacs Users
+#+subtitle: Add Emacs as an MCP backend to Claude Code in one command
+#+date: 2026-04-20
+#+author: zawatton
+#+options: toc:2 num:nil
+
+* Who this is for
+
+You use Claude Code (or any MCP-compatible AI client) and want the
+anvil.el tool surface — file editing, org-mode, git, shell — without
+learning Emacs.
+
+You *do not need to know Emacs Lisp*.  The installer keeps Emacs
+running as a headless daemon in the background; your day-to-day
+editor stays untouched.
+
+* TL;DR — one command per OS
+
+** Linux / macOS
+
+#+begin_src bash
+curl -fsSL https://raw.githubusercontent.com/zawatton/anvil.el/master/install.sh | bash
+#+end_src
+
+The script will:
+1. detect your package manager (=apt= / =dnf= / =pacman= / =zypper= / =brew=) and install Emacs if missing,
+2. clone anvil.el into =~/.emacs.d/external-packages/anvil.el=,
+3. start the Emacs daemon,
+4. install the =anvil-stdio.sh= MCP bridge,
+5. add =mcpServers.anvil= to =~/.claude.json=.
+
+Skip the Emacs install if you already have it:
+#+begin_src bash
+bash install.sh --skip-emacs
+#+end_src
+
+** Windows (PowerShell)
+
+#+begin_src powershell
+iwr -useb https://raw.githubusercontent.com/zawatton/anvil.el/master/install.ps1 | iex
+#+end_src
+
+Or with explicit options:
+#+begin_src powershell
+# If you already have Emacs (e.g. MSYS2 or GNU binary):
+.\install.ps1 -SkipEmacs
+
+# Preview without touching anything:
+.\install.ps1 -DryRun
+#+end_src
+
+Prerequisites on Windows: *Git for Windows* (for =bash= + =git=) must
+be installed before running the script.  Download:
+https://git-scm.com/download/win
+
+* After the installer finishes
+
+1. *Restart Claude Code*.  The new MCP server only appears on next
+   session start.
+2. Confirm registration:
+   #+begin_src shell
+   claude mcp list
+   # → anvil: /…/anvil-stdio.sh (connected)
+   #+end_src
+3. Try a tool call from inside Claude Code:
+   #+begin_example
+   @anvil list-tools
+   #+end_example
+
+* Platform-specific notes
+
+** Linux
+
+| Distro family | Package manager | Emacs package    |
+|---------------+-----------------+------------------|
+| Debian/Ubuntu | =apt=           | =emacs=          |
+| Fedora/RHEL   | =dnf=           | =emacs=          |
+| Arch          | =pacman=        | =emacs=          |
+| openSUSE      | =zypper=        | =emacs=          |
+
+The installer uses =sudo= for =apt= / =dnf= / =pacman= / =zypper= so
+you may be prompted for your password.  =brew= is used without
+=sudo= if present (e.g., on Linuxbrew).
+
+To persist the Emacs daemon across reboots, add a systemd user unit:
+#+begin_src conf
+# ~/.config/systemd/user/emacs.service
+[Unit]
+Description=Emacs daemon
+[Service]
+Type=forking
+ExecStart=/usr/bin/emacs --daemon
+ExecStop=/usr/bin/emacsclient --eval "(kill-emacs)"
+Restart=on-failure
+[Install]
+WantedBy=default.target
+#+end_src
+
+Then: =systemctl --user enable --now emacs=.
+
+** macOS
+
+The installer picks =brew install emacs= (CLI build, fast to install).
+If you prefer the GUI Cask, run =brew install --cask emacs= *before*
+the installer, then pass =--skip-emacs=.
+
+To persist the daemon across reboots:
+#+begin_src xml
+<!-- ~/Library/LaunchAgents/org.gnu.emacs.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>       <string>org.gnu.emacs</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/opt/homebrew/bin/emacs</string>
+      <string>--fg-daemon</string>
+    </array>
+    <key>RunAtLoad</key>   <true/>
+    <key>KeepAlive</key>   <true/>
+  </dict>
+</plist>
+#+end_src
+
+Then: =launchctl load ~/Library/LaunchAgents/org.gnu.emacs.plist=.
+
+On Apple Silicon the Homebrew prefix is =/opt/homebrew=; on Intel
+Macs it is =/usr/local=.
+
+** Windows
+
+The installer writes two files into =%USERPROFILE%\.emacs.d\=:
+- =anvil-stdio.sh= (the bash-based MCP bridge), and
+- =anvil-stdio.cmd= (a tiny wrapper that Claude Code invokes, which
+  calls =bash.exe= on the script).
+
+Claude Code's config (=%USERPROFILE%\.claude.json=) is pointed at the
+=.cmd= wrapper.  You do not need to edit it.
+
+*Daemon persistence*: Task Scheduler is the easiest route —
+=At log on= → =Start a program= → =runemacs.exe= with argument
+=--daemon=.
+
+*Known Windows quirks* (all handled by the bridge, listed here for
+diagnostic context):
+- MSYS =emacsclient= has a 512-byte read buffer vs the Emacs server's
+  1024-byte frame, which used to split long responses.  =anvil-stdio.sh=
+  strips the artefacts before base64-decoding.
+- ConPTY stdin is one-directional — this only matters if you were
+  trying to drive =vim= / =less= through the bridge; anvil's file and
+  org tools are unaffected.
+
+* Uninstall
+
+The installer is non-destructive and keeps a backup of your old
+=~/.claude.json= at =~/.claude.json.anvil-backup=.  To roll back:
+
+#+begin_src bash
+# Linux / macOS
+mv ~/.claude.json.anvil-backup ~/.claude.json
+rm -rf ~/.emacs.d/external-packages/anvil.el
+rm -f  ~/.emacs.d/anvil-stdio.sh ~/.emacs.d/anvil-init.el
+emacsclient -e '(kill-emacs)'
+#+end_src
+
+#+begin_src powershell
+# Windows
+Move-Item $env:USERPROFILE\.claude.json.anvil-backup $env:USERPROFILE\.claude.json -Force
+Remove-Item -Recurse -Force $env:USERPROFILE\.emacs.d\external-packages\anvil.el
+Remove-Item -Force $env:USERPROFILE\.emacs.d\anvil-stdio.sh, $env:USERPROFILE\.emacs.d\anvil-stdio.cmd, $env:USERPROFILE\.emacs.d\anvil-init.el
+emacsclient -e '(kill-emacs)'
+#+end_src
+
+Then remove the =(load …anvil-init.el)= line from =~/.emacs.d/init.el=
+(or delete =init.el= entirely if you never used Emacs outside anvil).
+
+* Troubleshooting
+
+** =emacs: command not found= after installer said success
+Open a fresh shell — some installers (winget, brew) only mutate PATH
+for new child processes.  If it still fails, re-run with
+=--skip-emacs= after confirming =which emacs= works.
+
+** =emacsclient= hangs
+The daemon did not start cleanly.  Inspect:
+#+begin_src bash
+pkill -f 'emacs.*--daemon'
+emacs --daemon --debug-init
+#+end_src
+
+** Claude Code says "anvil: failed to connect"
+The bridge script path in =~/.claude.json= points at something that
+no longer exists, or the Emacs daemon isn't running.  Re-run the
+installer — it's idempotent.
+
+** I want anvil on master instead of =v0.3.1= stable
+Pass =--branch master= (Linux/macOS) or =-Branch master= (Windows).
+Stable tag is recommended for day-to-day use; master occasionally
+moves tool signatures.
+
+** Where do I find what tools are available?
+From inside Claude Code:
+#+begin_example
+@anvil list-tools
+#+end_example
+
+Or from any shell:
+#+begin_src bash
+emacsclient -e '(mapcar (quote car) (gethash "anvil" anvil-server--tools))'
+#+end_src
+
+* Next steps (optional)
+
+- Add the anvil-preferring snippet to your =CLAUDE.md= so the model
+  prefers =file-batch= / =org-read-*= over plain =Read= / =Grep=.
+  See the main README's /Recommended snippet/ section.
+- Explore optional modules (=xlsx=, =pdf=, =orchestrator=, …) via
+  =anvil-optional-modules=.  The defaults are already generous.
+- Read the design docs at =docs/design/= to understand the
+  architecture.
+
+Ship a bug report if anything in this guide misbehaves:
+https://github.com/zawatton/anvil.el/issues
