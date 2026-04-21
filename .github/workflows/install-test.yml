@@ -110,6 +110,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Runner has no HOME; align it with USERPROFILE so the daemon
+          # install.ps1 spawns and the emacsclient probes we run later
+          # share a user-emacs-directory view.  install.ps1 now also
+          # does this internally, but setting it here makes subsequent
+          # workflow steps agree too.
+          $env:HOME = $env:USERPROFILE
           ./install.ps1 -Yes -SkipEmacs `
             -Repo $pwd.Path `
             -Branch install-test-ref
@@ -119,6 +125,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:HOME = $env:USERPROFILE  # match install.ps1 + daemon view
           $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
 
           Write-Host "[gate 1/7] file presence"
@@ -202,11 +209,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
+          # Note: do NOT set $env:HOME here so the output reflects the
+          # real (possibly empty) HOME value that caused the failure.
           $EmacsDir = Join-Path $env:USERPROFILE '.emacs.d'
 
           Write-Host "--- env ---"
           Write-Host "USERPROFILE=$env:USERPROFILE"
           Write-Host "HOME=$env:HOME"
+          Write-Host "APPDATA=$env:APPDATA"
           Write-Host "PATH head:"
           ($env:PATH -split ';') | Select-Object -First 10 | ForEach-Object { Write-Host "  $_" }
 

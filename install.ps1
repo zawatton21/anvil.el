@@ -52,6 +52,19 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Windows Emacs derives `user-emacs-directory` from $HOME, and silently
+# falls back to $APPDATA\.emacs.d when $HOME is unset.  Users (and this
+# installer) expect ~/.emacs.d to mean $USERPROFILE\.emacs.d, so the two
+# views disagree on fresh systems where $HOME was never set — the
+# daemon boots from $APPDATA\.emacs.d\init.el (which does not exist)
+# while we write config to $USERPROFILE\.emacs.d\init.el.  Force $HOME
+# to $USERPROFILE for this process tree so the daemon we spawn, and
+# emacsclient probes against it, agree with where we put the files.
+if (-not $env:HOME) {
+    $env:HOME = $env:USERPROFILE
+    Write-Host "[anvil] HOME was not set — using USERPROFILE for this session" -ForegroundColor DarkGray
+}
+
 $EmacsDir    = Join-Path $env:USERPROFILE '.emacs.d'
 $ClaudeConf  = Join-Path $env:USERPROFILE '.claude.json'
 $StdioSrc    = Join-Path $Prefix          'anvil-stdio.sh'
@@ -379,6 +392,21 @@ Log '  restart Claude Code (or run: claude mcp list) to pick up the new server.'
 Log "  verify:  emacsclient -e '(anvil-server-list-tools)'"
 Log '  persist daemon across reboots: create a Task Scheduler entry running'
 Log "           `"$($emacs.Source)`" --daemon  at logon (optional)"
+
+# Persistence hint: without $HOME in the user environment, a freshly
+# opened shell (e.g. the Task Scheduler action above) will fall back to
+# $APPDATA\.emacs.d and miss the init files we just wrote.
+$persistedHome = [Environment]::GetEnvironmentVariable('HOME', 'User')
+if (-not $persistedHome) {
+    Write-Host ''
+    Warn 'HOME is not set in your user Environment Variables.'
+    Warn '  Without it, a fresh shell opened after reboot falls back to'
+    Warn '  %APPDATA%\.emacs.d and will not find the init files that'
+    Warn '  this installer just wrote to %USERPROFILE%\.emacs.d.'
+    Warn '  Recommended (one-time, user-level, no admin needed):'
+    Warn '    [Environment]::SetEnvironmentVariable(''HOME'', $env:USERPROFILE, ''User'')'
+    Warn '  Or set it via System Properties -> Environment Variables -> HOME.'
+}
 
 if ($DryRun) {
     Write-Host ''
