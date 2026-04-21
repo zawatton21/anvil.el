@@ -366,6 +366,25 @@ fills them with nil at dispatch time."
         ;; No user-visible arguments case (all args are `_'-prefixed or empty)
         '((type . "object"))))))
 
+(defun anvil-server--normalize-tool-handler (handler)
+  "Return registration metadata derived from HANDLER.
+Wrappers created by `anvil-server-encode-handler' (or compatible helpers
+that set the `anvil-server-raw-handler' / `anvil-server-encode-result'
+symbol properties) keep the original handler as the source of truth for
+schema extraction and argument binding while transport encoding happens
+after execution."
+  (let* ((raw-handler
+          (if-let ((wrapped (and (symbolp handler)
+                                 (get handler 'anvil-server-raw-handler))))
+              wrapped
+            handler))
+         (encode-result
+          (and (symbolp handler)
+               (get handler 'anvil-server-encode-result))))
+    (list :handler raw-handler
+          :arglist (help-function-arglist raw-handler t)
+          :encode-result encode-result)))
+
 (defun anvil-server--ref-counted-register (key item table)
   "Register ITEM with KEY in TABLE with reference counting.
 If KEY already exists, increment its reference count.
@@ -951,18 +970,21 @@ virtual server-ids share the same handler pool."
               (context (list :id id)))
           (condition-case err
               (let*
-                  ;; Check if handler is defined before trying to get arglist
                   ((arglist
-                    (if (fboundp handler)
-                        (help-function-arglist handler t)
-                      ;; If undefined, signal early with proper error
-                      (signal 'void-function (list handler))))
+                    (progn
+                      (unless (functionp handler)
+                        (signal 'void-function (list handler)))
+                      ;; Keep dispatch aligned with registration-time
+                      ;; schema extraction, including transport-only
+                      ;; wrappers created by `anvil-server-encode-handler'.
+                      (or (plist-get tool :arglist)
+                          (help-function-arglist handler t))))
                    (expected-params '())
                    (required-params '())
                    (provided-params '())
                    (arg-values '())
                    (seen-optional nil)
-                   (result
+                   (raw-result
                     (progn
                       ;; Collect expected and required parameter names.
                       ;; `_'-prefixed args follow the Elisp unused-arg
@@ -1022,6 +1044,13 @@ virtual server-ids share the same handler pool."
                             (anvil-server--offload-apply
                              tool handler final-args)
                           (apply handler final-args)))))
+                   ;; `anvil-server-encode-handler' marks tools that want
+                   ;; transport-level JSON encoding while their raw
+                   ;; handler keeps returning rich Lisp data.
+                   (result
+                    (if (plist-get tool :encode-result)
+                        (anvil-server-encode-for-mcp raw-result)
+                      raw-result))
                    ;; Ensure result is string or nil, error on other types
                    (result-text
                     (cond
@@ -1336,6 +1365,10 @@ Optional properties:
   :server-id       Server identifier (defaults to \"default\")
 
 The HANDLER function's signature determines its input schema.
+When HANDLER is wrapped by `anvil-server-encode-handler' (or a
+compatible wrapper), registration still derives schema and
+parameter validation from the underlying raw handler and only
+encodes the result at the MCP transport boundary.
 Currently only no-argument and single-argument handlers are supported.
 
 Example:
@@ -1385,17 +1418,25 @@ See also:
     ;; Check for existing registration
     (if-let* ((existing (gethash id tools-table)))
       (anvil-server--ref-counted-register id existing tools-table)
-      (let* ((schema
-              (anvil-server--generate-schema-from-function handler))
+      (let* ((handler-meta
+              (anvil-server--normalize-tool-handler handler))
+             (raw-handler (plist-get handler-meta :handler))
+             (arglist (plist-get handler-meta :arglist))
+             (encode-result (plist-get handler-meta :encode-result))
+             (schema
+              (anvil-server--generate-schema-from-function raw-handler))
              (tool
               (list
                :id id
                :description description
-               :handler handler
+               :handler raw-handler
+               :arglist arglist
                :schema schema)))
         ;; Add optional properties if provided
         (when title
           (setq tool (plist-put tool :title title)))
+        (when encode-result
+          (setq tool (plist-put tool :encode-result t)))
         ;; Always include :read-only if it was specified, even if nil
         (when (plist-member properties :read-only)
           (setq tool (plist-put tool :read-only read-only)))
@@ -1404,6 +1445,8 @@ See also:
         ;; subprocess instead of the main daemon.  The handler must be a
         ;; symbol (not a lambda) because the subprocess identifies it by
         ;; name after loading the features listed in :offload-require.
+        ;; Encoded registration wrappers are normalized back to the raw
+        ;; handler before offload metadata is stored.
         (dolist (k '(:offload :offload-require :offload-load-path
                               :offload-inherit-load-path
                               :offload-timeout
@@ -1732,9 +1775,11 @@ will be caught by the resource handler infrastructure."
 ;;      flags any `(list :K ...)' that is still the terminal form.
 ;;
 ;;   2. Tag the file with the `;;; anvil-audit: tools-wrapped-at-registration'
-;;      header and wrap each registered handler with `anvil-server-encode-
-;;      handler' at registration time (the pattern anvil-orchestrator uses
-;;      for its ~25 tools).
+;;      header and wrap each registered handler with
+;;      `anvil-server-encode-handler' at registration time.  The wrapper is
+;;      transport-only: registration still inspects the underlying raw
+;;      handler and applies JSON encoding after execution (the pattern
+;;      anvil-orchestrator uses for its ~25 tools).
 ;;
 ;; Option 1 is the smaller, per-tool fix; option 2 is the whole-module
 ;; pattern.  Both produce the same wire format and pass the scanner.
@@ -1771,14 +1816,36 @@ Strings and nil pass through unchanged; other shapes round-trip through
    ((or (null value) (stringp value)) value)
    (t (json-encode (anvil-server--to-json-value value)))))
 
+(defun anvil-server--encoded-handler-dispatch (encoder handler &rest args)
+  "Apply HANDLER to ARGS, then pass the result through ENCODER."
+  (funcall encoder (apply handler args)))
+
+(defun anvil-server--make-encoded-handler (handler encoder)
+  "Return a symbol-backed transport wrapper around HANDLER using ENCODER.
+The wrapper records the underlying raw handler on the
+`anvil-server-raw-handler' symbol property and marks
+`anvil-server-encode-result' so registration can preserve the raw
+signature/docstring for schema extraction and dispatch."
+  (let* ((name (if (symbolp handler)
+                   (symbol-name handler)
+                 "handler"))
+         (sym (make-symbol (format "anvil-encoded:%s" name))))
+    (put sym 'anvil-server-raw-handler handler)
+    (put sym 'anvil-server-encode-result t)
+    (put sym 'function-documentation (documentation handler t))
+    (fset sym
+          (apply-partially #'anvil-server--encoded-handler-dispatch
+                           encoder handler))
+    sym))
+
 (defun anvil-server-encode-handler (handler)
   "Return a wrapper around HANDLER that JSON-encodes its result.
 Lets the underlying tool body keep returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-server-encode-for-mcp (apply handler args))))
+Schema extraction and MCP argument binding still use HANDLER's raw
+signature/docstring via `anvil-server-register-tool'."
+  (anvil-server--make-encoded-handler
+   handler #'anvil-server-encode-for-mcp))
 
 (provide 'anvil-server)
 ;;; anvil-server.el ends here

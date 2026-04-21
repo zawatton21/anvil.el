@@ -173,6 +173,80 @@ MCP Parameters:
     (should (assoc "task_id" props))
     (should (equal ["task_id"] required))))
 
+;;;; --- encoded registration wrappers -------------------------------------
+
+(ert-deftest anvil-test-register-tool-normalizes-encoded-handler ()
+  "`anvil-server-register-tool' must introspect wrapped tools via the raw handler."
+  (defun anvil-test--wrapped-schema-tool (path &optional mode)
+    "Return PATH and MODE in a plist.
+
+MCP Parameters:
+  path - Absolute path to inspect.
+  mode - Optional mode string."
+    (list :path path :mode mode))
+  (let ((tool-id "anvil-test-wrapped-schema")
+        (server-id "anvil-test")
+        (wrapped
+         (anvil-server-encode-handler #'anvil-test--wrapped-schema-tool)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id tool-id
+           :description "wrapped schema test"
+           :server-id server-id)
+          (let* ((tool (gethash tool-id
+                                (anvil-server--get-server-tools server-id)))
+                 (schema (plist-get tool :schema))
+                 (props (alist-get 'properties schema))
+                 (required (alist-get 'required schema)))
+            (should (eq 'anvil-test--wrapped-schema-tool
+                        (plist-get tool :handler)))
+            (should (equal '(path &optional mode)
+                           (plist-get tool :arglist)))
+            (should (plist-get tool :encode-result))
+            (should (assoc "path" props))
+            (should (assoc "mode" props))
+            (should (equal ["path"] required))))
+      (anvil-server-unregister-tool tool-id server-id))))
+
+(ert-deftest anvil-test-dispatch-encodes-wrapped-handler-result ()
+  "`tools/call' must validate args against the raw signature, then encode the result."
+  (defun anvil-test--wrapped-dispatch-tool (task_id &optional mode)
+    "Echo TASK_ID and MODE as a plist.
+
+MCP Parameters:
+  task_id - Task identifier string.
+  mode - Optional execution mode string."
+    (list :task_id task_id :mode mode))
+  (let ((tool-id "anvil-test-wrapped-dispatch")
+        (server-id "anvil-test")
+        (wrapped
+         (anvil-server-encode-handler #'anvil-test--wrapped-dispatch-tool)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id tool-id
+           :description "wrapped dispatch test"
+           :server-id server-id)
+          (let* ((params `((name . ,tool-id)
+                           (arguments . ((task_id . "task-7")
+                                         (mode . "fast")))))
+                 (resp (anvil-server--handle-tools-call
+                        "t-wrapped" params
+                        (make-anvil-server-metrics) server-id))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0)))
+                 (payload (json-parse-string text :object-type 'plist)))
+            (should (eq :json-false (alist-get 'isError result)))
+            (should (stringp text))
+            (should (equal "task-7" (plist-get payload :task_id)))
+            (should (equal "fast" (plist-get payload :mode)))))
+      (anvil-server-unregister-tool tool-id server-id))))
+
 ;;; :offload dispatch (Doc 03 Phase 2b) ------------------------------
 
 (defun anvil-test--offload-stub-dir ()

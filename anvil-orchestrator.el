@@ -2443,10 +2443,10 @@ through `anvil-orchestrator--to-json-value' then `json-encode'."
 
 Keeps the underlying tool body returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-orchestrator--encode-for-mcp (apply handler args))))
+Schema extraction and MCP argument binding continue to use HANDLER's
+raw signature/docstring via `anvil-server--make-encoded-handler'."
+  (anvil-server--make-encoded-handler
+   handler #'anvil-orchestrator--encode-for-mcp))
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
 

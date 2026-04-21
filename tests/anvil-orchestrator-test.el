@@ -2666,6 +2666,49 @@ becomes a JSON string (the fix for MCP transport)."
     (should (= 21 (plist-get back :echo)))
     (should (= 42 (plist-get back :doubled)))))
 
+(ert-deftest anvil-orchestrator--encode-handler-registers-with-server ()
+  "`anvil-orchestrator--encode-handler' must remain compatible with server registration."
+  (defun anvil-orchestrator-test--wrapped-tool (task_id &optional note)
+    "Return TASK_ID and NOTE in a plist.
+
+MCP Parameters:
+  task_id - Task identifier string.
+  note - Optional note string."
+    (list :task_id task_id :note note))
+  (let ((tool-id "anvil-orchestrator-test-wrapped")
+        (server-id "anvil-orchestrator-test")
+        (wrapped
+         (anvil-orchestrator--encode-handler
+          #'anvil-orchestrator-test--wrapped-tool)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id tool-id
+           :description "orchestrator wrapped tool"
+           :server-id server-id)
+          (let* ((tool (gethash tool-id
+                                (anvil-server--get-server-tools server-id)))
+                 (resp (anvil-server--handle-tools-call
+                        "t-orch-wrap"
+                        `((name . ,tool-id)
+                          (arguments . ((task_id . "t-1")
+                                        (note . "hello"))))
+                        (make-anvil-server-metrics) server-id))
+                 (decoded (json-read-from-string resp))
+                 (result (alist-get 'result decoded))
+                 (text (alist-get 'text
+                                  (aref (alist-get 'content result) 0)))
+                 (payload (json-parse-string text :object-type 'plist)))
+            (should (eq 'anvil-orchestrator-test--wrapped-tool
+                        (plist-get tool :handler)))
+            (should (plist-get tool :encode-result))
+            (should (equal '(task_id &optional note)
+                           (plist-get tool :arglist)))
+            (should (equal "t-1" (plist-get payload :task_id)))
+            (should (equal "hello" (plist-get payload :note)))))
+      (anvil-server-unregister-tool tool-id server-id))))
+
 (ert-deftest anvil-orchestrator--batch-task-ids-accessor ()
   "Encapsulates the `--batches' storage shape so callers stay decoupled."
   (let ((anvil-orchestrator--batches (make-hash-table :test 'equal)))
