@@ -2443,10 +2443,31 @@ through `anvil-orchestrator--to-json-value' then `json-encode'."
 
 Keeps the underlying tool body returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-orchestrator--encode-for-mcp (apply handler args))))
+
+The wrapper's public arglist mirrors HANDLER's exactly (required /
+&optional / &rest sections).  This matters because
+`anvil-server--generate-schema-from-function' refuses a `&rest'
+wrapper — an earlier `(lambda (&rest args) ...)' shape passed the
+first registration (when the check did not yet exist) but tripped
+every re-registration done by an `unload-feature' cycle."
+  (let ((arglist (help-function-arglist handler t))
+        (rest-var nil)
+        (call-args nil)
+        (saw-rest nil))
+    (dolist (a arglist)
+      (cond
+       ((eq a '&optional) nil)
+       ((eq a '&rest) (setq saw-rest t))
+       (saw-rest (setq rest-var a))
+       (t (push a call-args))))
+    (setq call-args (nreverse call-args))
+    (eval
+     `(lambda ,arglist
+        (anvil-orchestrator--encode-for-mcp
+         ,(if rest-var
+              `(apply (function ,handler) ,@call-args ,rest-var)
+            `(funcall (function ,handler) ,@call-args))))
+     t)))
 
 ;;;; --- MCP tool wrappers --------------------------------------------------
 

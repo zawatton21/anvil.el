@@ -25,12 +25,55 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'subr-x)
 (require 'anvil-host)
 (require 'anvil-server)
 
 (defconst anvil-git--server-id "emacs-eval"
   "MCP server id that git-* tools register under.")
+
+;;;; --- MCP serialization --------------------------------------------------
+;;
+;; All git helpers return elisp-native shapes (strings, plists, lists of
+;; plists, keywords like :null / :empty-array).  anvil-server requires
+;; tool handlers to return `string' or `nil' — anything else trips
+;; `Tool handler must return string or nil'.  The small encoder below
+;; converts our shapes to JSON, keeping :null / :empty-array sentinels
+;; semantically meaningful (→ JSON null / empty array respectively).
+
+(defun anvil-git--plist-p (x)
+  "Return non-nil when X looks like a plist (keyword head)."
+  (and (listp x) (keywordp (car-safe x))))
+
+(defun anvil-git--to-json-value (x)
+  "Recursively convert X into a shape `json-encode' renders sensibly.
+Plists become alists with symbol keys (leading colon stripped).
+Plain lists (non-plist) become vectors so they emit as JSON arrays.
+The sentinels :null and :empty-array map to nil / empty vector."
+  (cond
+   ((eq x :null) nil)
+   ((eq x :empty-array) (vector))
+   ((or (null x) (eq x t) (numberp x) (stringp x)) x)
+   ((keywordp x) (substring (symbol-name x) 1))
+   ((symbolp x) (symbol-name x))
+   ((vectorp x)
+    (vconcat (mapcar #'anvil-git--to-json-value x)))
+   ((anvil-git--plist-p x)
+    (cl-loop for (k v) on x by #'cddr
+             collect (cons (intern (substring (symbol-name k) 1))
+                           (anvil-git--to-json-value v))))
+   ((listp x)
+    (vconcat (mapcar #'anvil-git--to-json-value x)))
+   (t (format "%S" x))))
+
+(defun anvil-git--mcp-encode (value)
+  "Encode VALUE as a JSON string for MCP return.
+Strings and nil pass through — both are valid direct returns."
+  (cond
+   ((null value) nil)
+   ((stringp value) value)
+   (t (json-encode (anvil-git--to-json-value value)))))
 
 ;;;; --- internal: shell wrapper --------------------------------------------
 
@@ -418,8 +461,9 @@ Keys: :ref (commit-ish to check out, default \"HEAD\"),
 
 MCP Parameters:
   path - Directory or file path inside the repo."
-  (anvil-server-with-error-handling
-   (or (anvil-git-repo-root path) :null)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (or (anvil-git-repo-root path) :null))))
 
 (defun anvil-git--tool-head-sha (path &optional short)
   "Return HEAD SHA for the repo containing PATH.
@@ -427,17 +471,19 @@ MCP Parameters:
 MCP Parameters:
   path  - Directory inside the repo.
   short - Truthy → return the abbreviated SHA."
-  (anvil-server-with-error-handling
-   (or (anvil-git-head-sha path (and short (not (equal short ""))))
-       :null)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (or (anvil-git-head-sha path (and short (not (equal short ""))))
+        :null))))
 
 (defun anvil-git--tool-branch-current (path)
   "Return the current branch for PATH, or nil when detached.
 
 MCP Parameters:
   path - Directory inside the repo."
-  (anvil-server-with-error-handling
-   (or (anvil-git-branch-current path) :null)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (or (anvil-git-branch-current path) :null))))
 
 (defun anvil-git--tool-log (path &optional limit)
   "Return recent commits for repo at PATH.
@@ -445,13 +491,14 @@ MCP Parameters:
 MCP Parameters:
   path  - Directory inside the repo.
   limit - Max commits to return (integer or numeric string)."
-  (anvil-server-with-error-handling
-   (let ((n (cond ((integerp limit) limit)
-                  ((and (stringp limit)
-                        (string-match "\\`[0-9]+\\'" limit))
-                   (string-to-number limit))
-                  (t nil))))
-     (or (anvil-git-log path n) :empty-array))))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (let ((n (cond ((integerp limit) limit)
+                   ((and (stringp limit)
+                         (string-match "\\`[0-9]+\\'" limit))
+                    (string-to-number limit))
+                   (t nil))))
+      (or (anvil-git-log path n) :empty-array)))))
 
 (defun anvil-git--tool-diff-names (path &optional from to)
   "Return changed paths between FROM and TO in repo at PATH.
@@ -460,10 +507,11 @@ MCP Parameters:
   path - Directory inside the repo.
   from - Base revision (optional).
   to   - Target revision (optional)."
-  (anvil-server-with-error-handling
-   (let ((f  (and (stringp from) (not (string-empty-p from)) from))
-         (t* (and (stringp to)   (not (string-empty-p to))   to)))
-     (or (anvil-git-diff-names path f t*) :empty-array))))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (let ((f  (and (stringp from) (not (string-empty-p from)) from))
+          (t* (and (stringp to)   (not (string-empty-p to))   to)))
+      (or (anvil-git-diff-names path f t*) :empty-array)))))
 
 (defun anvil-git--tool-diff-stats (path &optional rev)
   "Return structured diff counts for repo at PATH.
@@ -471,25 +519,28 @@ MCP Parameters:
 MCP Parameters:
   path - Directory inside the repo.
   rev  - Optional revision (e.g. \"HEAD~1\" or \"main..HEAD\")."
-  (anvil-server-with-error-handling
-   (let ((r (and (stringp rev) (not (string-empty-p rev)) rev)))
-     (anvil-git-diff-stats path r))))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (let ((r (and (stringp rev) (not (string-empty-p rev)) rev)))
+      (anvil-git-diff-stats path r)))))
 
 (defun anvil-git--tool-status (path)
   "Return porcelain status + branch info for repo at PATH.
 
 MCP Parameters:
   path - Directory inside the repo."
-  (anvil-server-with-error-handling
-   (anvil-git-status path)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (anvil-git-status path))))
 
 (defun anvil-git--tool-worktree-list (path)
   "Return attached worktrees for repo at PATH.
 
 MCP Parameters:
   path - Directory inside the repo."
-  (anvil-server-with-error-handling
-   (or (anvil-git-worktree-list path) :empty-array)))
+  (anvil-git--mcp-encode
+   (anvil-server-with-error-handling
+    (or (anvil-git-worktree-list path) :empty-array))))
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
