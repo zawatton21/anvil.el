@@ -1388,6 +1388,8 @@ adding or modifying tags on TODO items."
   (anvil-server-register-tool
    #'anvil-org--tool-get-allowed-files
    :id "org-get-allowed-files"
+   :intent '(org-read)
+   :layer 'core
    :description
    "Get the list of Org files accessible through the anvil-org
 server.  Returns the configured allowed files exactly as specified in
@@ -1425,6 +1427,8 @@ Use cases:
   (anvil-server-register-tool
    #'anvil-org--tool-update-todo-state
    :id "org-update-todo-state"
+   :intent '(org-edit)
+   :layer 'core
    :description
    "Update the TODO state of an Org headline.  Changes the task state
 while preserving the headline title, tags, and other properties.
@@ -1452,6 +1456,8 @@ Returns JSON object:
   (anvil-server-register-tool
    #'anvil-org--tool-add-todo
    :id "org-add-todo"
+   :intent '(org-edit)
+   :layer 'core
    :description
    "Add a new TODO item to an Org file at a specified location.
 Creates the headline with TODO state, tags, and optional body content.
@@ -1496,6 +1502,8 @@ sibling
   (anvil-server-register-tool
    #'anvil-org--tool-rename-headline
    :id "org-rename-headline"
+   :intent '(org-edit)
+   :layer 'core
    :description
    "Rename an Org headline's title while preserving its TODO state,
 tags, properties, and body content.  Creates an Org ID property for
@@ -1525,6 +1533,8 @@ Returns JSON object:
   (anvil-server-register-tool
    #'anvil-org--tool-edit-body
    :id "org-edit-body"
+   :intent '(org-edit)
+   :layer 'core
    :description
    "Edit the body content of an Org headline using partial string
 replacement.  Finds and replaces a substring within the headline's
@@ -1561,6 +1571,8 @@ Special behavior - Empty old_body:
   (anvil-server-register-tool
    #'anvil-org--tool-read-file
    :id "org-read-file"
+   :intent '(org-read)
+   :layer 'core
    :description
    "Read complete raw content of an Org file. Returns entire file as
 plain text with all formatting, properties, and structure preserved.
@@ -1576,6 +1588,8 @@ Returns: Plain text content of the entire Org file"
   (anvil-server-register-tool
    #'anvil-org--tool-read-outline
    :id "org-read-outline"
+   :intent '(org-read structure)
+   :layer 'core
    :description
    "Get hierarchical structure of Org file as JSON outline. Returns
    all headline titles and nesting relationships at full depth. File
@@ -1591,6 +1605,8 @@ Returns: JSON object with hierarchical outline structure"
   (anvil-server-register-tool
    #'anvil-org--tool-read-headline
    :id "org-read-headline"
+   :intent '(org-read)
+   :layer 'core
    :description
    "Read specific Org headline by hierarchical path. Returns headline
    with TODO state, tags, properties, body text, and all nested
@@ -1613,6 +1629,8 @@ Returns: Plain text content of the headline and its subtree"
   (anvil-server-register-tool
    #'anvil-org--tool-read-by-id
    :id "org-read-by-id"
+   :intent '(org-read)
+   :layer 'core
    :description
    "Layer 3 of anvil progressive disclosure (see `disclosure-help').
 Read Org headline by its unique ID property.  More stable than

@@ -126,6 +126,8 @@ happens.  Errors out of the SQLite layer are bubbled up via
   (anvil-server-register-tool
    #'anvil-sqlite--tool-query
    :id "sqlite-query"
+   :intent '(db-read)
+   :layer 'core
    :server-id anvil-sqlite--server-id
    :description
    "Run a read-only SQL statement against a SQLite database file

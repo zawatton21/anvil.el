@@ -141,6 +141,15 @@ These are not loaded by default.  Available modules:
                 manifest cost dominates (Doc 26 Phase 1).  Add
                 `manifest' last in the module list so it sees every
                 earlier registration.
+- `discovery' — Intent-based MCP tool discovery.  Adds the
+                `anvil-tools-by-intent' tool that answers
+                \"which registered tools match intent X / layer Y?\"
+                queries without requiring the caller to read
+                CLAUDE.md.  Reads `:intent' / `:layer' /
+                `:stability' metadata attached by modules at
+                register time; tools without metadata fall back
+                to default values and still surface (Doc 34
+                Phase A)
 - `disclosure' — Layer-1 (slim index) + disclosure-help tools that
                 formalise the 3-layer read contract documented in
                 docs/design/28-progressive-disclosure.org.  Depends on

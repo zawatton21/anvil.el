@@ -2287,6 +2287,8 @@ avoiding shell + elisp-reader double-escaping of backslashes."
   (anvil-server-register-tool
    #'anvil-file--tool-replace-string
    :id "file-replace-string"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Replace literal text in a file.  Operates on the raw file via
 temp-buffer + write-region (no mount-layer issues on Windows).
@@ -2297,6 +2299,8 @@ Pass max-count \"1\" to assert exactly one match."
   (anvil-server-register-tool
    #'anvil-file--tool-replace-regexp
    :id "file-replace-regexp"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Replace regexp matches in a file.  The replacement string may use
 \\\\1 \\\\2 for capture groups.  Errors if no match found.
@@ -2306,6 +2310,8 @@ Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-insert-at-line
    :id "file-insert-at-line"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Insert text at a specific line number in a file (1-indexed).
 Line 1 inserts before the first line.  Safe for files over 1.2MB."
@@ -2314,6 +2320,8 @@ Line 1 inserts before the first line.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-delete-lines
    :id "file-delete-lines"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Delete a range of lines (inclusive, 1-indexed) from a file.
 Safe for files over 1.2MB."
@@ -2322,6 +2330,8 @@ Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-read
    :id "file-read"
+   :intent '(file-read structure)
+   :layer 'core
    :description
    "Layer 3 of anvil progressive disclosure (see `disclosure-help').
 Read file contents with optional line-based pagination.  Accepts
@@ -2337,6 +2347,8 @@ read specific sections."
   (anvil-server-register-tool
    #'anvil-file--tool-append
    :id "file-append"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Append text to the end of a file.  A leading newline is added
 if the file does not end with one.  Safe for files over 1.2MB."
@@ -2345,6 +2357,8 @@ if the file does not end with one.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-batch
    :id "file-batch"
+   :intent '(file-edit batch)
+   :layer 'core
    :description
    "Execute multiple file operations in a single call.  Most token-efficient
 way to perform bulk edits: N operations in 1 round trip instead of N calls.
@@ -2357,6 +2371,8 @@ once atomically at the end.  Safe for files over 1.2MB."
   (anvil-server-register-tool
    #'anvil-file--tool-json-object-add
    :id "json-object-add"
+   :intent '(json-edit config)
+   :layer 'core
    :description
    "Add key-value pairs to a top-level JSON object while preserving
 existing formatting.  Designed for i18n dictionaries and config files
@@ -2373,6 +2389,8 @@ file-insert-at-line."
   (anvil-server-register-tool
    #'anvil-file--tool-ensure-import
    :id "file-ensure-import"
+   :intent '(file-edit)
+   :layer 'core
    :description
    "Idempotently ensure an import (or any header) line exists in a file.
 If the line already appears verbatim, returns already-present without
@@ -2385,6 +2403,8 @@ Position can be overridden: \"after-last-match\" (default),
   (anvil-server-register-tool
    #'anvil-file--tool-batch-across
    :id "file-batch-across"
+   :intent '(file-edit batch)
+   :layer 'core
    :description
    "Apply anvil-file-batch to multiple files in a single MCP call.
 The argument is a JSON array where each element has a path and an
@@ -2397,6 +2417,8 @@ coordinated multi-file refactors."
   (anvil-server-register-tool
    #'anvil-file--tool-outline
    :id "file-outline"
+   :intent '(file-read structure)
+   :layer 'core
    :description
    "Layer 1 of anvil progressive disclosure (see `disclosure-help').
 Return a compact structural outline of a file without reading its
@@ -2413,6 +2435,8 @@ descriptions and disclosure-help cover the full contract."
   (anvil-server-register-tool
    #'anvil-file--tool-code-extract-pattern
    :id "code-extract-pattern"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :description
    "Extract repeating structured records from a file using regexp patterns.
 For each match of `block-start' the tool finds the block's body via
@@ -2429,6 +2453,8 @@ the entire file would be wasteful.  Brace-balance skips strings."
   (anvil-server-register-tool
    #'anvil-file--tool-code-add-field-by-map
    :id "code-add-field-by-map"
+   :intent '(code-bulk-edit)
+   :layer 'core
    :description
    "Add a field to TS/JS object literals by mapping from another field's value.
 For each occurrence of `LOOKUP-KEY: \"VALUE\"' inside a single-line `{...}'

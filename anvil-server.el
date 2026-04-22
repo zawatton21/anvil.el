@@ -1410,7 +1410,16 @@ See also:
         (dolist (k '(:offload :offload-require :offload-load-path
                               :offload-inherit-load-path
                               :offload-timeout
-                              :resumable))
+                              :resumable
+                              ;; Discovery metadata (Doc 34 Phase A):
+                              ;; :intent is a list of symbols naming
+                              ;; the use-cases the tool serves;
+                              ;; :layer classifies the tool as
+                              ;; core / io / workflow / dev;
+                              ;; :stability is stable / experimental /
+                              ;; deprecated.  Handlers ignore these
+                              ;; values; `anvil-discovery' reads them.
+                              :intent :layer :stability))
           (when (plist-member properties k)
             (setq tool (plist-put tool k (plist-get properties k)))))
         ;; Register the tool

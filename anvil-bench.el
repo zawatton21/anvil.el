@@ -431,6 +431,8 @@ has been recorded in this session."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-bench--tool-compare)
    :id "bench-compare"
+   :intent '(bench)
+   :layer 'dev
    :server-id anvil-bench--server-id
    :description
    "Measure two elisp expressions head-to-head.  Each expression is
@@ -445,6 +447,8 @@ feels faster\" is not enough."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-bench--tool-profile-expr)
    :id "bench-profile-expr"
+   :intent '(bench)
+   :layer 'dev
    :server-id anvil-bench--server-id
    :description
    "Sample-profile an elisp expression for DURATION_SEC seconds.
@@ -458,6 +462,8 @@ durations (>10s) should be dispatched via offload."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-bench--tool-last)
    :id "bench-last"
+   :intent '(bench)
+   :layer 'dev
    :server-id anvil-bench--server-id
    :description
    "Return the last bench-compare or bench-profile-expr report

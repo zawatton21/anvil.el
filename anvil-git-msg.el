@@ -490,6 +490,8 @@ MCP Parameters:
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-git-msg--tool-commit-message)
    :id "git-commit-message"
+   :intent '(git compose)
+   :layer 'workflow
    :server-id anvil-git-msg--server-id
    :description
    "Generate a Conventional-Commits draft from the staged diff.
@@ -504,6 +506,8 @@ never writes to git history."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-git-msg--tool-pr-body)
    :id "git-pr-body"
+   :intent '(git compose)
+   :layer 'workflow
    :server-id anvil-git-msg--server-id
    :description
    "Generate a PR-body draft summarising commits between BASE and

@@ -625,6 +625,8 @@ total removed for a namespace flush)."
   (anvil-server-register-tool
    #'anvil-http--tool-fetch
    :id "http-fetch"
+   :intent '(http)
+   :layer 'io
    :server-id anvil-http--server-id
    :description
    "GET an http/https URL and return status, headers and body with
@@ -638,6 +640,8 @@ with exponential backoff (honours Retry-After on 429)."
   (anvil-server-register-tool
    #'anvil-http--tool-head
    :id "http-head"
+   :intent '(http)
+   :layer 'io
    :server-id anvil-http--server-id
    :description
    "HEAD an http/https URL and return its status + response headers.
@@ -647,6 +651,8 @@ Cheap liveness / metadata probe; responses are never cached."
   (anvil-server-register-tool
    #'anvil-http--tool-cache-clear
    :id "http-cache-clear"
+   :intent '(http admin)
+   :layer 'io
    :server-id anvil-http--server-id
    :description
    "Drop cached entries for the http namespace.  With a URL argument

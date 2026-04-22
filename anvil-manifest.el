@@ -245,6 +245,8 @@ MCP Parameters: (none)"
 (defconst anvil-manifest--tool-specs
   `((,#'anvil-manifest-cost-handler
      :id "manifest-cost"
+     :intent '(meta token)
+     :layer 'dev
      :description "Return the active ANVIL_PROFILE, count of advertised tools, and an approximate token cost of the current tools/list manifest.  Handlers of hidden tools remain callable via explicit tools/call."
      :read-only t
      :title "Manifest Cost"))

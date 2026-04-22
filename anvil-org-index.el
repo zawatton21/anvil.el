@@ -438,6 +438,8 @@ Return the new headline id."
   (anvil-server-register-tool
    #'anvil-org-index--tool-search
    :id "org-index-search"
+   :intent '(org-read)
+   :layer 'core
    :server-id anvil-org-index--server-id
    :description
    "Layer 2 of anvil progressive disclosure (see `disclosure-help').
@@ -454,6 +456,8 @@ when clipped."
   (anvil-server-register-tool
    #'anvil-org-index--tool-rebuild
    :id "org-index-rebuild"
+   :intent '(org-read admin)
+   :layer 'workflow
    :server-id anvil-org-index--server-id
    :description
    "Rebuild the entire org-index from disk.  Runs in an offload

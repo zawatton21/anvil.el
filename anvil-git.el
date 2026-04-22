@@ -553,6 +553,8 @@ MCP Parameters:
   (anvil-server-register-tool
    #'anvil-git--tool-repo-root
    :id "git-repo-root"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the git top-level directory for PATH, or nil when PATH is
@@ -562,6 +564,8 @@ not inside a repository."
   (anvil-server-register-tool
    #'anvil-git--tool-head-sha
    :id "git-head-sha"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the HEAD commit SHA for the repo containing PATH.  Pass
@@ -571,6 +575,8 @@ short=1 for the abbreviated form."
   (anvil-server-register-tool
    #'anvil-git--tool-branch-current
    :id "git-branch-current"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the current branch name, or nil when HEAD is detached."
@@ -579,6 +585,8 @@ short=1 for the abbreviated form."
   (anvil-server-register-tool
    #'anvil-git--tool-log
    :id "git-log"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return recent commits as (hash, date, author, subject) plists.
@@ -588,6 +596,8 @@ limit defaults to 20."
   (anvil-server-register-tool
    #'anvil-git--tool-diff-names
    :id "git-diff-names"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return the paths differing between FROM and TO (defaults
@@ -597,6 +607,8 @@ unstaged-vs-HEAD)."
   (anvil-server-register-tool
    #'anvil-git--tool-diff-stats
    :id "git-diff-stats"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return structured diff counts (files, insertions, deletions)
@@ -606,6 +618,8 @@ for REV or unstaged-vs-HEAD."
   (anvil-server-register-tool
    #'anvil-git--tool-status
    :id "git-status"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return porcelain status + branch/upstream/ahead/behind counts
@@ -615,6 +629,8 @@ as one plist.  Buckets: staged / modified / untracked / unmerged."
   (anvil-server-register-tool
    #'anvil-git--tool-worktree-list
    :id "git-worktree-list"
+   :intent '(git read)
+   :layer 'workflow
    :server-id anvil-git--server-id
    :description
    "Return attached git worktrees as plists (path, head, branch,
