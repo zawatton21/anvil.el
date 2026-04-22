@@ -8,16 +8,23 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c002
   :END:
-~Phase 1 SHIPPED~ (2026-04-22, feat/doc-27-shell-filter-phase1) —
-Week-3 Ship 2 ship、競合 rtk (Rust Token Killer) 由来の per-command
-出力圧縮 + =anvil-state= tee + gain 累計。Phase 2 以降 (streaming,
-user-defined filter, 業務固有 filter) は DRAFT 維持。
+~Phase 1 + 2a SHIPPED~ (2026-04-22、feat branches) — Week-3 Ship 2。
+競合 rtk (Rust Token Killer) 由来の per-command 出力圧縮 +
+=anvil-state= tee + gain 累計。Phase 2b (streaming) / Phase 3
+(user-defined) / Phase 4 (業務固有) は DRAFT 維持。
 
-*実装された範囲:* 10 filter (=git-status= / =git-log= / =git-diff= /
-=rg= / =find= / =ls= / =pytest= / =ert-batch= / =emacs-batch= /
-=make=) + 4 MCP tool (=shell-run= / =shell-filter= / =shell-tee-get=
-/ =shell-gain=) + tee (TTL 1h)、gain 日次累計。19 shape-locked ERT
-を TDD-lock してから impl、全 pass。
+*Phase 1 (feat/doc-27-shell-filter-phase1):* 10 filter
+(=git-status= / =git-log= / =git-diff= / =rg= / =find= / =ls= /
+=pytest= / =ert-batch= / =emacs-batch= / =make=) + 4 MCP tool
+(=shell-run= / =shell-filter= / =shell-tee-get= / =shell-gain=) +
+tee (TTL 1h) + gain 日次累計。19 shape-locked ERT。
+
+*Phase 2a (feat/doc-27-shell-filter-phase2a):* 10 filter 追加
+(=gh= / =git-log-graph= / =pip-install= / =npm-install= /
+=docker-ps= / =docker-logs= / =kubectl-get= / =aws-s3-ls= /
+=prettier= / =ruff=) + dispatcher 拡張 (=docker SUB= / =kubectl SUB=
+/ =aws SUB SUB2= / =git log --graph= の sub-token resolution)。
+11 shape-locked ERT。Phase 2 streaming は Phase 2b として切り出し。
 
 *module placement:* =anvil-optional-modules= (=anvil-state= 依存
 のため default 非搭載、opt-in)。
@@ -223,13 +230,25 @@ namespace を =anvil-state= 上に占有、TTL 1h で自動 prune。
 commit: =939e4f1= (test-lock) → =59ef084= (impl) →
 =a74f7f3= (MCP encode-handler fix)。
 
-** Phase 2 — 10 filter 追加 + streaming
+** Phase 2a — 10 filter 追加 (~SHIPPED~ 2026-04-22)
 
-=gh= / =git log --graph= / =pip install= / =npm install= /
-=docker ps= / =docker logs= / =kubectl= 系 / =aws cli= subset /
-=prettier= / =ruff=。
+10 filter SHIPPED:
+=gh= / =git-log-graph= (=git log --graph=) / =pip-install= /
+=npm-install= / =docker-ps= / =docker-logs= / =kubectl-get= /
+=aws-s3-ls= / =prettier= / =ruff=。
 
-Streaming: =anvil-pty-broker-watch= との統合、tail on filter.
+Dispatcher は =docker SUB= / =kubectl SUB= / =aws SUB SUB2= の
+multi-token resolution を追加、=git log --graph= の flag
+detection で既存 =git-log= と =git-log-graph= を分岐。
+
+commit: =f71598a= (test-lock) → =e4947d3= (impl)。
+
+** Phase 2b — streaming (~DRAFT~)
+
+=anvil-pty-broker-watch= の ring buffer tail に filter を
+適用する tail on filter。pty-broker 側の filter-hook 点を
+決める必要があり、Phase 2a と別 scope に切り出し。実装 ETA
+2-3 日見込み。
 
 ** Phase 3 — user-defined filter
 
