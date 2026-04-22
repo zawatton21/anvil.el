@@ -10,8 +10,8 @@
   :END:
 ~DRAFT~ (2026-04-21) → ~APPROVED~ (2026-04-22, Phase 0 pass) →
 ~APPROVED (Phase 1a trimmed)~ (2026-04-22, post-consensus critique)
-→ ~SHIPPED~ (2026-04-22, Phase 0 + 1a + 1b + 2a + 2b + 3a + 3b 全
-完了、Phase 3b ROI 83% > 60% bar) — Week-4 Ship 候補。r/emacs landscape 調査 (2026-04-21) で cl-mcp
+→ ~SHIPPED~ (2026-04-22, Phase 0 + 1a + 1b + 2a + 2b + 3a + 3b +
+3c 全完了、ROI 90% — Phase 3a 83% + Phase 3c +7pt) — Week-4 Ship 候補。r/emacs landscape 調査 (2026-04-21) で cl-mcp
 (cl-ai-project, 64★) の Eclector CST 経由 edit + object drilling +
 parinfer auto-repair を確認し、anvil の Doc 12 (sexp-edits, reader-only)
 との機能差を設計上で埋める。
@@ -223,6 +223,7 @@ depth-N まで展開) にすると:
 | 2b    | =sexp-cst-edit= (node rewrite, structural diff)      | 2a     | 3d   | SHIPPED 04-22 |
 | 3a    | =sexp-cst-repair= (close-paren balancing)            | 2b     | 2d   | SHIPPED 04-22 |
 | 3b    | LLM 評価 (括弧壊れ input のリトライ率計測 — 83% hit) | 3a     | 1d   | SHIPPED 04-22 |
+| 3c    | unterminated-string close (repair pipeline 拡張)     | 3a     | 0.5d | SHIPPED 04-22 |
 
 Phase 0 は ROI 判定の gate (2026-04-22 PASS): treesit-elisp が実用精度
 に届かない場合、Phase 2 以降は棚上げして Phase 1 (inspect-object) のみ
