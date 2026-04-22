@@ -105,7 +105,7 @@ indexed in a single DB.  Explicit list overrides auto-detection."
   '(scan audit access list
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
-         mdl-distill export-html serve)
+         mdl-distill export-html serve contradictions)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -300,7 +300,20 @@ already present with a matching tokenizer."
   ;; rebuilds the table).
   (anvil-memory--create-fts-table
    anvil-memory--db
-   (anvil-memory--resolve-tokenizer anvil-memory--db)))
+   (anvil-memory--resolve-tokenizer anvil-memory--db))
+  ;; Phase 3c: persistent contradiction edges.  Pair ordering is
+  ;; canonicalised on write (string< first) so (A, B) and (B, A) do
+  ;; not both get rows — the (file_a, file_b) composite PK enforces
+  ;; that invariant across rescans.
+  (sqlite-execute anvil-memory--db
+                  "CREATE TABLE IF NOT EXISTS memory_contradictions (
+                     file_a TEXT NOT NULL,
+                     file_b TEXT NOT NULL,
+                     verdict TEXT NOT NULL,
+                     score REAL,
+                     checked_at INTEGER,
+                     PRIMARY KEY (file_a, file_b)
+                   )"))
 
 
 ;;;; --- type inference + row → plist ---------------------------------------
@@ -1203,15 +1216,71 @@ sort survives the split)."
      "  </table>\n"
      "</section>\n")))
 
+(defun anvil-memory--render-type-filter (groups)
+  "Return a per-type checkbox fieldset + inline JS that toggles sections.
+Only emits controls for TYPEs present in GROUPS."
+  (if (null groups) ""
+    (concat
+     "<fieldset class=\"facets\">\n"
+     "  <legend>Types</legend>\n"
+     (mapconcat
+      (lambda (group)
+        (let ((name (anvil-memory--html-escape (symbol-name (car group)))))
+          (format "  <label><input type=\"checkbox\" class=\"facet-filter\" \
+data-facet-type=\"%s\" checked> %s</label>\n" name name)))
+      groups "")
+     "</fieldset>\n"
+     ;; Inline script — Phase 3a fixture only forbids `<script src>'.
+     "<script>\n(function(){\n\
+var boxes=document.querySelectorAll('.facet-filter');\n\
+boxes.forEach(function(cb){cb.addEventListener('change',function(e){\n\
+  var t=e.target.getAttribute('data-facet-type');\n\
+  var sec=document.querySelector('section[data-type=\"'+t+'\"]');\n\
+  if(sec){sec.style.display=e.target.checked?'':'none';}\n\
+});});\n})();\n</script>\n")))
+
+(defun anvil-memory--render-contradictions (rows)
+  "Return the contradictions <section> for stored ROWS, empty when none."
+  (if (null rows) ""
+    (concat
+     "<section data-section=\"contradictions\">\n"
+     (format "  <h2>Contradictions <span class=\"muted\">(%d)</span></h2>\n"
+             (length rows))
+     "  <ul class=\"contradictions\">\n"
+     (mapconcat
+      (lambda (r)
+        (let* ((a (anvil-memory--html-escape
+                   (file-name-nondirectory (plist-get r :file-a))))
+               (b (anvil-memory--html-escape
+                   (file-name-nondirectory (plist-get r :file-b))))
+               (v (anvil-memory--html-escape (plist-get r :verdict)))
+               (score (or (plist-get r :score) 0.0)))
+          (format "    <li data-verdict=\"%s\">\
+<code>%s</code> <span class=\"arrow\">↔</span> <code>%s</code> \
+<span class=\"muted\">%s · %.2f</span></li>\n"
+                  v a b v score)))
+      rows "")
+     "  </ul>\n"
+     "</section>\n")))
+
 (defun anvil-memory--render-page (abs-root groups title)
   "Return the full HTML document for ABS-ROOT + GROUPS (:by-type alist)."
   (let* ((total (apply #'+ (mapcar (lambda (g) (length (cdr g))) groups)))
+         (contradictions (ignore-errors (anvil-memory-contradictions)))
+         ;; Only include contradiction rows whose both endpoints live under
+         ;; ABS-ROOT — the page is scoped to a single root and showing edges
+         ;; to out-of-scope files would confuse the reader.
+         (scoped (cl-remove-if-not
+                  (lambda (r)
+                    (and (string-prefix-p abs-root (plist-get r :file-a))
+                         (string-prefix-p abs-root (plist-get r :file-b))))
+                  contradictions))
          (hdr (or title (format "anvil memory — %s"
                                 (abbreviate-file-name abs-root)))))
     (concat
      "<!DOCTYPE html>\n<html lang=\"en\"><head>\n"
      "  <meta charset=\"utf-8\">\n"
-     "  <meta name=\"generator\" content=\"anvil-memory / Doc 29 Phase 3a\">\n"
+     "  <meta name=\"generator\" content=\"anvil-memory / Doc 29 Phase 3\">\n"
      "  <title>" (anvil-memory--html-escape hdr) "</title>\n"
      "  <style>\n" anvil-memory--html-css "  </style>\n"
      "</head><body>\n"
@@ -1220,6 +1289,8 @@ sort survives the split)."
              (anvil-memory--html-escape (abbreviate-file-name abs-root))
              total
              (if (= total 1) "y" "ies"))
+     (anvil-memory--render-type-filter groups)
+     (anvil-memory--render-contradictions scoped)
      (if (zerop total)
          "<p class=\"muted\">No indexed memories under this root.</p>\n"
        (mapconcat (lambda (group)
@@ -1389,6 +1460,11 @@ memory roots — run <code>memory-scan</code> first.</p></body></html>")))
     (let* ((rows (anvil-memory--serve-list-rows anvil-memory--serve-root))
            (body (json-encode (anvil-memory--heatmap-aggregate rows))))
       (anvil-memory--http-response 200 "application/json; charset=utf-8" body)))
+   ((equal path "/api/contradictions")
+    (let* ((rows (anvil-memory-contradictions))
+           (body (json-encode
+                  (anvil-memory--contradictions-to-alist rows))))
+      (anvil-memory--http-response 200 "application/json; charset=utf-8" body)))
    (t
     (anvil-memory--http-response
      404 "text/plain; charset=utf-8"
@@ -1482,7 +1558,126 @@ running (so the caller can use the return value to distinguish
     was))
 
 
-;;;; --- MCP tool handlers --------------------------------------------------
+;;;; --- Phase 3c: contradiction store + graph -----------------------------
+
+(defun anvil-memory--canonical-pair (a b)
+  "Return (cons A B) / (cons B A) with string< ordering so (a,b)=(b,a)."
+  (if (string-lessp a b) (cons a b) (cons b a)))
+
+(defun anvil-memory--upsert-contradiction (db a b verdict score ts)
+  "Store / refresh a single contradiction row (canonically-ordered pair)."
+  (sqlite-execute
+   db
+   "INSERT INTO memory_contradictions(file_a, file_b, verdict, score, checked_at)
+    VALUES (?1, ?2, ?3, ?4, ?5)
+    ON CONFLICT(file_a, file_b) DO UPDATE SET
+      verdict=excluded.verdict,
+      score=excluded.score,
+      checked_at=excluded.checked_at"
+   (list a b verdict score ts)))
+
+;;;###autoload
+(cl-defun anvil-memory-scan-contradictions
+    (&key (threshold 0.5) (mode 'keyword)
+          provider model timeout-sec)
+  "Populate `memory_contradictions' from the current memory index.
+THRESHOLD is the jaccard-similarity floor passed to
+`anvil-memory-duplicates' to shortlist candidate pairs.
+
+MODE controls how candidates become stored rows:
+  `keyword' — every candidate is persisted verbatim with
+              verdict=\"candidate\" and score=jaccard.
+  `llm'     — each candidate is handed to `anvil-orchestrator-
+              submit-and-collect' for a verdict; only pairs flagged
+              `contradicting' are stored (verdict=\"contradicting\",
+              score=jaccard).  PROVIDER / MODEL / TIMEOUT-SEC
+              default to `anvil-memory-llm-*'.
+
+Rows are upserted by (file_a, file_b) so re-running is idempotent.
+Returns (:scanned N :stored M :mode STR :threshold FLOAT)."
+  (let* ((db (anvil-memory--db))
+         (candidates (anvil-memory-duplicates threshold))
+         (now (truncate (float-time)))
+         (stored 0))
+    (pcase mode
+      ('keyword
+       (dolist (c candidates)
+         (let* ((pair (plist-get c :pair))
+                (sim (plist-get c :similarity))
+                (canon (anvil-memory--canonical-pair
+                        (nth 0 pair) (nth 1 pair))))
+           (anvil-memory--upsert-contradiction
+            db (car canon) (cdr canon) "candidate" sim now)
+           (cl-incf stored))))
+      ('llm
+       (let ((prov (or provider anvil-memory-llm-provider))
+             (mdl  (or model anvil-memory-llm-model))
+             (tout (or timeout-sec anvil-memory-llm-timeout-sec)))
+         (dolist (c candidates)
+           (let* ((pair (plist-get c :pair))
+                  (sim (plist-get c :similarity))
+                  (canon (anvil-memory--canonical-pair
+                          (nth 0 pair) (nth 1 pair)))
+                  (a (car canon))
+                  (b (cdr canon))
+                  (body-a (or (anvil-memory--get-body a) ""))
+                  (body-b (or (anvil-memory--get-body b) ""))
+                  (prompt (anvil-memory--verdict-prompt
+                           (file-name-nondirectory a) body-a body-b))
+                  (result (condition-case err
+                              (anvil-orchestrator-submit-and-collect
+                               :provider prov
+                               :prompt prompt
+                               :model mdl
+                               :timeout-sec tout
+                               :collect-timeout-sec tout)
+                            (error (list :status 'failed
+                                         :error (error-message-string err)
+                                         :pending nil))))
+                  (status (plist-get result :status))
+                  (summary (plist-get result :summary))
+                  (verdict (and (eq status 'done)
+                                (anvil-memory--parse-verdict summary))))
+             (when (eq verdict 'contradicting)
+               (anvil-memory--upsert-contradiction
+                db a b "contradicting" sim now)
+               (cl-incf stored))))))
+      (other
+       (user-error
+        "anvil-memory-scan-contradictions: unknown mode %S" other)))
+    (list :scanned (length candidates)
+          :stored stored
+          :mode (symbol-name mode)
+          :threshold threshold)))
+
+;;;###autoload
+(defun anvil-memory-contradictions ()
+  "Return every stored contradiction / candidate edge as plists.
+Sorted by verdict (contradicting / candidate / others) then by
+score descending.  Result plist keys:
+  :file-a / :file-b / :verdict / :score / :checked-at"
+  (let* ((db (anvil-memory--db))
+         (rows (sqlite-select
+                db "SELECT file_a, file_b, verdict, score, checked_at
+                    FROM memory_contradictions
+                    ORDER BY verdict ASC, score DESC")))
+    (mapcar (lambda (row)
+              (list :file-a (nth 0 row)
+                    :file-b (nth 1 row)
+                    :verdict (nth 2 row)
+                    :score (or (nth 3 row) 0.0)
+                    :checked-at (nth 4 row)))
+            rows)))
+
+(defun anvil-memory--contradictions-to-alist (rows)
+  "Coerce `anvil-memory-contradictions' ROWS to JSON-serialisable alists."
+  (mapcar (lambda (r)
+            `((file_a . ,(plist-get r :file-a))
+              (file_b . ,(plist-get r :file-b))
+              (verdict . ,(plist-get r :verdict))
+              (score . ,(or (plist-get r :score) 0.0))
+              (checked_at . ,(or (plist-get r :checked-at) :null))))
+          rows))
 
 (defun anvil-memory--coerce-type (v)
   "Coerce V (string / symbol / nil) to a type symbol or nil."
@@ -1815,6 +2010,45 @@ already idle so the caller can detect no-ops."
   (anvil-server-with-error-handling
    (list :stopped (anvil-memory-serve-stop))))
 
+(defun anvil-memory--tool-scan-contradictions (&optional threshold mode
+                                                         provider model)
+  "Populate memory_contradictions from the current memory index.
+
+MCP Parameters:
+  threshold - Optional jaccard floor (number or digit-string).
+              Defaults to 0.5.
+  mode      - `keyword' (default) or `llm'.  `llm' calls
+              `anvil-orchestrator' per candidate and only keeps
+              contradicting pairs.
+  provider  - Optional orchestrator provider id (llm mode only).
+  model     - Optional model slug (llm mode only).
+
+Returns (:scanned :stored :mode :threshold)."
+  (anvil-server-with-error-handling
+   (let* ((th (anvil-memory--coerce-number threshold 0.5))
+          (m-raw (cond ((null mode) nil)
+                       ((and (stringp mode) (string-empty-p mode)) nil)
+                       ((stringp mode) (intern mode))
+                       ((symbolp mode) mode)
+                       (t nil)))
+          (m (or m-raw 'keyword))
+          (prov (cond ((null provider) nil)
+                      ((and (stringp provider) (string-empty-p provider)) nil)
+                      (t provider)))
+          (mdl (cond ((null model) nil)
+                     ((and (stringp model) (string-empty-p model)) nil)
+                     (t model))))
+     (anvil-memory-scan-contradictions
+      :threshold th :mode m :provider prov :model mdl))))
+
+(defun anvil-memory--tool-contradictions ()
+  "Return every stored contradiction / candidate edge.
+
+Returns (:rows ROWS).  Each row carries :file-a / :file-b /
+:verdict / :score / :checked-at — read-only."
+  (anvil-server-with-error-handling
+   (list :rows (anvil-memory-contradictions))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -1958,7 +2192,26 @@ are all optional and coerced from strings.  Returns :port / :host /
      :description
      "Stop the running memory viewer server.  Idempotent — the MCP
 call always succeeds; :stopped is the port number that was being
-served, or nil when the server was already idle."))
+served, or nil when the server was already idle.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-scan-contradictions)
+     :id "memory-scan-contradictions"
+     :description
+     "Phase 3c: find memory pairs above a jaccard threshold and persist
+them in `memory_contradictions'.  mode=\"keyword\" (default) stores
+every candidate verbatim for later review; mode=\"llm\" calls
+anvil-orchestrator per candidate and only keeps pairs flagged
+`contradicting'.  Idempotent — rows are upserted by (file_a, file_b)
+with canonical (sorted) pair ordering.  Returns :scanned / :stored /
+:mode / :threshold.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-contradictions)
+     :id "memory-contradictions"
+     :description
+     "Phase 3c: return every stored contradiction / candidate edge as
+plists with :file-a / :file-b / :verdict / :score / :checked-at.
+Read-only — rows are populated by `memory-scan-contradictions'."
+     :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory--register-tools ()

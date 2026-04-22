@@ -1657,6 +1657,189 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
           (should (plist-member stopped :stopped)))))))
 
 
+;;;; --- Phase 3c: contradiction store + graph ----------------------------
+
+(defun anvil-memory-test--seed-contradicting-pair (root)
+  "Populate ROOT with two memories whose bodies overlap (candidate pair)."
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_always.md" root)
+   "---\nname: commit rule\n---\nAlways include Co-Authored-By in every commit message trailer.\n")
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_never.md" root)
+   "---\nname: commit rule\n---\nNever include Co-Authored-By in any commit message trailer.\n"))
+
+(ert-deftest anvil-memory-test/scan-contradictions-keyword-mode-stores-candidates ()
+  "Keyword mode stores every jaccard-overlapping pair as verdict=candidate."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (let ((res (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)))
+      (should (plist-member res :scanned))
+      (should (>= (plist-get res :stored) 1))
+      (let ((rows (anvil-memory-contradictions)))
+        (should (>= (length rows) 1))
+        (dolist (r rows)
+          (should (equal "candidate" (plist-get r :verdict)))
+          (should (numberp (plist-get r :score))))))))
+
+(ert-deftest anvil-memory-test/scan-contradictions-respects-threshold ()
+  "Pairs whose jaccard similarity < THRESHOLD are not stored."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_alpha.md" root)
+     "---\nname: alpha\n---\nalpha bravo charlie delta echo foxtrot golf\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_zulu.md" root)
+     "---\nname: zulu\n---\nzulu yankee xray whiskey victor uniform tango\n")
+    (anvil-memory-scan)
+    ;; The two bodies are fully disjoint; frontmatter `name:' contributes
+    ;; the lone shared token "name" (jaccard ≈ 0.06).  A threshold of
+    ;; 0.3 is comfortably above that noise floor so nothing should store.
+    (let ((res (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)))
+      (should (= 0 (plist-get res :stored))))))
+
+(ert-deftest anvil-memory-test/scan-contradictions-llm-mode-stores-contradicting ()
+  "LLM mode verifies candidates; only pairs the model flags as contradicting stay."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        ;; Each candidate pair triggers 1 mock call.
+        (list (list :status 'done :summary "contradicting" :pending nil)
+              (list :status 'done :summary "contradicting" :pending nil))
+      (let ((res (anvil-memory-scan-contradictions
+                  :threshold 0.3 :mode 'llm)))
+        (should (>= (plist-get res :stored) 1))
+        (dolist (r (anvil-memory-contradictions))
+          (should (equal "contradicting" (plist-get r :verdict))))))))
+
+(ert-deftest anvil-memory-test/scan-contradictions-llm-skips-non-contradicting ()
+  "LLM mode drops pairs the model labels `orthogonal' / `duplicate'."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "orthogonal" :pending nil)
+              (list :status 'done :summary "orthogonal" :pending nil))
+      (let ((res (anvil-memory-scan-contradictions
+                  :threshold 0.3 :mode 'llm)))
+        (should (= 0 (plist-get res :stored)))
+        (should (null (anvil-memory-contradictions)))))))
+
+(ert-deftest anvil-memory-test/scan-contradictions-empty-index-noop ()
+  "Zero memories → scan is a no-op; read returns nil."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (let ((res (anvil-memory-scan-contradictions :mode 'keyword)))
+      (should (= 0 (plist-get res :stored))))
+    (should (null (anvil-memory-contradictions)))))
+
+(ert-deftest anvil-memory-test/scan-contradictions-rescan-upserts ()
+  "A second scan with the same inputs replaces (not duplicates) stored rows."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)
+    (let ((first (length (anvil-memory-contradictions))))
+      (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)
+      (should (= first (length (anvil-memory-contradictions)))))))
+
+(ert-deftest anvil-memory-test/contradictions-read-empty-returns-nil ()
+  "Read API on a fresh index returns nil, not an error."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (should (null (anvil-memory-contradictions)))))
+
+(ert-deftest anvil-memory-test/api-contradictions-returns-json ()
+  "GET /api/contradictions returns 200 + application/json array."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)
+    (anvil-memory-test--with-server root
+      (let* ((res (anvil-memory-test--http-get port "/api/contradictions"))
+             (ct (assoc "content-type" (plist-get res :headers))))
+        (should (= 200 (plist-get res :status)))
+        (should (string-match-p "application/json" (cdr ct)))
+        (let* ((json-object-type 'alist)
+               (json-array-type 'list)
+               (parsed (json-read-from-string (plist-get res :body))))
+          (should (listp parsed))
+          (should (> (length parsed) 0))
+          (dolist (entry parsed)
+            (should (assq 'file_a entry))
+            (should (assq 'file_b entry))
+            (should (assq 'verdict entry))))))))
+
+(ert-deftest anvil-memory-test/serve-html-has-contradictions-section-when-present ()
+  "When contradictions are stored the viewer HTML lists them."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "data-section=\"contradictions\"" html))
+      (should (string-match-p "feedback_commit_always\\.md" html))
+      (should (string-match-p "feedback_commit_never\\.md" html)))))
+
+(ert-deftest anvil-memory-test/serve-html-omits-contradictions-section-when-empty ()
+  "With no stored contradictions the section header is absent."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should-not (string-match-p "data-section=\"contradictions\"" html)))))
+
+(ert-deftest anvil-memory-test/serve-html-has-type-filter-controls ()
+  "The viewer HTML now exposes CSS-filterable per-type checkboxes."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-typed-mix root)
+    (anvil-memory-scan)
+    (let ((html (anvil-memory-export-html root)))
+      (should (string-match-p "class=\"facet-filter\"" html))
+      ;; Inline script is OK, external <script src> is not (Phase 3a rule).
+      (should (string-match-p "<script>" html))
+      (should-not (string-match-p "<script[^>]+src=" html)))))
+
+(ert-deftest anvil-memory-test/mcp-scan-contradictions-roundtrip ()
+  "MCP `memory-scan-contradictions' accepts string args and returns a plist."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (let ((res (anvil-memory--tool-scan-contradictions "0.3" "keyword" nil nil)))
+      (should (plist-member res :stored))
+      (should (plist-member res :scanned))
+      (should (equal "keyword" (plist-get res :mode))))))
+
+(ert-deftest anvil-memory-test/mcp-contradictions-roundtrip ()
+  "MCP `memory-contradictions' returns rows as :rows alist entries."
+  (skip-unless (anvil-memory-test--supported-p 'contradictions))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-contradicting-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)
+    (let* ((res (anvil-memory--tool-contradictions))
+           (rows (plist-get res :rows)))
+      (should (listp rows))
+      (should (> (length rows) 0))
+      (dolist (r rows)
+        (should (plist-member r :file-a))
+        (should (plist-member r :file-b))
+        (should (plist-member r :verdict))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

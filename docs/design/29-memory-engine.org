@@ -8,15 +8,14 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3a + 3b SHIPPED~ (2026-04-22、
-stacked feat branches) — Week-3 Ship 4、競合 token-savior の
-"memory engine" を anvil + Claude Code auto-memory に統合する。
-非 destructive (metadata layer のみ SQLite、memory =.md= files の
-rename 以外は不変) の foundation + 検出 + ranking & lifecycle +
-tokenizer swap + LLM verdict + MDL distillation + static HTML
-viewer + live TCP server (loopback HTTP + JSON API)。Phase 3c
-(htmx + contradiction graph) / Phase 4 (cross-project) は
-オプション扱い。
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3 (a/b/c) SHIPPED~ (2026-04-22、
+9 stacked feat branches) — Week-3 Ship 4、競合 token-savior の
+"memory engine" を anvil + Claude Code auto-memory に統合する完成
+実装。非 destructive (metadata layer のみ SQLite、memory =.md=
+files の rename 以外は不変) で foundation + 検出 + ranking &
+lifecycle + tokenizer swap + LLM verdict + MDL distillation +
+static HTML viewer + live TCP server + contradiction store & graph
+を全カバー。Phase 4 (cross-project) のみ optional / 未着手。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -89,6 +88,24 @@ per-client filter state は client process plist の
 =:request-buffer= に分離。loopback default (=127.0.0.1=)、
 ephemeral port は =:port t=。stop は idempotent。新 MCP tool 2 本
 (=memory-serve-start= / =memory-serve-stop=)。11 ERT (合計 102)。
+
+*Phase 3c (feat/doc-29-memory-engine-phase3c):* 永続
+contradiction layer + viewer 拡張。新 SQLite table
+=memory_contradictions= (file_a / file_b PK、canonical pair
+ordering、verdict / score / checked_at)。
+=anvil-memory-scan-contradictions &key threshold mode= で
+=anvil-memory-duplicates= の候補を upsert — mode =keyword=
+(default) は全 candidate を verdict =candidate= で store、
+mode =llm= は orchestrator verdict が =contradicting= の pair
+のみ store。read API =anvil-memory-contradictions= + route
+=GET /api/contradictions=。viewer HTML (Phase 3a
+=--render-page=) に =<fieldset class="facets">= 型 checkbox +
+inline 6 行 JS で CSS filter、contradiction section を
+=<section data-section="contradictions">= で埋め込み (rows が
+page ROOT 以下の両端点の場合のみ render)。htmx は諦めて
+server-side rendered 化、self-contained rule 維持。
+新 MCP tool 2 本 (=memory-scan-contradictions= /
+=memory-contradictions=)。13 ERT (合計 115)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -481,12 +498,56 @@ delete-process で hang safe。
 
 commit: =a6ca5f0= (test-lock、11 ERT) → =79fa6a6= (impl、+290 行)。
 
-** Phase 3c — htmx interactive + contradiction graph (~DRAFT~)
+** Phase 3c — contradiction store + graph viewer (~SHIPPED~ 2026-04-22)
 
-Phase 3b の server に htmx script を inline、=hx-get= で
-per-type section を live refresh。Phase 2b-ii の verdict store
-(将来的に persist された時) を矢印化 (SVG, feedback ↔ feedback の
-contradicting pair)。opt-in、Phase 3b 前提。
+htmx を諦めて代わりに *server-side rendered* の contradiction
+section + CSS-filterable type checkboxes (inline JS 6 行) で同等の
+UX を実装。htmx の CDN / external script dep を避けて、Phase 3a
+の "self-contained HTML" rule を維持したまま interactive にした。
+
+新 SQLite table =memory_contradictions= を Phase 1a/1b/2a の既存
+schema に追加:
+- =file_a= / =file_b= (canonical ordering: =string-lessp= で sort、
+  PK = =(file_a, file_b)=)
+- =verdict= (=candidate= / =contradicting= / =duplicate= / ...)
+- =score= (jaccard similarity at candidate 検出時)
+- =checked_at= (unix timestamp)
+
+populator: =anvil-memory-scan-contradictions &key threshold mode
+provider model timeout-sec=。
+- =mode 'keyword= (default): =anvil-memory-duplicates= で candidate
+  pair を取得、verdict =candidate= + jaccard score を verbatim
+  store。
+- =mode 'llm=: candidate 毎に =anvil-orchestrator-submit-and-
+  collect= + =--verdict-prompt= で verdict 判定、=contradicting=
+  のみ store。=provider= / =model= / =timeout-sec= は既存
+  =anvil-memory-llm-*= defcustom を default に再利用。
+- upsert は =ON CONFLICT(file_a, file_b) DO UPDATE SET verdict,
+  score, checked_at=。rescan で row 数不変、最新 verdict を反映。
+
+read: =anvil-memory-contradictions= (nil-safe、plist list 返却、
+verdict asc + score desc)。
+
+route: =GET /api/contradictions= JSON (=file_a= / =file_b= /
+=verdict= / =score= / =checked_at=)。
+
+HTML 強化 (Phase 3a =--render-page=):
+- =<fieldset class="facets">= の type checkbox + inline
+  =<script>= (6 行) で section 表示切り替え。external JS 依存なし
+  (Phase 3a =export-html-is-self-contained= fixture は引き続き
+  pass)。
+- =<section data-section="contradictions">= を contradictions が
+  存在する時のみ挿入。page ROOT 以下の両端点 row だけ display。
+
+MCP tool 2 本: =memory-scan-contradictions= (threshold / mode /
+provider / model、全 string coerce) / =memory-contradictions=
+(read-only)。
+
+非 obvious: canonical pair ordering を upsert 側で決める。caller
+が =(file_b, file_a)= で呼んでも同じ row に着地。PK 衝突での
+duplicate 蓄積を防ぐ最短 pattern。
+
+commit: =dd83c36= (test-lock、13 ERT) → =cf6cbae= (impl、+262 行)。
 
 ** Phase 4 — cross-project memory
 
