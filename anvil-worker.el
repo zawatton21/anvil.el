@@ -1052,7 +1052,7 @@ cheap enough to poll at interactive rates."
                      (alive  (anvil-worker--quick-alive-p w))
                      (busy   (plist-get w :busy))
                      (sfile  (plist-get w :server-file))
-                     (pid    (and server-use-tcp alive
+                     (pid    (and alive
                                   (anvil-worker--server-file-pid sfile))))
                 (push (format "    %s: %s%s%s"
                               (plist-get w :name)
