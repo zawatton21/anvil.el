@@ -77,7 +77,10 @@
 
 (defconst anvil-shell-filter-supported
   '(git-status git-log git-diff rg find ls pytest ert-batch
-               emacs-batch make dispatch tee gain)
+               emacs-batch make dispatch tee gain
+               gh git-log-graph pip-install npm-install
+               docker-ps docker-logs kubectl-get aws-s3-ls
+               prettier ruff phase2a-dispatch)
   "Capability tags this module currently provides.
 Tests in tests/anvil-shell-filter-test.el gate their `skip-unless'
 on membership here so a half-shipped filter never breaks CI.  The
@@ -320,44 +323,234 @@ retained so the diff remains contextually addressable."
     (string-join (nreverse output) "\n")))
 
 
+;;;; --- Phase 2a filters ---------------------------------------------------
+
+(defun anvil-shell-filter--gh (raw)
+  "Reduce `gh pr list' / `gh issue list' RAW to `#NUM TITLE' oneliners."
+  (let ((lines (split-string raw "\n"))
+        output)
+    (dolist (line lines)
+      (cond
+       ((string-match "^\\(#[0-9]+\\)\\s-+\\(\\S-.*?\\)\\s-\\{2,\\}" line)
+        (push (format "%s %s" (match-string 1 line)
+                      (string-trim-right (match-string 2 line)))
+              output))
+       ((string-match-p "^\\(error\\|Error\\|gh: \\)" line)
+        (push line output))))
+    (string-join (nreverse output) "\n")))
+
+(defun anvil-shell-filter--git-log-graph (raw)
+  "Compress `git log --graph' RAW to `<graph> <hash> <subject>' lines.
+Preserves the leading tree characters so the merge topology is
+still visible; hashes are truncated to 7 chars and Author / Date /
+blank commit metadata is dropped."
+  (let ((lines (split-string raw "\n"))
+        results)
+    (while lines
+      (let ((line (car lines)))
+        (if (string-match
+             "^\\(\\(?:[*|/\\\\ ]\\)+\\)commit \\([a-f0-9]+\\)" line)
+            (let* ((graph (match-string 1 line))
+                   (hash-full (match-string 2 line))
+                   (hash (substring hash-full 0 (min 7 (length hash-full))))
+                   subject)
+              (setq lines (cdr lines))
+              (while (and lines (not subject))
+                (if (string-match "^[*|/\\\\ ]*    \\(.+\\)" (car lines))
+                    (setq subject (match-string 1 (car lines)))
+                  (setq lines (cdr lines))))
+              (when subject
+                (push (format "%s%s %s" graph hash subject) results))
+              (when lines (setq lines (cdr lines))))
+          (setq lines (cdr lines)))))
+    (string-join (nreverse results) "\n")))
+
+(defun anvil-shell-filter--pip-install (raw)
+  "Drop pip progress / cache noise.
+Keeps `Successfully installed' plus ERROR / WARNING lines."
+  (let ((lines (split-string raw "\n"))
+        output)
+    (dolist (line lines)
+      (when (or (string-match-p "^Successfully installed\\|^ERROR:\\|^WARNING:" line)
+                (string-match-p "\\bFATAL\\b\\|not found\\|failed" line))
+        (push line output)))
+    (string-join (nreverse output) "\n")))
+
+(defun anvil-shell-filter--npm-install (raw)
+  "Keep npm summary (added / removed / changed / audited / vulnerabilities)
+and any `npm ERR' / `npm WARN' lines; drop http / notice / progress."
+  (let ((lines (split-string raw "\n"))
+        output)
+    (dolist (line lines)
+      (when (or (string-match-p "^\\(added\\|removed\\|changed\\) [0-9]+" line)
+                (string-match-p "\\baudited [0-9]+" line)
+                (string-match-p "\\bvulnerabilit\\(y\\|ies\\)" line)
+                (string-match-p "^npm ERR\\|^npm WARN" line))
+        (push line output)))
+    (string-join (nreverse output) "\n")))
+
+(defun anvil-shell-filter--docker-ps (raw)
+  "Collapse `docker ps' rows to a count when they exceed the ls threshold.
+Keeps the header row so callers can still see column semantics."
+  (let* ((lines (split-string raw "\n" t))
+         (header (car lines))
+         (rows (cdr lines))
+         (n (length rows)))
+    (if (> n anvil-shell-filter-ls-threshold)
+        (format "%s\n... %d containers" header n)
+      raw)))
+
+(defun anvil-shell-filter--docker-logs (raw)
+  "Collapse consecutive duplicate `docker logs' lines (ignoring timestamp).
+Lines that differ only by their leading ISO-8601 timestamp are
+merged and the count is emitted as `... (xN)' on the first
+occurrence's original line."
+  (let ((lines (split-string raw "\n" t))
+        output
+        (prev-norm nil)
+        (prev-raw nil)
+        (count 0))
+    (cl-labels
+        ((strip-ts (s)
+                   (if (string-match "^[-0-9T:.+]+\\s-+\\(.*\\)" s)
+                       (match-string 1 s)
+                     s))
+         (emit ()
+               (when prev-raw
+                 (push (if (> count 1)
+                           (format "%s (x%d)" prev-raw count)
+                         prev-raw)
+                       output))))
+      (dolist (line lines)
+        (let ((norm (strip-ts line)))
+          (if (equal norm prev-norm)
+              (setq count (1+ count))
+            (emit)
+            (setq prev-norm norm prev-raw line count 1))))
+      (emit))
+    (string-join (nreverse output) "\n")))
+
+(defun anvil-shell-filter--kubectl-get (raw)
+  "Collapse `kubectl get' rows to a count when rows exceed the ls threshold."
+  (let* ((lines (split-string raw "\n" t))
+         (header (car lines))
+         (rows (cdr lines))
+         (n (length rows)))
+    (if (> n anvil-shell-filter-ls-threshold)
+        (format "%s\n... %d resources" header n)
+      raw)))
+
+(defun anvil-shell-filter--aws-s3-ls (raw)
+  "Collapse `aws s3 ls' output to a count when entries exceed the ls threshold."
+  (let* ((lines (split-string raw "\n" t))
+         (n (length lines)))
+    (if (> n anvil-shell-filter-ls-threshold)
+        (format "... %d s3 entries" n)
+      raw)))
+
+(defun anvil-shell-filter--prettier (raw)
+  "Keep `[error]' / `[warn]' / `SyntaxError' / `Error:' lines from prettier RAW."
+  (let ((lines (split-string raw "\n"))
+        output)
+    (dolist (line lines)
+      (when (string-match-p "\\[error\\]\\|\\[warn\\]\\|SyntaxError\\|Error:" line)
+        (push line output)))
+    (string-join (nreverse output) "\n")))
+
+(defun anvil-shell-filter--ruff (raw)
+  "Group ruff violations by rule code; cap 3 occurrences per code + `(N more)'.
+The trailing `Found N errors.' summary is preserved when present."
+  (let ((lines (split-string raw "\n"))
+        (groups (make-hash-table :test 'equal))
+        order summary)
+    (dolist (line lines)
+      (cond
+       ((string-match "^Found [0-9]+ error" line)
+        (setq summary line))
+       ((string-match ": \\([A-Z][0-9]+\\)\\b" line)
+        (let ((code (match-string 1 line)))
+          (unless (gethash code groups)
+            (push code order))
+          (puthash code (cons line (gethash code groups)) groups)))))
+    (let (output)
+      (dolist (code (nreverse order))
+        (let* ((matches (nreverse (gethash code groups)))
+               (shown (seq-take matches 3))
+               (rest (- (length matches) 3)))
+          (push (string-join shown "\n") output)
+          (when (> rest 0)
+            (push (format "  (%d more %s)" rest code) output))))
+      (when summary (push summary output))
+      (string-join (nreverse output) "\n"))))
+
+
 ;;;; --- dispatch / lookup --------------------------------------------------
 
 (defvar anvil-shell-filter-handlers
-  `((git-status  . ,#'anvil-shell-filter--git-status)
-    (git-log     . ,#'anvil-shell-filter--git-log)
-    (git-diff    . ,#'anvil-shell-filter--git-diff)
-    (rg          . ,#'anvil-shell-filter--rg)
-    (find        . ,#'anvil-shell-filter--find)
-    (ls          . ,#'anvil-shell-filter--ls)
-    (pytest      . ,#'anvil-shell-filter--pytest)
-    (ert-batch   . ,#'anvil-shell-filter--ert-batch)
-    (emacs-batch . ,#'anvil-shell-filter--emacs-batch)
-    (make        . ,#'anvil-shell-filter--make))
+  `((git-status     . ,#'anvil-shell-filter--git-status)
+    (git-log        . ,#'anvil-shell-filter--git-log)
+    (git-log-graph  . ,#'anvil-shell-filter--git-log-graph)
+    (git-diff       . ,#'anvil-shell-filter--git-diff)
+    (rg             . ,#'anvil-shell-filter--rg)
+    (find           . ,#'anvil-shell-filter--find)
+    (ls             . ,#'anvil-shell-filter--ls)
+    (pytest         . ,#'anvil-shell-filter--pytest)
+    (ert-batch      . ,#'anvil-shell-filter--ert-batch)
+    (emacs-batch    . ,#'anvil-shell-filter--emacs-batch)
+    (make           . ,#'anvil-shell-filter--make)
+    (gh             . ,#'anvil-shell-filter--gh)
+    (pip-install    . ,#'anvil-shell-filter--pip-install)
+    (npm-install    . ,#'anvil-shell-filter--npm-install)
+    (docker-ps      . ,#'anvil-shell-filter--docker-ps)
+    (docker-logs    . ,#'anvil-shell-filter--docker-logs)
+    (kubectl-get    . ,#'anvil-shell-filter--kubectl-get)
+    (aws-s3-ls      . ,#'anvil-shell-filter--aws-s3-ls)
+    (prettier       . ,#'anvil-shell-filter--prettier)
+    (ruff           . ,#'anvil-shell-filter--ruff))
   "Alist mapping filter tag → pure `(RAW) -> COMPRESSED' function.
 Users can `setf' new entries to register additional filters before
 Phase 3 adds a public register API.")
 
 (defun anvil-shell-filter-lookup (cmd)
-  "Return the filter tag for the first token of shell command CMD, or nil.
-`git SUB ...' dispatches on SUB so `git status' / `git log' /
-`git diff' map to distinct filters.  Unknown commands return nil
-and the caller is expected to fall through to raw passthrough."
+  "Return the filter tag for the first token(s) of shell command CMD, or nil.
+Multi-token commands (`git SUB', `docker SUB', `kubectl SUB',
+`aws SUB SUB2') dispatch on the relevant sub-command so each
+variant lands on its own filter; `git log --graph' upgrades to
+`git-log-graph'.  Unknown commands return nil and the caller
+is expected to fall through to raw passthrough."
   (when (and cmd (stringp cmd))
     (let* ((tokens (split-string (string-trim cmd) "\\s-+" t))
            (first (car tokens))
-           (second (cadr tokens)))
+           (second (cadr tokens))
+           (third (nth 2 tokens)))
       (cond
        ((equal first "git")
-        (pcase second
-          ("status" 'git-status)
-          ("log"    'git-log)
-          ("diff"   'git-diff)
-          (_ nil)))
-       ((member first '("rg" "ag"))          'rg)
-       ((equal first "find")                 'find)
-       ((equal first "ls")                   'ls)
-       ((equal first "pytest")               'pytest)
-       ((equal first "make")                 'make)
+        (cond
+         ((and (equal second "log") (member "--graph" tokens)) 'git-log-graph)
+         ((equal second "status") 'git-status)
+         ((equal second "log")    'git-log)
+         ((equal second "diff")   'git-diff)
+         (t nil)))
+       ((equal first "gh") 'gh)
+       ((member first '("pip" "pip3"))
+        (and (equal second "install") 'pip-install))
+       ((equal first "npm")
+        (and (member second '("install" "i" "ci")) 'npm-install))
+       ((equal first "docker")
+        (cond ((equal second "ps")   'docker-ps)
+              ((equal second "logs") 'docker-logs)
+              (t nil)))
+       ((equal first "kubectl")
+        (and (equal second "get") 'kubectl-get))
+       ((equal first "aws")
+        (and (equal second "s3") (equal third "ls") 'aws-s3-ls))
+       ((equal first "prettier") 'prettier)
+       ((equal first "ruff") 'ruff)
+       ((member first '("rg" "ag")) 'rg)
+       ((equal first "find") 'find)
+       ((equal first "ls") 'ls)
+       ((equal first "pytest") 'pytest)
+       ((equal first "make") 'make)
        (t nil)))))
 
 (defun anvil-shell-filter-apply (name raw)
