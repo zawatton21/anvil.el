@@ -1,0 +1,42 @@
+#+title: benchmarks/tools — grammar / bench helpers
+
+* =regenerate-abi14.sh=
+
+Rebuild the =tree-sitter-elisp= grammar at ABI 14 for Emacs 30.
+
+Why it exists: the upstream Wilfred/tree-sitter-elisp repo's =grammar.js=
+compiles to ABI 15 with recent =tree-sitter= CLI releases, but Emacs
+30.1's =libtreesit= only loads ABI 14. =anvil-sexp-cst= (Doc 31) depends
+on a matching grammar; the script provides the one canonical way to
+produce one.
+
+** Usage
+
+: # clone, regenerate, compile, install into ~/.emacs.d/tree-sitter/
+: benchmarks/tools/regenerate-abi14.sh
+
+: # verify an existing install without rebuilding
+: benchmarks/tools/regenerate-abi14.sh --verify-only
+
+: # use a local checkout and pin a ref
+: benchmarks/tools/regenerate-abi14.sh --src ~/src/tree-sitter-elisp --ref main
+
+Requires =tree-sitter= CLI (=cargo install tree-sitter-cli= or
+=npm i -g tree-sitter-cli=), =git=, and a C compiler.  The install step
+backs up any existing =libtree-sitter-elisp.so= with a timestamped copy.
+
+** Verification
+
+After install the script runs Emacs in batch, loads the grammar from
+the install dir, parses a one-line elisp snippet and asserts the root
+node type.  Exit codes:
+
+- =7=  — this Emacs build has no =treesit-available-p= (pre-29 or no libtreesit)
+- =8=  — =libtreesit= not compiled in
+- =9=  — grammar still not ready (ABI mismatch, missing file, or wrong install dir)
+- =10= — grammar loads but produces unexpected root type
+
+** Related
+
+- [[file:../../docs/design/31-sexp-cst-edits.org][Doc 31]] — =anvil-sexp-cst=, =anvil-inspect-object=, parinfer repair
+- [[file:../doc31-phase0/report-2026-04-22.org][Phase 0 report]] — G1 / G2 measurement results
