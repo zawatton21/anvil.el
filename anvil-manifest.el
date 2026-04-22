@@ -56,9 +56,15 @@ Selects which registered tools are advertised via tools/list when
 the incoming server-id has no entry in `anvil-manifest-server-profiles'.
 Set via `ANVIL_PROFILE' env var or Lisp before calling
 `anvil-manifest-enable'.  Handlers remain live regardless of profile,
-so hidden tools stay callable via explicit tools/call."
+so hidden tools stay callable via explicit tools/call.
+
+Legacy ID-list profiles (full / core / nav / ultra / lean) enumerate
+tool ids explicitly; intent-based profiles (agent / edit, Doc 34
+Phase B) filter by the `:intent' / `:layer' / `:stability' metadata
+attached at registration time."
   :type '(choice (const full) (const core) (const nav)
-                 (const ultra) (const lean))
+                 (const ultra) (const lean)
+                 (const agent) (const edit))
   :group 'anvil-manifest)
 
 (defcustom anvil-manifest-server-profiles
@@ -166,16 +172,54 @@ Excludes orchestrator / browser / pty / cron / worker-admin tools.")
 After Doc 29 (memory-engine) ships, memory-* tools will be stripped
 here to keep the `learning workload' path slim.")
 
+;;; Intent-based profiles (Doc 34 Phase B)
+;;
+;; These use the `:intent' / `:layer' / `:stability' metadata attached
+;; at registration time instead of enumerating tool ids explicitly.
+;; The leading `:filter' keyword distinguishes a filter-spec plist
+;; from a list-of-strings profile.  Tools without metadata receive
+;; default values (intent=general / layer=core / stability=stable)
+;; via `anvil-manifest--filter-match-p'.
+
+(defconst anvil-manifest-profile-agent
+  '(:filter t
+    :intent-include (orchestrator session memory browser
+                     file-edit file-read org-read org-edit
+                     code-bulk-edit json-edit structure
+                     git discovery)
+    :layer-include (core workflow)
+    :stability-exclude (experimental deprecated))
+  "Agent workload: orchestrator-driven long-running tasks.
+Intent-filter variant (Doc 34 Phase B) — advertises any tool whose
+`:intent' overlaps the include list AND whose `:layer' is core or
+workflow AND whose `:stability' is not experimental/deprecated.")
+
+(defconst anvil-manifest-profile-edit
+  '(:filter t
+    :intent-include (file-edit file-read org-read org-edit
+                     code-bulk-edit json-edit structure db-read)
+    :layer-include (core)
+    :stability-exclude (experimental deprecated))
+  "Daily editing: file / code / org, layer=core only.
+Intent-filter variant (Doc 34 Phase B) — excludes io (http),
+workflow (git, orchestrator), and dev (bench, meta) layers.")
+
 ;;; Filter logic
 
 (defun anvil-manifest--profile-toolset (profile)
-  "Return the list of tool IDs visible under PROFILE, or `:all' for full."
+  "Return the toolset specifier for PROFILE.
+Possible return shapes:
+  :all                 — full profile, every tool visible
+  (\"tool-id\" ...)    — ID-list profile (ultra / nav / core / lean)
+  (:filter ...)         — filter-spec profile (agent / edit)"
   (pcase profile
     ('full :all)
     ('core anvil-manifest-profile-core)
     ('nav  anvil-manifest-profile-nav)
     ('ultra anvil-manifest-profile-ultra)
     ('lean anvil-manifest-profile-lean)
+    ('agent anvil-manifest-profile-agent)
+    ('edit anvil-manifest-profile-edit)
     (_ (user-error "anvil-manifest: unknown profile %S" profile))))
 
 (defun anvil-manifest--profile-for-server-id (server-id)
@@ -185,15 +229,43 @@ server-id is absent from `anvil-manifest-server-profiles'."
   (or (cdr (assoc server-id anvil-manifest-server-profiles))
       anvil-manifest-profile))
 
-(defun anvil-manifest--visible-p (tool-id _tool-plist &optional server-id)
+(defun anvil-manifest--filter-match-p (filter tool-plist)
+  "Return non-nil when TOOL-PLIST matches the FILTER spec.
+FILTER is a plist whose first element is `:filter'; recognised
+clauses are `:intent-include' (tool passes iff its `:intent' list
+intersects), `:layer-include' (tool passes iff its `:layer' is a
+member), and `:stability-exclude' (tool fails iff its `:stability'
+is a member).  Missing clauses pass all tools.  TOOL-PLIST may be
+nil, in which case default metadata (intent general / layer core /
+stability stable) is assumed."
+  (let ((intent-inc (plist-get filter :intent-include))
+        (layer-inc (plist-get filter :layer-include))
+        (stab-exc (plist-get filter :stability-exclude))
+        (tool-intents (or (plist-get tool-plist :intent) '(general)))
+        (tool-layer (or (plist-get tool-plist :layer) 'core))
+        (tool-stab (or (plist-get tool-plist :stability) 'stable)))
+    (and
+     (or (null intent-inc) (cl-intersection intent-inc tool-intents))
+     (or (null layer-inc) (memq tool-layer layer-inc))
+     (not (memq tool-stab stab-exc)))))
+
+(defun anvil-manifest--visible-p (tool-id tool-plist &optional server-id)
   "Return non-nil if TOOL-ID should appear in tools/list for SERVER-ID.
 Used as `anvil-server-tool-filter-function' when the module is
 enabled.  When called without SERVER-ID (legacy two-argument callers),
-the global `anvil-manifest-profile' applies."
+the global `anvil-manifest-profile' applies.
+
+Dispatches on the toolset shape: `:all' sentinel passes everything,
+a list of strings uses ID membership (ultra / nav / core / lean),
+and a `(:filter ...)' plist uses the intent/layer/stability filter
+(agent / edit)."
   (let* ((profile (anvil-manifest--profile-for-server-id server-id))
          (set (anvil-manifest--profile-toolset profile)))
-    (or (eq set :all)
-        (member tool-id set))))
+    (cond
+     ((eq set :all) t)
+     ((and (consp set) (eq (car set) :filter))
+      (anvil-manifest--filter-match-p set tool-plist))
+     (t (member tool-id set)))))
 
 ;;; manifest-cost handler
 
@@ -238,7 +310,7 @@ MCP Parameters: (none)"
             :registered-count all
             :approx-tokens tokens
             :profiles-available
-            '(full core nav ultra lean)))))
+            '(full core nav ultra lean agent edit)))))
 
 ;;; Lifecycle
 

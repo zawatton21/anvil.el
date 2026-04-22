@@ -159,10 +159,10 @@ SERVER-ID defaults to \"default\" and is resolved through
       (should (= 0 (plist-get result :advertised-count))))))
 
 (ert-deftest anvil-manifest-test-cost-lists-available-profiles ()
-  "Handler advertises the five profile names."
+  "Handler advertises every profile name (5 legacy + 2 Phase B)."
   (anvil-manifest-test--with-server
     (let ((result (anvil-manifest-cost-handler)))
-      (should (equal '(full core nav ultra lean)
+      (should (equal '(full core nav ultra lean agent edit)
                      (plist-get result :profiles-available))))))
 
 ;;;; --- Phase 1a: per-server-id profile + alias ---------------------------
@@ -290,6 +290,159 @@ and sees only ultra tools while `emacs-eval' still shows everything."
                          anvil-manifest-profile-core))
     (should (= (length profile)
                (length (cl-remove-duplicates profile :test #'equal))))))
+
+
+;;;; --- Phase B: intent-based profiles (agent / edit) ----------------------
+
+(defmacro anvil-manifest-test--with-intent-tools (&rest body)
+  "Run BODY against a registry with a controlled set of tagged stubs."
+  (declare (indent 0))
+  `(let ((anvil-server--tools (make-hash-table :test #'equal))
+         (anvil-server-tool-filter-function nil)
+         (anvil-server-id-aliases nil)
+         (anvil-manifest-profile 'full)
+         (anvil-manifest-server-profiles nil))
+     (unwind-protect
+         (progn
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-file-edit"
+            :description "edit file"
+            :intent '(file-edit) :layer 'core :stability 'stable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-org-edit"
+            :description "edit org"
+            :intent '(org-edit) :layer 'core :stability 'stable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-git-read"
+            :description "read git"
+            :intent '(git read) :layer 'workflow :stability 'stable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-http"
+            :description "http fetch"
+            :intent '(http) :layer 'io :stability 'stable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-bench"
+            :description "bench"
+            :intent '(bench) :layer 'dev :stability 'stable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-wip"
+            :description "wip"
+            :intent '(file-edit) :layer 'core
+            :stability 'experimental)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-dead"
+            :description "dead"
+            :intent '(file-edit) :layer 'core
+            :stability 'deprecated)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-untagged"
+            :description "legacy")
+           ,@body)
+       (setq anvil-server-tool-filter-function nil))))
+
+(ert-deftest anvil-manifest-test-toolset-agent-is-filter-spec ()
+  "`agent' profile returns a `(:filter ...)' plist, not an ID list."
+  (let ((set (anvil-manifest--profile-toolset 'agent)))
+    (should (consp set))
+    (should (eq (car set) :filter))))
+
+(ert-deftest anvil-manifest-test-toolset-edit-is-filter-spec ()
+  (let ((set (anvil-manifest--profile-toolset 'edit)))
+    (should (consp set))
+    (should (eq (car set) :filter))))
+
+(ert-deftest anvil-manifest-test-filter-match-intent-include ()
+  "Filter matches when tool intent intersects the include list."
+  (let ((filter '(:filter t :intent-include (file-edit))))
+    (should (anvil-manifest--filter-match-p
+             filter '(:intent (file-edit) :layer core :stability stable)))
+    (should-not (anvil-manifest--filter-match-p
+                 filter '(:intent (org-read) :layer core :stability stable)))))
+
+(ert-deftest anvil-manifest-test-filter-match-layer-include ()
+  (let ((filter '(:filter t :layer-include (core))))
+    (should (anvil-manifest--filter-match-p
+             filter '(:intent (any) :layer core :stability stable)))
+    (should-not (anvil-manifest--filter-match-p
+                 filter '(:intent (any) :layer io :stability stable)))))
+
+(ert-deftest anvil-manifest-test-filter-excludes-deprecated ()
+  (let ((filter '(:filter t :stability-exclude (deprecated))))
+    (should-not (anvil-manifest--filter-match-p
+                 filter '(:intent (any) :layer core :stability deprecated)))
+    (should (anvil-manifest--filter-match-p
+             filter '(:intent (any) :layer core :stability stable)))))
+
+(ert-deftest anvil-manifest-test-filter-nil-tool-uses-defaults ()
+  "A nil tool plist is treated as intent=general / layer=core / stability=stable."
+  ;; Default-tagged (general) does not intersect (file-edit), so it fails
+  ;; the agent filter's intent clause.
+  (should-not (anvil-manifest--filter-match-p
+               '(:filter t :intent-include (file-edit))
+               nil))
+  ;; No clauses => pass-all, even for nil plist.
+  (should (anvil-manifest--filter-match-p '(:filter t) nil)))
+
+(ert-deftest anvil-manifest-test-filter-missing-clause-is-pass-all ()
+  "Absent filter clauses do not restrict the match."
+  (let ((tool '(:intent (anything) :layer dev :stability stable)))
+    ;; Only layer-include set: intent / stability are unrestricted.
+    (should (anvil-manifest--filter-match-p
+             '(:filter t :layer-include (dev)) tool))
+    ;; No clauses at all: anything passes (including deprecated, since
+    ;; stability-exclude is absent).
+    (should (anvil-manifest--filter-match-p '(:filter t) tool))))
+
+(ert-deftest anvil-manifest-test-visible-agent-profile ()
+  "Under agent: file-edit / org-edit / git-read pass; http / bench / deprecated fail."
+  (anvil-manifest-test--with-intent-tools
+    (let* ((anvil-manifest-profile 'agent)
+           (visible (lambda (id)
+                      (let ((tool (gethash id
+                                           (gethash "default"
+                                                    anvil-server--tools))))
+                        (anvil-manifest--visible-p id tool nil)))))
+      (should (funcall visible "stub-file-edit"))
+      (should (funcall visible "stub-org-edit"))
+      (should (funcall visible "stub-git-read"))
+      (should-not (funcall visible "stub-http"))
+      (should-not (funcall visible "stub-bench"))
+      (should-not (funcall visible "stub-dead")))))
+
+(ert-deftest anvil-manifest-test-visible-edit-profile ()
+  "Under edit: layer=core / intent=edit pass; workflow / io / dev fail."
+  (anvil-manifest-test--with-intent-tools
+    (let* ((anvil-manifest-profile 'edit)
+           (visible (lambda (id)
+                      (let ((tool (gethash id
+                                           (gethash "default"
+                                                    anvil-server--tools))))
+                        (anvil-manifest--visible-p id tool nil)))))
+      (should (funcall visible "stub-file-edit"))
+      (should (funcall visible "stub-org-edit"))
+      (should-not (funcall visible "stub-git-read"))
+      (should-not (funcall visible "stub-http"))
+      (should-not (funcall visible "stub-bench")))))
+
+(ert-deftest anvil-manifest-test-visible-id-list-profiles-unchanged ()
+  "Legacy ID-list profiles keep working after Phase B."
+  (let ((anvil-manifest-profile 'ultra))
+    ;; file-read is in ultra list; stub-untagged is not.
+    (should (anvil-manifest--visible-p "file-read" nil))
+    (should-not (anvil-manifest--visible-p "stub-untagged" nil))))
+
+(ert-deftest anvil-manifest-test-visible-full-profile-unchanged ()
+  "`full' profile always returns t regardless of metadata."
+  (let ((anvil-manifest-profile 'full))
+    (should (anvil-manifest--visible-p "anything" nil))
+    (should (anvil-manifest--visible-p "anything"
+                                       '(:intent (x) :layer dev
+                                         :stability deprecated)))))
+
+(ert-deftest anvil-manifest-test-unknown-profile-still-errors-phase-b ()
+  "Unknown profile continues to signal user-error (no regression)."
+  (should-error (anvil-manifest--profile-toolset 'nonsense)
+                :type 'user-error))
 
 (provide 'anvil-manifest-test)
 ;;; anvil-manifest-test.el ends here
