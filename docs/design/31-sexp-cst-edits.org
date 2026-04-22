@@ -8,7 +8,8 @@
   :PROPERTIES:
   :ID:       d7a1b2c4-5e6f-7a8b-9c0d-1e2f3a4b5c31
   :END:
-~DRAFT~ (2026-04-21) → ~APPROVED~ (2026-04-22, Phase 0 pass) —
+~DRAFT~ (2026-04-21) → ~APPROVED~ (2026-04-22, Phase 0 pass) →
+~APPROVED (Phase 1a trimmed)~ (2026-04-22, post-consensus critique) —
 Week-4 Ship 候補。r/emacs landscape 調査 (2026-04-21) で cl-mcp
 (cl-ai-project, 64★) の Eclector CST 経由 edit + object drilling +
 parinfer auto-repair を確認し、anvil の Doc 12 (sexp-edits, reader-only)
@@ -44,6 +45,89 @@ Phase 0 (G1 treesit-elisp accuracy / G2 inspect-object prototype) を
   の再現 script を添付する (Phase 1a 前に整備)。
 
 Phase 1a 着手 OK。ETA 2-3 日。
+
+** 2026-04-22 consensus critique (claude + codex, orchestrator)
+
+Phase 1a 着手前に orchestrator で cross-model design critique を実施
+(consensus-id =01fa0b61=, verdict=~trim~ ×2)。両 reviewer は独立に
+「概念 GO だが Phase 1a は trim 必要」と判定、収束点と分岐点を記録する。
+
+*** 収束した推奨 (両者一致、Phase 1a に織り込む)
+
+1. *14-type を trim*: char-table / EIEIO / record は 1a で「type +
+   summary のみ stub」、中身の深い introspection は 1b 送り。core 6-8
+   type (alist / plist / hash-table / vector / string / symbol /
+   number / cons) のみ 1a で full output format 固定。
+2. *hostile-value test 必須*: Phase 0 は clean anvil source のみ。
+   Phase 1a ERT に circular 参照 / 巨大 hash (>10k entries) / marker /
+   buffer / process / 深いネスト (>20 levels) を盛り込む。output cap
+   hit 時の graceful degradation を assert。
+3. *cursor namespace に session/client identity を含める*:
+   =inspect-object/<uuid>= は collision 前提。namespace を
+   =inspect-object/<client-id>/<uuid>= に拡張し、他 client 由来の
+   cursor を purge できない構造にする。
+4. *=:error :cursor-expired= の明示契約*: daemon restart / TTL 超過時
+   に cursor lookup すると現在は confusing error。Phase 1a で typed
+   error を contract 化 (=:ok= / =:cursor-expired= / =:not-found=)。
+5. *output format は 1 本に絞る*: Phase 0 の 10-25% 差は 4 KB cap
+   内で ~1 KB にとどまり、dual-format のメンテコストを正当化しない。
+
+*** 分岐した format 選択 → *JSON を 1a 採用*
+
+- Claude: 「downstream MCP consumer (Claude Code 等) は JSON 前提、
+  S-exp output は LLM が text parse する羽目になり構造利点を失う」
+- Codex: 「Phase 0 で S-exp が小さく、Emacs/Lisp alignment、versioned
+  schema で発展」
+- 決定: *JSON only for Phase 1a*。MCP 既存 plumbing (Doc 05 / Doc 26)
+  が全 JSON 経路に整備済みで、S-exp は LLM-side parser 追加負担を
+  生む。S-exp 検討は Phase 3 以降、LLM usage signal 出てから revisit。
+
+*** Claude のみ強く主張 — Emacs 30 ABI mitigation を 1a 着手前に spec 化
+
+- 上流 tree-sitter-elisp grammar は ABI 15 進行中、Emacs 30.1 は ABI 14
+  まで。C toolchain 無しユーザ向け fallback path が doc 未定義。
+- ERROR node recovery mode は byte-offset silent shift を起こし、
+  cursor が stale node 位置を指す risk。Phase 0 は clean input のみで
+  検証しており、この recovery mode は未測定。
+- Mitigation checklist (Phase 1a 着手前に完了必須):
+  - [ ] =benchmarks/tools/regenerate-abi14.sh= を ship
+        (tree-sitter CLI で =--abi 14= 再生成 + install 手順)
+  - [ ] =anvil-sexp-cst= module load 時に =treesit-ready-p= + ABI
+        check、fail 時に =(message "anvil-sexp-cst: grammar ABI
+        mismatch; see benchmarks/tools/regenerate-abi14.sh")= の
+        user-facing warning
+  - [ ] grammar 不在環境で module は silent no-op (ERT skip tag 付与)
+  - [ ] README / install guide に Emacs 30 case の手順 1 節
+
+*** Codex のみ追加 — output shape lock test を先行
+
+- 実装前に =anvil-inspect-object= JSON shape を ERT fixture で固定、
+  実装は fixture を満たす形で埋める (TDD-lite)。後で field 追加する
+  migration を阻止する。
+
+*** Phase 1a (revised) deliverable
+
+- =anvil-sexp-cst.el= skeleton (opt-in, treesit-ready + ABI 14 guard)
+- =anvil-inspect-object= MCP tool (JSON output only):
+  - core 6-8 type full support: alist / plist / hash-table / vector /
+    string / symbol / number / cons
+  - stub-only for 1a: char-table / EIEIO / record (~{type, length}~
+    だけ返す、内部は 1b)
+  - 4 KB output cap、超過で =:cursor= 返却
+- =anvil-state= namespace =inspect-object/<client-id>/<uuid>=、TTL 24h、
+  typed error contract (=:cursor-expired= / =:not-found=)
+- ERT:
+  - core 6-8 type happy path (shape-locked JSON fixture)
+  - hostile value: circular / >10k hash / marker / buffer / process /
+    deep nest / 4KB truncation
+  - stub type (char-table / EIEIO / record) returns =type= + =length=
+    のみを assert
+  - ABI mismatch graceful (skip tag)
+- =benchmarks/tools/regenerate-abi14.sh= + README 1 節
+
+ETA: 3 日 (trim 前 2-3 日 → hostile test + ABI script 追加で +0.5d)。
+trim 無しで進めると claude 見積では 3-4 日となっていたため、trim で
+原見積 2-3 日に収まる筋。
 
 * Motivation
 
@@ -129,18 +213,20 @@ depth-N まで展開) にすると:
 
 * Phasing
 
-| Phase | 内容                                           | 依存   | 想定 | 状態  |
-|-------+------------------------------------------------+--------+------+-------|
-| 0     | treesit-elisp 精度実測 (anvil 自身を parse)    | なし   | 2d   | TODO  |
-| 1a    | =anvil-inspect-object= (lazy drill, top-N)     | 0      | 2d   | TODO  |
-| 1b    | =anvil-inspect-object= :drill + :cursor        | 1a     | 1d   | TODO  |
-| 2a    | =sexp-cst-read= (comment-preserving AST)       | 0      | 2d   | TODO  |
-| 2b    | =sexp-cst-edit= (node rewrite, structural diff)| 2a     | 3d   | TODO  |
-| 3a    | =sexp-cst-repair= (parinfer optional)          | 2b     | 2d   | TODO  |
-| 3b    | LLM 評価 (括弧壊れ input のリトライ率計測)     | 3a     | 1d   | TODO  |
+| Phase | 内容                                                 | 依存   | 想定 | 状態          |
+|-------+------------------------------------------------------+--------+------+---------------|
+| 0     | treesit-elisp 精度実測 (anvil 自身を parse)          | なし   | 2d   | DONE 04-22    |
+| 1a    | inspect-object (core 6-8 type full + stub 3、JSON)   | 0      | 3d   | NEXT (trimmed) |
+| 1b    | inspect-object :drill + :cursor + char-table/EIEIO/record 本体 | 1a     | 2d   | pending       |
+| 2a    | =sexp-cst-read= (comment-preserving AST)             | 0      | 2d   | pending       |
+| 2b    | =sexp-cst-edit= (node rewrite, structural diff)      | 2a     | 3d   | pending       |
+| 3a    | =sexp-cst-repair= (parinfer optional)                | 2b     | 2d   | pending       |
+| 3b    | LLM 評価 (括弧壊れ input のリトライ率計測)           | 3a     | 1d   | pending       |
 
-Phase 0 は ROI 判定の gate: treesit-elisp が実用精度に届かない場合、
-Phase 2 以降は棚上げして Phase 1 (inspect-object) のみ ship する。
+Phase 0 は ROI 判定の gate (2026-04-22 PASS): treesit-elisp が実用精度
+に届かない場合、Phase 2 以降は棚上げして Phase 1 (inspect-object) のみ
+ship する。Phase 1a trim は 2026-04-22 consensus critique で決定
+(詳細は status update 内 "2026-04-22 consensus critique" 節)。
 
 * Design Notes
 
