@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-04-22
+
+Two small fixes released same-day as v0.4.0, both reached the repo
+after the v0.4.0 tag was pushed.
+
+### Fixed
+
+- **Release-audit false positive on `anvil-discovery.el`** — four
+  private accessors (`--tool-intent` / `--tool-layer` /
+  `--tool-stability` / `--tool-summary`) triggered the MCP-tool
+  wrapper regex and failed the release-audit gate on master,
+  leaving the v0.4.0 CI build red.  Renamed to `-of` suffixes
+  (`--intent-of` / `--layer-of` / `--stability-of` / `--summary-of`)
+  so the audit no longer treats them as MCP tools.  No public API
+  change; the actual `anvil-tools-by-intent` / `anvil-tools-
+  usage-report` surfaces are unchanged.
+- **`treesit_info` parser initialisation** (@yours57) — the tool
+  ran through the TreeSitter node walker without creating a parser
+  first, so callers got a stale / empty info payload on buffers
+  where treesit hadn't been warmed.  Added `treesit-parser-create`
+  + integer-param parse helper + autoload for
+  `anvil-treesit-language-for-file` / `-ensure-grammar`.
+
 ## [0.4.0] - 2026-04-22
 
 AI agent workbench release.  Fourteen new design documents (Doc 21-34)
