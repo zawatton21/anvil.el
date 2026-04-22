@@ -8,12 +8,13 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a SHIPPED~ (2026-04-22、stacked feat branches) —
-Week-3 Ship 4、競合 token-savior の "memory engine" を anvil +
-Claude Code auto-memory に統合する。非 destructive (metadata layer
-のみ SQLite、memory =.md= files の rename 以外は不変) の foundation
-+ 検出 + ranking & lifecycle。LLM 判定 (contradiction / MDL) は
-Phase 2b 送り、web viewer / cross-project は Phase 3/4。
+~Phase 1a + 1b + 2a + 2b-i SHIPPED~ (2026-04-22、stacked feat
+branches) — Week-3 Ship 4、競合 token-savior の "memory engine" を
+anvil + Claude Code auto-memory に統合する。非 destructive
+(metadata layer のみ SQLite、memory =.md= files の rename 以外は
+不変) の foundation + 検出 + ranking & lifecycle + tokenizer swap。
+LLM 判定 (contradiction / MDL) は Phase 2b-ii/iii 送り、
+web viewer / cross-project は Phase 3/4。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -35,6 +36,13 @@ refuse missing / overwrite)、=memory-regenerate-index= (=MEMORY.md=
 本文を decay-desc で生成、frontmatter name/description 解析、
 fallback 名は prefix strip + =_= → 空白)。2 新 MCP tool +
 =memory-list= 拡張。16 ERT (合計 49)。
+
+*Phase 2b-i (feat/doc-29-memory-engine-phase2b-i):* FTS5 trigram
+tokenizer swap (SQLite 3.34+)。=anvil-memory-fts-tokenizer= defcustom
+(=auto= / =trigram= / =unicode61=)、新 =memory-reindex-fts= MCP
+tool、既存 DB は opt-in で rebuild (auto-migrate しない)。日本語
+3-char 以上 substring が unicode61 で hit しない問題を解消。
+11 ERT (合計 60)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -277,15 +285,40 @@ commit: =e5a29fc= (test-lock、16 ERT) → =c9f509e= (impl、+320 行)。
 
 commit: =0b3b31c= (test-lock、16 ERT) → =fdbaf3e= (impl、+296 行)。
 
-** Phase 2b — LLM contradiction + MDL distillation + trigram (~DRAFT~)
+** Phase 2b-i — FTS5 trigram tokenizer (~SHIPPED~ 2026-04-22)
 
-9. =memory-save-check= 拡張: Phase 1b は候補を返すだけ、Phase 2b で
-   anvil-orchestrator へ contradiction 判定 prompt を投げて verdict
-   (=orthogonal= / =contradicting= / =duplicate=) を plist に乗せる。
-10. MDL distillation: 複数 memory の共通項を抽出し「convention
+9. Trigram tokenizer (SQLite 3.34+): 日本語 3-char substring が
+   unicode61 で hit しない問題の解消。
+   - =anvil-memory-fts-tokenizer= defcustom: =auto= (default) /
+     =trigram= / =unicode61=。=auto= は build probe で決定
+     (=anvil-memory--sqlite-supports-trigram-p=、throwaway virtual
+     table を create+drop)。
+   - =anvil-memory--create-fts-table= に factored、
+     =anvil-memory--ensure-schema= が resolved tokenizer を使う。
+   - =anvil-memory-reindex-fts [TOKENIZER]=: DROP + CREATE +
+     per-file body INSERT で in-place rebuild。明示的 TOKENIZER
+     は =trigram= / =unicode61= のみ (invalid は =user-error=)。
+   - =memory-reindex-fts= MCP tool (opt-in)。auto-migrate しない —
+     既存 unicode61 DB は user / skill が明示 rebuild。
+   - =anvil-memory--current-fts-tokenizer= は sqlite_master の
+     CREATE SQL を regex match で判定。
+
+commit: =55265b0= (test-lock、11 ERT) → =89f0372= (impl、+157 行)。
+
+** Phase 2b-ii — LLM save-check verdict (~DRAFT~)
+
+10. =memory-save-check= 拡張: Phase 1b は候補を返すだけ、Phase 2b-ii
+    で anvil-orchestrator へ contradiction 判定 prompt を投げて
+    verdict (=orthogonal= / =contradicting= / =duplicate=) を
+    plist に乗せる。=anvil-orchestrator-submit-and-collect= を
+    single-shot 呼び出しで使う想定。network-less ERT は
+    =cl-letf= mock。
+
+** Phase 2b-iii — MDL distillation (~DRAFT~)
+
+11. MDL distillation: 複数 memory の共通項を抽出し「convention
     memory」の草稿を生成する提案機能 (orchestrator-dispatch)。
-11. Trigram tokenizer (SQLite 3.34+): 日本語 FTS hit 改善。
-    Fallback: version check で既存 unicode61 を keep。
+    書き込みはせず draft 返却のみ (human-in-the-loop 維持)。
 
 ** Phase 3 — web-viewer
 
