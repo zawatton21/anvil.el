@@ -397,6 +397,81 @@ client are not drillable by another."
       (should (stringp (anvil-sexp-cst-test--get err "message"))))))
 
 
+;;;; --- byte-level cap (Phase 1b-b) ---------------------------------------
+
+(ert-deftest anvil-sexp-cst-test-byte-cap-truncates ()
+  "When entries fit the entry-count cap but blow the byte cap, the
+encoder must still emit a JSON payload of `<= anvil-sexp-cst-cap-bytes'
+bytes by dropping entries from the tail and minting a drill cursor
+so the caller can page through the rest.  Locks the contract
+documented in Phase 1b-b — the 4 KB ceiling the module has advertised
+since Phase 1a but not enforced."
+  (skip-unless (anvil-sexp-cst-test--available-p 'byte-cap))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((anvil-sexp-cst-cap-bytes 512)
+           (anvil-sexp-cst-top-limit 10)
+           ;; 5 alist cells, each key 120 chars — well over 512 bytes total
+           ;; but well under the 10-entry count cap.
+           (big (cl-loop for i below 5
+                         collect (cons (make-string 120 ?x) i)))
+           (raw (anvil-inspect-object big anvil-sexp-cst-test--client-id))
+           (obj (json-parse-string raw :object-type 'hash-table
+                                   :array-type 'array
+                                   :null-object :null
+                                   :false-object :false)))
+      (should (stringp raw))
+      (should (<= (string-bytes raw) 512))
+      (should (equal (anvil-sexp-cst-test--get obj "type") "alist"))
+      (should (equal (anvil-sexp-cst-test--get obj "length") 5))
+      (should (eq (anvil-sexp-cst-test--get obj "truncated") t))
+      (should (stringp (anvil-sexp-cst-test--get obj "cursor")))
+      ;; Cursor still namespaced by client-id.
+      (should (string-prefix-p
+               (format "inspect-object/%s/" anvil-sexp-cst-test--client-id)
+               (anvil-sexp-cst-test--get obj "cursor"))))))
+
+(ert-deftest anvil-sexp-cst-test-byte-cap-preserves-shape-when-under ()
+  "Small outputs must be unaffected — byte cap only fires when
+`<= anvil-sexp-cst-cap-bytes' would be violated.  Guards against a
+regression where the byte-cap path accidentally truncates every
+response."
+  (skip-unless (anvil-sexp-cst-test--available-p 'byte-cap))
+  (let* ((anvil-sexp-cst-cap-bytes 4096)
+         (small '((a . 1) (b . 2) (c . 3)))
+         (obj (anvil-sexp-cst-test--invoke small))
+         (entries (anvil-sexp-cst-test--entries-as-alist obj)))
+    (should (equal (anvil-sexp-cst-test--get obj "type") "alist"))
+    (should (equal (anvil-sexp-cst-test--get obj "length") 3))
+    (should (eq (anvil-sexp-cst-test--get obj "truncated") :false))
+    (should (null (anvil-sexp-cst-test--get obj "cursor")))
+    (should (= (length entries) 3))))
+
+(ert-deftest anvil-sexp-cst-test-byte-cap-keeps-existing-cursor ()
+  "When the handler already emitted a cursor (top-limit truncation),
+the byte-cap backoff must reuse the same cursor rather than
+minting a fresh one — otherwise stale cursors accumulate every
+time the same huge value is inspected."
+  (skip-unless (anvil-sexp-cst-test--available-p 'byte-cap))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((anvil-sexp-cst-cap-bytes 512)
+           (anvil-sexp-cst-top-limit 3)
+           (big (cl-loop for i below 20
+                         collect (cons (make-string 90 ?q) i)))
+           (raw (anvil-inspect-object big anvil-sexp-cst-test--client-id))
+           (obj (json-parse-string raw :object-type 'hash-table
+                                   :array-type 'array
+                                   :null-object :null
+                                   :false-object :false))
+           (cursor (anvil-sexp-cst-test--get obj "cursor")))
+      (should (<= (string-bytes raw) 512))
+      (should (eq (anvil-sexp-cst-test--get obj "truncated") t))
+      (should (stringp cursor))
+      ;; The same logical value has one cursor in the response; we do not
+      ;; mint two.  (Entry count may be smaller than top-limit 3 due to
+      ;; the byte cap biting first.)
+      (should (equal (anvil-sexp-cst-test--get obj "length") 20)))))
+
+
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
 (ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
