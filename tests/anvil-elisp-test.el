@@ -21,6 +21,29 @@
                      :null-object nil
                      :false-object nil))
 
+(defun anvil-elisp-test--require-native-compiler ()
+  "Skip unless this runner can actually produce native-compiled functions."
+  (unless (and (fboundp 'native-compile)
+               (fboundp 'native-comp-function-p)
+               (fboundp 'native-comp-available-p)
+               (native-comp-available-p))
+    (ert-skip "native compilation is unavailable on this runner")))
+
+(defun anvil-elisp-test--native-compile-symbol-or-skip (sym)
+  "Native-compile SYM or skip if the runner cannot do so reliably."
+  (anvil-elisp-test--require-native-compiler)
+  (condition-case err
+      (let ((compiled (native-compile sym)))
+        (unless (native-comp-function-p compiled)
+          (ert-skip
+           (format "native-compile did not return a native function for %s"
+                   sym)))
+        (fset sym compiled))
+    (error
+     (ert-skip
+      (format "native compilation failed on this runner: %s"
+              (error-message-string err))))))
+
 (defun anvil-elisp-test--with-temp-source (fn)
   "Write a temporary Elisp fixture and call FN with its path."
   (let* ((dir (make-temp-file "anvil-elisp-test-" t))
@@ -75,13 +98,11 @@
 
 (ert-deftest anvil-elisp-test-native-compiled-file-backed-function-uses-source ()
   "Native-compiled Elisp functions with a source file must not be treated as C."
-  (unless (and (fboundp 'native-compile)
-               (fboundp 'native-comp-function-p))
-    (ert-skip "native compilation is unavailable on this runner"))
+  (anvil-elisp-test--require-native-compiler)
   (anvil-elisp-test--with-temp-source
    (lambda (file)
-     (fset 'anvil-elisp-test-fixture-fn
-           (native-compile 'anvil-elisp-test-fixture-fn))
+     (anvil-elisp-test--native-compile-symbol-or-skip
+      'anvil-elisp-test-fixture-fn)
      (should (subrp (symbol-function 'anvil-elisp-test-fixture-fn)))
      (should-not
       (and (fboundp 'subr-primitive-p)
@@ -98,9 +119,7 @@
 
 (ert-deftest anvil-elisp-test-native-compiled-no-source-returns-synthetic-stub ()
   "A native-compiled function without source should return a synthetic stub."
-  (unless (and (fboundp 'native-compile)
-               (fboundp 'native-comp-function-p))
-    (ert-skip "native compilation is unavailable on this runner"))
+  (anvil-elisp-test--require-native-compiler)
   (let ((sym 'anvil-elisp-test-native-no-source))
     (unwind-protect
         (progn
@@ -108,7 +127,7 @@
             (lambda (x y)
               "Standalone native doc."
               (+ x y 3)))
-          (fset sym (native-compile sym))
+          (anvil-elisp-test--native-compile-symbol-or-skip sym)
           (let ((res (anvil-elisp-test--parse-json
                       (anvil-elisp--get-function-definition
                        (symbol-name sym)))))
