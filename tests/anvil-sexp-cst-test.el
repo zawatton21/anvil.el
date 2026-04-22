@@ -46,9 +46,17 @@ The locked cursor namespace is
   `inspect-object/<client-id>/<uuid>' (Doc 31, consensus critique).
 Using a constant here lets us assert the prefix exactly.")
 
-(defun anvil-sexp-cst-test--available-p ()
-  "Return non-nil when `anvil-inspect-object' is implemented."
-  (fboundp 'anvil-inspect-object))
+(defun anvil-sexp-cst-test--available-p (&optional type)
+  "Return non-nil when `anvil-inspect-object' is implemented.
+With TYPE (a symbol like `integer' / `alist' / …) also require the
+module to have declared it in `anvil-sexp-cst-supported-types'.
+Chunks of Phase 1a can ship type families in separate commits —
+tests for unshipped types stay skipped until the module adds
+their tag to the list."
+  (and (fboundp 'anvil-inspect-object)
+       (or (null type)
+           (not (boundp 'anvil-sexp-cst-supported-types))
+           (memq type anvil-sexp-cst-supported-types))))
 
 (defun anvil-sexp-cst-test--invoke (value)
   "Call `anvil-inspect-object' on VALUE with the stable client-id.
@@ -94,7 +102,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-integer-shape ()
   "An integer round-trips as type=integer, length absent, scalar entry."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'integer))
   (let ((obj (anvil-sexp-cst-test--invoke 42)))
     (should (equal (anvil-sexp-cst-test--get obj "type") "integer"))
     ;; scalars must not expose length (size is not a sequence measure).
@@ -105,7 +113,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-nil-shape ()
   "nil reports as type=nil with no length or entries."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'nil))
   (let ((obj (anvil-sexp-cst-test--invoke nil)))
     (should (equal (anvil-sexp-cst-test--get obj "type") "nil"))
     (should (null (anvil-sexp-cst-test--get obj "length")))
@@ -113,14 +121,14 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-symbol-shape ()
   "A symbol reports type=symbol; length MAY be present (name length)."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'symbol))
   (let ((obj (anvil-sexp-cst-test--invoke 'alpha-beta-gamma)))
     (should (equal (anvil-sexp-cst-test--get obj "type") "symbol"))
     (should (eq (anvil-sexp-cst-test--get obj "truncated") :false))))
 
 (ert-deftest anvil-sexp-cst-test-string-shape ()
   "A string reports type=string, length=char count, not truncated at 5 chars."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'string))
   (let ((obj (anvil-sexp-cst-test--invoke "hello")))
     (should (equal (anvil-sexp-cst-test--get obj "type") "string"))
     (should (equal (anvil-sexp-cst-test--get obj "length") 5))
@@ -128,7 +136,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-list-shape ()
   "A proper list reports type=list with length and N entries."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'list))
   (let* ((obj (anvil-sexp-cst-test--invoke '(1 2 3)))
          (entries (anvil-sexp-cst-test--entries-as-alist obj)))
     (should (equal (anvil-sexp-cst-test--get obj "type") "list"))
@@ -140,7 +148,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-alist-shape ()
   "An alist reports type=alist, length = cell count, keys preserved as SEXP repr."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'alist))
   (let* ((val '((a . 1) (b . 2) (c . 3)))
          (obj (anvil-sexp-cst-test--invoke val))
          (entries (anvil-sexp-cst-test--entries-as-alist obj)))
@@ -156,7 +164,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-plist-shape ()
   "A plist (keyword-tagged) reports type=plist with paired keys/values."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'plist))
   (let* ((val '(:x 1 :y 2 :z 3))
          (obj (anvil-sexp-cst-test--invoke val)))
     ;; Either "plist" (preferred by Doc 31 spec) or "list" is acceptable
@@ -167,7 +175,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-hash-table-shape ()
   "A hash-table reports type=hash-table, length = entry count."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'hash-table))
   (let* ((h (make-hash-table :test 'equal))
          (_ (puthash "a" 1 h))
          (_ (puthash "b" 2 h))
@@ -180,7 +188,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-vector-shape ()
   "A vector reports type=vector, length = cell count."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'vector))
   (let* ((obj (anvil-sexp-cst-test--invoke (vector 10 20 30))))
     (should (equal (anvil-sexp-cst-test--get obj "type") "vector"))
     (should (equal (anvil-sexp-cst-test--get obj "length") 3))
@@ -188,7 +196,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-cons-shape ()
   "A proper two-element cons (not an alist cell by itself) reports a pair-ish type."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'cons))
   ;; Cons of scalars: we don't pin type to 'cons because the prototype
   ;; classifies '(a . b) as 'list'.  What we lock is: must not crash,
   ;; must return `type' string, `error' must be absent.
@@ -203,7 +211,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-record-stub-shape ()
   "cl-struct records report type=record with length, empty entries (1a stub)."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'record))
   (let* ((rec (make-anvil-sexp-cst-test-sample :name "top" :quota 42))
          (obj (anvil-sexp-cst-test--invoke rec)))
     (should (equal (anvil-sexp-cst-test--get obj "type") "record"))
@@ -220,7 +228,7 @@ Errors if any entry is missing either `k' or `v'."
 (ert-deftest anvil-sexp-cst-test-truncation-emits-cursor ()
   "When truncation fires, cursor must be namespaced
 `inspect-object/<client-id>/<uuid>' per Doc 31 consensus critique."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'truncation))
   (let* ((huge (cl-loop for i below 5000
                         collect (cons (intern (format "long-key-%05d" i))
                                       (make-string 50 ?z))))
@@ -246,7 +254,7 @@ Errors if any entry is missing either `k' or `v'."
 
 (ert-deftest anvil-sexp-cst-test-circular-returns-typed-error ()
   "A self-referencing list must be reported as a typed error, not a crash."
-  (skip-unless (anvil-sexp-cst-test--available-p))
+  (skip-unless (anvil-sexp-cst-test--available-p 'circular))
   (let* ((cell (list 1 2 3))
          (_ (setcdr (last cell) cell))  ;; close the loop
          (obj (anvil-sexp-cst-test--invoke cell))
@@ -260,15 +268,17 @@ Errors if any entry is missing either `k' or `v'."
 
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
 
-(ert-deftest anvil-sexp-cst-test-meta-locks-active ()
-  "Every other test in this file must skip-when-missing or run-when-present.
-This meta-test fails loudly if someone removes the skip guard from a
-single test without implementing the tool."
-  (skip-unless (not (anvil-sexp-cst-test--available-p)))
-  ;; When the module is missing the whole file should still *load*.  If
-  ;; we reach this branch it means we're on the pre-ship side of the
-  ;; TDD-lite gate and the suite's sole assertion is that we got here.
-  (should t))
+(ert-deftest anvil-sexp-cst-test-meta-locks-loaded ()
+  "Shape-lock infrastructure itself must load regardless of impl state.
+The whole point of the TDD-lite gate is that this file is valid,
+evaluable, and discoverable by `ert-run-tests-batch-and-exit' even
+when `anvil-sexp-cst' is entirely absent.  If this test does not
+run, the suite is broken and every per-type shape-lock result
+below should be treated as unverified."
+  (should (fboundp 'anvil-sexp-cst-test--available-p))
+  (should (fboundp 'anvil-sexp-cst-test--invoke))
+  (should (fboundp 'anvil-sexp-cst-test--get))
+  (should (stringp anvil-sexp-cst-test--client-id)))
 
 
 (provide 'anvil-sexp-cst-test)

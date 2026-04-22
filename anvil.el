@@ -129,7 +129,12 @@ These are not loaded by default.  Available modules:
                 formalise the 3-layer read contract documented in
                 docs/design/28-progressive-disclosure.org.  Depends on
                 `anvil-org-index' for the org-index-index handler
-                (Doc 28 Phase 1)"
+                (Doc 28 Phase 1)
+- `sexp-cst'  — Tree-sitter CST + runtime `inspect-object' tool:
+                token-bounded JSON view of any live Lisp value.
+                Phase 1a chunk 1 covers scalar types; later chunks
+                add containers, truncation cursors, and CST edits
+                (Doc 31, requires Emacs 29+ for later CST phases)"
   :type '(repeat symbol)
   :group 'anvil)
 
