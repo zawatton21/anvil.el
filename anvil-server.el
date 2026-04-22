@@ -801,6 +801,17 @@ explicit tools/call.
 
 Set by `anvil-manifest' (Doc 26) to implement ANVIL_PROFILE.")
 
+(defvar anvil-server-tool-dispatch-hook nil
+  "Abnormal hook run after a tool handler returns successfully.
+Functions on this hook are called with (TOOL-ID SERVER-ID); the
+SERVER-ID is the virtual id the client used (before alias
+resolution).  Used by Doc 34 Phase C (`anvil-discovery') to track
+per-tool usage counters without coupling anvil-server to anvil-state.
+
+Errors raised by hook functions are caught and logged; they do not
+mask or modify the handler's result.  Keep hook functions cheap —
+they run on every successful dispatch.")
+
 (defvar anvil-server-id-aliases nil
   "Alist mapping virtual server-ids to real server-ids.
 Entries are (VIRTUAL . REAL) string pairs.  Used to advertise the
@@ -1047,6 +1058,14 @@ virtual server-ids share the same handler pool."
                          `((type . "text") (text . ,result-text))))
                       (isError . :json-false))))
                 (anvil-server-metrics--track-tool-call tool-name)
+                (condition-case hook-err
+                    (run-hook-with-args
+                     'anvil-server-tool-dispatch-hook
+                     tool-name server-id)
+                  (error
+                   (message "anvil-server: dispatch-hook error on %s: %s"
+                            tool-name
+                            (error-message-string hook-err))))
                 (anvil-server--respond-with-result
                  context formatted-result))
             ;; Handle invalid parameter errors

@@ -916,7 +916,51 @@ SCOPE nil returns FILES unchanged.  Non-existent SCOPE returns nil."
                         files)))
    (t nil)))
 
-(cl-defun anvil-dev-release-audit (&optional project-dir &key scope)
+(defun anvil-dev--audit-scan-unused-tools (days)
+  "Return tool-ids whose last dispatch was more than DAYS ago.
+Reads the Doc 34 Phase C counter from `anvil-state' namespace
+`discovery-usage'.  Returns a list of plists
+`(:id :reason :last-called :days-ago :count)'.  :reason is
+`never-called' when the tool has no counter row, `stale' when
+the counter exists but is older than DAYS.  Returns nil (no
+findings) when anvil-state / anvil-discovery are not loaded so
+the audit still runs on machines where Phase C is not enabled."
+  (when (and (featurep 'anvil-state)
+             (featurep 'anvil-discovery)
+             (fboundp 'anvil-state-get))
+    (condition-case nil
+        (let* ((ns      (bound-and-true-p anvil-discovery--usage-ns))
+               (now     (truncate (float-time)))
+               (cutoff  (- now (* days 86400)))
+               registered results)
+          (when (hash-table-p (bound-and-true-p anvil-server--tools))
+            (maphash
+             (lambda (_sid table)
+               (when (hash-table-p table)
+                 (maphash (lambda (id _t) (push id registered)) table)))
+             anvil-server--tools))
+          (setq registered (cl-remove-duplicates registered :test #'equal))
+          (dolist (id registered)
+            (let ((entry (and ns (anvil-state-get id :ns ns :default nil))))
+              (cond
+               ((null entry)
+                (push (list :id id :reason 'never-called) results))
+               (t
+                (let ((last (plist-get entry :last-called)))
+                  (when (and (numberp last) (< last cutoff))
+                    (push (list :id id
+                                :reason 'stale
+                                :last-called last
+                                :days-ago (/ (- now last) 86400)
+                                :count (or (plist-get entry :count) 0))
+                          results)))))))
+          (sort results
+                (lambda (a b)
+                  (string-lessp (plist-get a :id)
+                                (plist-get b :id)))))
+      (error nil))))
+
+(cl-defun anvil-dev-release-audit (&optional project-dir &key scope unused-since)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
 Runs five cheap scanners (see the `release audit' section for
@@ -937,18 +981,30 @@ details) and returns a plist:
                       when git history is unavailable (shallow clone).
   :non-shipped-docs — list of `(:file :status)' plists for design
                       docs whose STATUS line lacks `SHIPPED'
-  :clean-p          — t iff all five scans returned empty
+  :unused-tools     — Doc 34 Phase C.  Populated only when
+                      UNUSED-SINCE is a positive integer; list of
+                      plists `(:id :reason :last-called :days-ago
+                      :count)' for tools whose counter is stale
+                      (>UNUSED-SINCE days) or absent.  Requires
+                      `anvil-state' + `anvil-discovery' loaded.
+                      Advisory — does not affect `:clean-p'.
+  :clean-p          — t iff the five release-blocker scans returned
+                      empty (unused-tools excluded by design)
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
+  :unused-since     — UNUSED-SINCE value when supplied, else nil
   :audited-at       — ISO timestamp when the scan ran
 
 :SCOPE limits the source scanners (arglist-strip / missing-params /
 plist-return) to a single file or directory path.  When SCOPE names
 a regular file, only that file is audited; when it names a
-directory, files under it are audited.  The design-docs and
-issue-fix scanners are always run on the project tree — whole-tree
-doc state and full git history are cheap and independent of the
-scope in question."
+directory, files under it are audited.  The design-docs, issue-fix,
+and unused-tools scanners always run against the whole project /
+registry state.
+
+:UNUSED-SINCE N (integer days) activates the Phase C unused-tools
+scanner.  Typical values: 14 (biweekly review) or 30 (monthly
+deprecation candidate list).  Omit or pass nil to skip."
   (interactive)
   (let* ((root (or project-dir (anvil-dev--audit-default-root)))
          (_    (unless (and root (file-directory-p root))
@@ -967,6 +1023,8 @@ scope in question."
                           scanner-files))
          (issue-fix-no-test (anvil-dev--audit-scan-issue-fix-without-test root))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
+         (unused-tools   (when (and (integerp unused-since) (> unused-since 0))
+                           (anvil-dev--audit-scan-unused-tools unused-since)))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
                               (null plist-return)
@@ -978,9 +1036,11 @@ scope in question."
                 :plist-return plist-return
                 :issue-fix-no-test issue-fix-no-test
                 :non-shipped-docs non-shipped
+                :unused-tools unused-tools
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
                 :scope scope
+                :unused-since unused-since
                 :audited-at (format-time-string "%Y-%m-%d %H:%M:%S"))))
     (when (called-interactively-p 'any)
       (message "%s" (anvil-dev--audit-format-report result)))

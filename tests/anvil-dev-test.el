@@ -841,4 +841,69 @@ if they don't touch tests."
           (should (null (plist-get r :issue-fix-no-test))))
       (delete-directory d t))))
 
+
+;;;; --- Phase C: :unused-since scanner (Doc 34) ----------------------------
+
+(require 'anvil-state)
+(require 'anvil-discovery)
+
+(ert-deftest anvil-dev-test-audit-unused-since-omitted-is-nil ()
+  "Without :unused-since the Phase C scanner does not run."
+  (let ((d (anvil-dev-test--audit-make-root)))
+    (unwind-protect
+        (let ((r (anvil-dev-release-audit d)))
+          (should (null (plist-get r :unused-tools)))
+          (should (null (plist-get r :unused-since))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-unused-since-reports-stale-and-never ()
+  "With :unused-since the scanner reports stale counters and
+never-called tools against the current registry."
+  (let ((d (anvil-dev-test--audit-make-root))
+        (anvil-server--tools (make-hash-table :test #'equal))
+        (anvil-state-db-path (make-temp-file "anvil-dev-audit-" nil ".db"))
+        (anvil-state--db nil))
+    (unwind-protect
+        (progn
+          (anvil-state-enable)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "recent-tool"
+           :description "r" :intent '(file-edit) :layer 'core)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "stale-tool"
+           :description "s" :intent '(file-edit) :layer 'core)
+          (anvil-server-register-tool
+           (lambda () "ok") :id "never-tool"
+           :description "n" :intent '(file-edit) :layer 'core)
+          (let ((now (truncate (float-time))))
+            (anvil-state-set
+             "recent-tool"
+             (list :count 1 :last-called now :first-seen now
+                   :server-id "default")
+             :ns anvil-discovery--usage-ns)
+            (anvil-state-set
+             "stale-tool"
+             (list :count 3
+                   :last-called (- now (* 45 86400))
+                   :first-seen (- now (* 45 86400))
+                   :server-id "default")
+             :ns anvil-discovery--usage-ns))
+          (let* ((r (anvil-dev-release-audit d :unused-since 30))
+                 (found (plist-get r :unused-tools))
+                 (ids (mapcar (lambda (p) (plist-get p :id)) found))
+                 (reasons (mapcar (lambda (p) (cons (plist-get p :id)
+                                                   (plist-get p :reason)))
+                                  found)))
+            (should (equal 30 (plist-get r :unused-since)))
+            (should-not (member "recent-tool" ids))
+            (should (member "stale-tool" ids))
+            (should (member "never-tool" ids))
+            (should (eq 'stale (cdr (assoc "stale-tool" reasons))))
+            (should (eq 'never-called (cdr (assoc "never-tool" reasons))))
+            (should (plist-get r :clean-p))))
+      (anvil-discovery-usage-clear)
+      (anvil-state-disable)
+      (ignore-errors (delete-file anvil-state-db-path))
+      (delete-directory d t))))
+
 ;;; anvil-dev-test.el ends here

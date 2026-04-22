@@ -231,10 +231,134 @@ layer (core first), intent overlap with the query, and id."
             :tools sorted))))
 
 
+;;;; --- Phase C: usage counter ---------------------------------------------
+
+(defconst anvil-discovery--usage-ns "discovery-usage"
+  "`anvil-state' namespace used to store per-tool usage counters.
+Value at each key is a plist `(:count N :last-called EPOCH-SEC
+:first-seen EPOCH-SEC :server-id SERVER-ID)'.")
+
+(defun anvil-discovery--record-call (tool-name server-id)
+  "Increment the usage counter for TOOL-NAME under SERVER-ID.
+Installed on `anvil-server-tool-dispatch-hook' by
+`anvil-discovery-enable'.  Gracefully no-ops when anvil-state is
+unavailable so dispatch never breaks because of counter I/O."
+  (when (and (stringp tool-name)
+             (featurep 'anvil-state)
+             (fboundp 'anvil-state-set))
+    (condition-case nil
+        (let* ((now (truncate (float-time)))
+               (prev (anvil-state-get tool-name
+                                      :ns anvil-discovery--usage-ns
+                                      :default nil))
+               (prev-count (or (plist-get prev :count) 0))
+               (first (or (plist-get prev :first-seen) now)))
+          (anvil-state-set
+           tool-name
+           (list :count (1+ prev-count)
+                 :last-called now
+                 :first-seen first
+                 :server-id server-id)
+           :ns anvil-discovery--usage-ns))
+      ;; Counter writes are best-effort.  Any state-layer error is
+      ;; swallowed — the user's tool call already succeeded.
+      (error nil))))
+
+(defun anvil-discovery--usage-entry (tool-id)
+  "Return the current usage plist for TOOL-ID, or nil."
+  (when (and (featurep 'anvil-state) (fboundp 'anvil-state-get))
+    (anvil-state-get tool-id
+                     :ns anvil-discovery--usage-ns
+                     :default nil)))
+
+(defun anvil-discovery--all-registered-tool-ids ()
+  "Return every tool-id registered across all server-ids in the registry."
+  (let (ids)
+    (when (hash-table-p anvil-server--tools)
+      (maphash
+       (lambda (_server-id table)
+         (when (hash-table-p table)
+           (maphash (lambda (id _tool) (push id ids)) table)))
+       anvil-server--tools))
+    (cl-remove-duplicates ids :test #'equal)))
+
+(defun anvil-discovery--parse-days-arg (days)
+  "Parse DAYS (string or number) into a positive integer.
+nil / empty returns the default 14."
+  (cond
+   ((null days) 14)
+   ((and (stringp days) (string-empty-p days)) 14)
+   ((stringp days)
+    (let ((n (string-to-number days)))
+      (if (<= n 0) 14 (truncate n))))
+   ((numberp days) (max 1 (truncate days)))
+   (t 14)))
+
+(defun anvil-discovery-usage-report (days)
+  "Return per-tool usage summary based on the Phase C counter.
+
+MCP Parameters:
+  days - Number of days for the `unused-since' threshold (string).
+         Default 14.  Tools whose last-called timestamp is older
+         than DAYS get reported as unused; tools that have never
+         been called are reported as `never-called'.
+
+Returns a plist:
+  :total-registered   - N distinct tool-ids across all server-ids
+  :with-usage         - tools that have a counter record
+  :never-called       - tool-ids with no counter entry at all
+  :unused-since-days  - counter exists but last-called > DAYS ago
+  :per-tool           - sorted list of (:id :count :last-called :days-ago)
+                        plists for the tools that DO have counters,
+                        most recently used first"
+  (anvil-server-with-error-handling
+    (let* ((days-n   (anvil-discovery--parse-days-arg days))
+           (now      (truncate (float-time)))
+           (cutoff   (- now (* days-n 86400)))
+           (all-ids  (anvil-discovery--all-registered-tool-ids))
+           (with-use '())
+           (never    '())
+           (stale    '()))
+      (dolist (id all-ids)
+        (let ((entry (anvil-discovery--usage-entry id)))
+          (cond
+           ((null entry) (push id never))
+           (t
+            (let ((last (plist-get entry :last-called)))
+              (when (and (numberp last) (< last cutoff))
+                (push id stale))
+              (push
+               (list :id id
+                     :count (or (plist-get entry :count) 0)
+                     :last-called last
+                     :days-ago (when (numberp last)
+                                 (max 0 (/ (- now last) 86400))))
+               with-use))))))
+      (list :days-threshold days-n
+            :total-registered (length all-ids)
+            :with-usage (length with-use)
+            :never-called (sort never #'string-lessp)
+            :unused-since-days (sort stale #'string-lessp)
+            :per-tool
+            (sort with-use
+                  (lambda (a b)
+                    (> (or (plist-get a :last-called) 0)
+                       (or (plist-get b :last-called) 0))))))))
+
+(defun anvil-discovery-usage-clear ()
+  "Delete every per-tool usage counter.
+Intended for tests and for operators who want to reset the
+counter window after investigating a report.  No MCP surface."
+  (interactive)
+  (when (and (featurep 'anvil-state)
+             (fboundp 'anvil-state-delete-ns))
+    (anvil-state-delete-ns anvil-discovery--usage-ns)))
+
+
 ;;;; --- lifecycle ----------------------------------------------------------
 
 (defun anvil-discovery--register-tools ()
-  "Register the Doc 34 Phase A discovery MCP tool."
+  "Register the Doc 34 Phase A / C discovery MCP tools."
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-discovery-tools-by-intent)
    :id "anvil-tools-by-intent"
@@ -249,24 +373,49 @@ rank, intent overlap, and id."
    :read-only t
    :intent '(meta discovery)
    :layer 'dev
+   :stability 'stable)
+  (anvil-server-register-tool
+   (anvil-server-encode-handler #'anvil-discovery-usage-report)
+   :id "anvil-tools-usage-report"
+   :server-id anvil-discovery--server-id
+   :description
+   "Report per-tool usage counters (Doc 34 Phase C).  Takes a
+single `days' parameter (default 14) and returns :total-registered,
+:with-usage, :never-called, :unused-since-days, and a :per-tool
+list of (:id :count :last-called :days-ago) sorted by recency.
+Counters are incremented by `anvil-server-tool-dispatch-hook' and
+persist in `anvil-state' under namespace `discovery-usage'."
+   :read-only t
+   :intent '(meta discovery usage)
+   :layer 'dev
    :stability 'stable))
 
 (defun anvil-discovery--unregister-tools ()
-  "Unregister the Doc 34 Phase A discovery tool."
+  "Unregister the discovery MCP tools."
   (ignore-errors
     (anvil-server-unregister-tool "anvil-tools-by-intent"
+                                  anvil-discovery--server-id))
+  (ignore-errors
+    (anvil-server-unregister-tool "anvil-tools-usage-report"
                                   anvil-discovery--server-id)))
 
 ;;;###autoload
 (defun anvil-discovery-enable ()
-  "Enable Doc 34 Phase A — register `anvil-tools-by-intent'."
+  "Enable Doc 34 discovery module — register MCP tools and install
+the usage-counter hook."
   (interactive)
-  (anvil-discovery--register-tools))
+  (anvil-discovery--register-tools)
+  (add-hook 'anvil-server-tool-dispatch-hook
+            #'anvil-discovery--record-call))
 
 ;;;###autoload
 (defun anvil-discovery-disable ()
-  "Disable Doc 34 Phase A — unregister `anvil-tools-by-intent'."
+  "Disable Doc 34 discovery module — remove the dispatch hook and
+unregister MCP tools.  Existing counters in `anvil-state' are left
+in place so historical data survives a toggle."
   (interactive)
+  (remove-hook 'anvil-server-tool-dispatch-hook
+               #'anvil-discovery--record-call)
   (anvil-discovery--unregister-tools))
 
 (provide 'anvil-discovery)
