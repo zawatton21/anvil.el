@@ -10,7 +10,8 @@
   :END:
 ~DRAFT~ (2026-04-22) → ~Phase A SHIPPED~ (2026-04-22, develop branch)
 → ~Phase B SHIPPED~ (2026-04-22, develop branch)
-→ ~Orchestrator wiring SHIPPED~ (2026-04-22, develop branch)。
+→ ~Orchestrator wiring SHIPPED~ (2026-04-22, develop branch)
+→ ~Phase C SHIPPED~ (2026-04-22, develop branch)。
 Phase A: anvil-discovery.el (273 lines) + 19 ERT + 41 core tool tagged、
 ~anvil-server-register-tool~ が ~:intent~/~:layer~/~:stability~ を
 plist pass-through。
@@ -21,8 +22,12 @@ Orchestrator wiring: =anvil-manifest--default-aliases= /
 =-server-profiles= に agent/edit の virtual server-id 追加、
 =anvil-orchestrator-manifest-profile= defcustom に agent / edit 明示、
 +4 ERT (manifest 2 + orchestrator 2)。
-make test-all 1159/1164 pass 0 failed。
-Phase C は Phase B 運用後 (usage counter + release-audit 拡張)。
+Phase C: =anvil-server-tool-dispatch-hook= + =anvil-discovery=
+usage counter (anvil-state ns=discovery-usage) + MCP tool
+=anvil-tools-usage-report= + =anvil-dev-release-audit :unused-since=
+scanner, +8 ERT (discovery 6 + dev 2). Counter 計測は次 session 以降
+自動累積、閾値評価は 1-2 週後に。
+make test-all 1167/1172 pass 0 failed。
 
 Week-4 の主題「module 臨界点対策」の 1 本目。
 tool 数 ~90 を整理せず、*選び方* を runtime 側に移す approach。
