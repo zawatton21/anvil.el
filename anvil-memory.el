@@ -91,10 +91,41 @@ indexed in a single DB.  Explicit list overrides auto-detection."
 
 (defconst anvil-memory-supported
   '(scan audit access list
-         search save-check duplicates audit-urls)
+         search save-check duplicates audit-urls
+         decay promote regenerate)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
+
+(defcustom anvil-memory-decay-half-life-days 30
+  "Days after which the recency component of decay-score decays to ~1/e.
+Used by `anvil-memory--compute-decay'.  Defaults to the 30-day
+half-life from Doc 29 architecture.  Shortening this biases the
+ranking toward very fresh memories; lengthening it keeps long-
+lived feedback rows visible longer."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-decay-access-saturation 10
+  "Access count at which the decay-score access component saturates.
+Counts above this cap no longer boost the score; chosen so a
+memory referenced 10 sessions in a row reaches the maximum access
+contribution."
+  :type 'integer
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-decay-type-weights
+  '((user      . 1.0)
+    (feedback  . 0.9)
+    (project   . 0.7)
+    (reference . 0.5)
+    (memo      . 0.4))
+  "Per-type weight mixed into `anvil-memory--compute-decay'.
+Higher weights buoy long-lived rows (user / feedback) against the
+pure recency signal, so rarely-read-but-load-bearing memories do
+not drop off the MEMORY.md index."
+  :type '(alist :key-type symbol :value-type number)
+  :group 'anvil-memory)
 
 (defconst anvil-memory-ttl-policies
   '((user      . (:hard nil      :soft nil))
@@ -252,12 +283,46 @@ Returns the number of .md files seen."
 
 ;;;; --- list ---------------------------------------------------------------
 
+(defun anvil-memory--compute-decay (row)
+  "Compute a [0, 1] decay-score for ROW.
+Formula (Doc 29 architecture):
+  decay = 0.4 * recency(last-accessed)
+        + 0.3 * access(access-count, saturation)
+        + 0.3 * type-weight(type)
+  recency(t) = exp(-days-since(t) / half-life)
+  access(n)  = min(1, n / saturation)
+
+An unaccessed row (`:last-accessed' nil) contributes 0 recency —
+those rows are deliberately ranked on type-weight alone so the
+MEMORY.md index does not spike a brand-new file above a proven
+feedback rule."
+  (let* ((now (truncate (float-time)))
+         (last (plist-get row :last-accessed))
+         (count (or (plist-get row :access-count) 0))
+         (type (plist-get row :type))
+         (half-life (max 1 anvil-memory-decay-half-life-days))
+         (sat (max 1 anvil-memory-decay-access-saturation))
+         (recency (if last
+                      (let ((days (/ (float (- now last)) 86400.0)))
+                        (exp (- (/ days (float half-life)))))
+                    0.0))
+         (access (min 1.0 (/ (float count) (float sat))))
+         (tw (or (cdr (assoc type anvil-memory-decay-type-weights)) 0.5)))
+    (+ (* 0.4 recency) (* 0.3 access) (* 0.3 tw))))
+
 ;;;###autoload
-(defun anvil-memory-list (&optional type)
+(cl-defun anvil-memory-list (&optional type &key with-decay sort)
   "Return every indexed memory row, optionally filtered by TYPE symbol.
-Rows are ordered by file path.  Each row is a plist with keys
-:file / :type / :created / :last-accessed / :access-count /
-:validity-prior / :ttl-policy / :decay-score / :tags."
+Each row is a plist with keys :file / :type / :created /
+:last-accessed / :access-count / :validity-prior / :ttl-policy /
+:decay-score / :tags.
+
+  :with-decay   non-nil decorates each row with a freshly-computed
+                `:decay-score' float (overrides the stored column
+                value, which is never updated in-place by
+                `memory-scan').
+  :sort         `decay' orders rows by :decay-score descending.
+                Any other value (or nil) falls back to file path."
   (let* ((db (anvil-memory--db))
          (rows (if type
                    (sqlite-select
@@ -275,8 +340,26 @@ Rows are ordered by file path.  Each row is a plist with keys
                           access_count, validity_prior, ttl_policy,
                           decay_score, tags
                      FROM memory_meta
-                 ORDER BY file"))))
-    (mapcar #'anvil-memory--row->plist rows)))
+                 ORDER BY file")))
+         (plists (mapcar #'anvil-memory--row->plist rows)))
+    (when with-decay
+      ;; `anvil-memory--row->plist' already stashes the stored
+      ;; `decay_score' column (default 0.0) under :decay-score.
+      ;; Using `append' here would leave the stored 0.0 in front of
+      ;; the fresh value and `plist-get' would keep returning the
+      ;; stale 0.0.  `plist-put' on a copy updates in-place.
+      (setq plists
+            (mapcar (lambda (row)
+                      (plist-put (copy-sequence row)
+                                 :decay-score
+                                 (anvil-memory--compute-decay row)))
+                    plists)))
+    (when (eq sort 'decay)
+      (setq plists
+            (cl-sort (copy-sequence plists) #'>
+                     :key (lambda (r)
+                            (or (plist-get r :decay-score) 0.0)))))
+    plists))
 
 
 ;;;; --- access tracker -----------------------------------------------------
@@ -511,6 +594,138 @@ detection to Phase 2."
              :key (lambda (p) (plist-get p :similarity)))))
 
 
+;;;; --- Phase 2a: promote + regenerate-index ------------------------------
+
+(defconst anvil-memory--type-prefixes
+  '("feedback_" "project_" "reference_" "user_")
+  "Filename prefixes stripped / prepended by `anvil-memory-promote'.
+Order matches `anvil-memory--infer-type' so a `feedback_' file
+cannot be mis-stripped as `user_*'.")
+
+(defun anvil-memory--strip-type-prefix (basename)
+  "Return BASENAME with any known type prefix removed once."
+  (let ((result basename)
+        (stripped nil))
+    (dolist (p anvil-memory--type-prefixes)
+      (unless stripped
+        (when (string-prefix-p p result)
+          (setq result (substring result (length p))
+                stripped t))))
+    result))
+
+;;;###autoload
+(defun anvil-memory-promote (old-file new-type)
+  "Rename OLD-FILE on disk to reflect NEW-TYPE's filename prefix and
+update the metadata + FTS index accordingly.
+
+OLD-FILE must exist and be indexed (run `anvil-memory-scan'
+first).  NEW-TYPE is one of the `anvil-memory-ttl-policies'
+symbols (user / feedback / project / reference / memo).  The
+destination basename is `NEW-TYPE_BASENAME-WITHOUT-OLD-PREFIX'
+placed in OLD-FILE's directory; the helper refuses overwrite.
+
+Returns the new absolute path on success.  The memory file's
+body is never rewritten — only its filename and index rows are
+touched."
+  (unless (and old-file (stringp old-file))
+    (user-error "anvil-memory-promote: OLD-FILE must be a string"))
+  (unless (and new-type (symbolp new-type))
+    (user-error "anvil-memory-promote: NEW-TYPE must be a symbol"))
+  (unless (file-exists-p old-file)
+    (user-error "anvil-memory-promote: source missing: %s" old-file))
+  (let* ((db (anvil-memory--db))
+         (indexed (sqlite-select
+                   db
+                   "SELECT 1 FROM memory_meta WHERE file = ?1 LIMIT 1"
+                   (list old-file))))
+    (unless indexed
+      (user-error
+       "anvil-memory-promote: file not indexed (run memory-scan): %s"
+       old-file))
+    (let* ((dir (file-name-directory old-file))
+           (stripped (anvil-memory--strip-type-prefix
+                      (file-name-nondirectory old-file)))
+           (new-base (format "%s_%s" (symbol-name new-type) stripped))
+           (new-file (expand-file-name new-base dir)))
+      (when (file-exists-p new-file)
+        (user-error
+         "anvil-memory-promote: destination exists: %s" new-file))
+      (rename-file old-file new-file)
+      (sqlite-execute
+       db
+       "UPDATE memory_meta
+           SET file = ?1, type = ?2, ttl_policy = ?2
+         WHERE file = ?3"
+       (list new-file (symbol-name new-type) old-file))
+      (sqlite-execute
+       db
+       "UPDATE memory_body_fts SET file = ?1 WHERE file = ?2"
+       (list new-file old-file))
+      new-file)))
+
+
+(defun anvil-memory--parse-frontmatter (body)
+  "Extract display metadata from BODY's leading `---' YAML block.
+Returns (:name STR :description STR); either can be nil when the
+respective key is absent.  No YAML parser is used — a line-level
+regexp handles the 4 fields anvil memories actually write."
+  (when (and body (string-match "\\`---\n\\([^\0]*?\\)---\n?" body))
+    (let* ((fm (match-string 1 body))
+           (name nil)
+           (desc nil))
+      (save-match-data
+        (when (string-match "^name:\\s-*\\(.+\\)$" fm)
+          (setq name (string-trim (match-string 1 fm))))
+        (when (string-match "^description:\\s-*\\(.+\\)$" fm)
+          (setq desc (string-trim (match-string 1 fm)))))
+      (list :name name :description desc))))
+
+(defun anvil-memory--fallback-display-name (path)
+  "Derive a human-friendly title from PATH when frontmatter is absent.
+Strips the type prefix + `.md' extension and turns underscores
+into spaces."
+  (let* ((base (file-name-nondirectory path))
+         (stem (file-name-sans-extension base))
+         (no-prefix (anvil-memory--strip-type-prefix stem)))
+    (replace-regexp-in-string "_" " " no-prefix)))
+
+;;;###autoload
+(defun anvil-memory-regenerate-index (root)
+  "Return a `MEMORY.md' body listing memories under ROOT.
+Rows are ordered by `:decay-score' descending (Phase 2a formula)
+so the most load-bearing entries gravitate to the top 200 lines
+Claude Code actually loads.  Each line is shaped:
+
+  - [NAME](BASENAME.md) — DESCRIPTION
+
+NAME / DESCRIPTION come from the memory file's YAML frontmatter;
+missing fields fall back to a prettified filename / empty string.
+The function is read-only: it returns the text — the caller
+writes it to disk (the memory-pruner skill owns that step)."
+  (unless (and root (stringp root))
+    (user-error "anvil-memory-regenerate-index: ROOT must be a string"))
+  (let* ((abs-root (file-name-as-directory (expand-file-name root)))
+         (rows (anvil-memory-list nil :with-decay t :sort 'decay))
+         (scoped (cl-remove-if-not
+                  (lambda (r)
+                    (string-prefix-p abs-root (plist-get r :file)))
+                  rows)))
+    (mapconcat
+     (lambda (row)
+       (let* ((path (plist-get row :file))
+              (base (file-name-nondirectory path))
+              (body (or (anvil-memory--get-body path) ""))
+              (fm (anvil-memory--parse-frontmatter body))
+              (name (or (and fm (plist-get fm :name))
+                        (anvil-memory--fallback-display-name path)))
+              (desc (or (and fm (plist-get fm :description)) "")))
+         (if (string-empty-p desc)
+             (format "- [%s](%s)" name base)
+           (format "- [%s](%s) — %s" name base desc))))
+     scoped
+     "\n")))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-memory--coerce-type (v)
@@ -633,17 +848,66 @@ nil when FILE is not in the index; `:access-count' is then nil."
            :access-count new-count
            :found (and new-count t)))))
 
-(defun anvil-memory--tool-list (&optional type)
+(defun anvil-memory--tool-list (&optional type with_decay sort)
   "Dump the memory metadata index.
 
 MCP Parameters:
-  type - Optional memory type to filter by.  Empty / omitted
-         returns every row.
+  type       - Optional memory type to filter by.  Empty /
+               omitted returns every row.
+  with_decay - Truthy (non-nil / non-empty string) attaches a
+               freshly-computed :decay-score to each row (Phase
+               2a formula).
+  sort       - `decay' sorts rows by :decay-score descending.
+               Any other value (or empty / omitted) keeps the
+               default file-path ordering.
 
-Returns (:rows ROWS) ordered by file path."
+Returns (:rows ROWS)."
   (anvil-server-with-error-handling
-   (let ((typ (anvil-memory--coerce-type type)))
-     (list :rows (anvil-memory-list typ)))))
+   (let* ((typ (anvil-memory--coerce-type type))
+          (wd (cond ((null with_decay) nil)
+                    ((and (stringp with_decay) (string-empty-p with_decay))
+                     nil)
+                    (t t)))
+          (sort-sym (cond ((null sort) nil)
+                          ((and (stringp sort) (string-empty-p sort)) nil)
+                          ((stringp sort) (intern sort))
+                          ((symbolp sort) sort)
+                          (t nil))))
+     (list :rows
+           (anvil-memory-list typ :with-decay wd :sort sort-sym)))))
+
+(defun anvil-memory--tool-promote (old_file new_type)
+  "Rename an indexed memory file and update its type.
+
+MCP Parameters:
+  old_file - Absolute path as stored in the index.  Required.
+  new_type - Target type symbol / string (user / feedback /
+             project / reference / memo).  Required.
+
+Returns (:old-file :new-file :type) on success.  Signals
+`user-error' when OLD_FILE is missing, unindexed, or the new
+filename already exists — the rename is refused in every
+failure mode so the on-disk state stays consistent."
+  (anvil-server-with-error-handling
+   (let* ((typ (anvil-memory--coerce-type new_type))
+          (_ (unless typ
+               (user-error
+                "anvil-memory-promote: new_type must be a type symbol")))
+          (new-path (anvil-memory-promote old_file typ)))
+     (list :old-file old_file
+           :new-file new-path
+           :type typ))))
+
+(defun anvil-memory--tool-regenerate (root)
+  "Return a MEMORY.md body for ROOT ordered by decay-score descending.
+
+MCP Parameters:
+  root - Directory whose indexed memory files should be listed.
+         Only rows whose `:file' lives under ROOT are included.
+
+Returns (:body TEXT) — read-only; the caller writes the file."
+  (anvil-server-with-error-handling
+   (list :body (anvil-memory-regenerate-index root))))
 
 
 ;;;; --- module lifecycle ---------------------------------------------------
@@ -711,6 +975,25 @@ candidate."
 THRESHOLD (default 0.6).  O(N^2) over the index — fine up to a
 few hundred memories, defer semantic (embedding) duplicates to
 Phase 2."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-promote)
+     :id "memory-promote"
+     :description
+     "Rename an indexed memory file to reflect NEW_TYPE's prefix and
+update metadata + FTS index accordingly.  Refuses overwrite and
+missing / unindexed sources so on-disk state stays consistent.
+Use this to promote a `MEMO'-style note to `feedback' once it
+has proven itself across multiple sessions.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-regenerate)
+     :id "memory-regenerate-index"
+     :description
+     "Return a `MEMORY.md' body listing memories under ROOT, ordered
+by :decay-score descending.  Lines are `- [NAME](FILE) — DESC'
+using YAML frontmatter when present (fallback: prettified file
+stem).  Read-only — the caller (memory-pruner skill) writes the
+returned body to disk after human review."
      :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 
