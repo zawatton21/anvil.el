@@ -215,6 +215,40 @@ support.  Override per task with `:no-worktree t'."
   :type 'boolean
   :group 'anvil-orchestrator)
 
+(defcustom anvil-orchestrator-manifest-profile nil
+  "Active `anvil-manifest' profile for orchestrator child sessions.
+Symbol (e.g. `ultra', `nav', `core') or nil (Phase 1b disabled).
+
+When non-nil AND `anvil-orchestrator-manifest-stdio-command' is
+populated, each provider that supports MCP config injection (claude
+today) generates a per-task JSON file pointing at the virtual
+server-id `emacs-eval-PROFILE', and appends `--mcp-config FILE' to
+its argv.  The result: child sessions see only the PROFILE-filtered
+`tools/list' without the user hand-editing `~/.claude.json'.
+
+The Phase 0 ROI measurement (2026-04-20) concluded main-session
+applications save <1% tokens, so this is *opt-in* — leave nil for
+main-session main-daemon behavior unchanged.
+
+Override per task with `:no-manifest-override t' on the task plist
+(useful for tasks that need the full MCP surface — debugging
+orchestrator, running `manifest-cost' against the unfiltered
+server, etc.)."
+  :type '(choice (const :tag "Disabled" nil)
+                 (const ultra) (const nav) (const core) (const lean)
+                 (symbol :tag "Other profile"))
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-manifest-stdio-command nil
+  "Absolute path to the user's `anvil-stdio.sh' wrapper (or equivalent).
+Used by Phase 1b manifest injection to build the `mcpServers' entry
+in the generated MCP config file.  When nil or the file does not
+exist, manifest injection is a no-op — protects users from shipping
+a broken `--mcp-config' to their child sessions."
+  :type '(choice (const :tag "Autodetect / disabled" nil)
+                 (file :tag "Path to anvil-stdio.sh"))
+  :group 'anvil-orchestrator)
+
 (defcustom anvil-orchestrator-output-size-cap (* 1024 1024)
   "Per-task stdout / stderr byte ceiling before head + tail truncation."
   :type 'integer
@@ -349,6 +383,100 @@ Collapses the `(setq cmd (append cmd (list ...)))' pattern that
 every provider build-cmd repeats.  Does not mutate CMD."
   (if test (append cmd items) cmd))
 
+;;;; --- Phase 1b manifest auto-inject helpers (Doc 26) ---------------------
+
+(defconst anvil-orchestrator--manifest-virtual-server-prefix "emacs-eval-"
+  "Prefix for the virtual server-id derived from the manifest profile.
+`anvil-manifest' installs aliases of the form `emacs-eval-PROFILE'
+in `anvil-server-id-aliases' at `anvil-manifest-enable' time; this
+constant must agree with that convention.")
+
+(defun anvil-orchestrator--manifest-config-file-path (task-id)
+  "Return a deterministic temp path for TASK-ID's manifest MCP config.
+Keying on the task id lets the sentinel clean up the same file
+`--claude-build-cmd' wrote to without stashing state on the process
+object.  The file lives under `temporary-file-directory' with a
+fixed prefix so accidental collisions with unrelated temp files are
+vanishingly unlikely."
+  (expand-file-name
+   (format "anvil-orch-manifest-%s.json"
+           (or task-id "anon"))
+   temporary-file-directory))
+
+(defun anvil-orchestrator--manifest-active-profile (task)
+  "Return the manifest profile symbol to apply to TASK, or nil to skip.
+Checks the opt-out first (`:no-manifest-override t') then falls back
+to `anvil-orchestrator-manifest-profile'.  The stdio-command is
+validated by the caller, not here — callers who only need to know
+`do we inject?' can combine this with `--manifest-stdio-ready-p'."
+  (and (not (plist-get task :no-manifest-override))
+       anvil-orchestrator-manifest-profile
+       (symbolp anvil-orchestrator-manifest-profile)
+       anvil-orchestrator-manifest-profile))
+
+(defun anvil-orchestrator--manifest-stdio-ready-p ()
+  "Return non-nil when the stdio-command customization is usable.
+Phase 1b degrades gracefully when the path is unset or missing so a
+half-configured user does not end up shipping broken MCP config to
+claude."
+  (let ((cmd anvil-orchestrator-manifest-stdio-command))
+    (and (stringp cmd)
+         (not (string-empty-p cmd))
+         (file-exists-p cmd))))
+
+(defun anvil-orchestrator--manifest-write-config (task profile)
+  "Write a per-task MCP config file for PROFILE, return its path.
+TASK's `:id' keys the path; the file contains a single `mcpServers'
+entry named `emacs-eval-PROFILE' pointing at
+`anvil-orchestrator-manifest-stdio-command' with `--server-id=' +
+`--init-function=anvil-enable' args.
+
+Signals if the write fails — build-cmd's caller handles the
+downstream error in the usual orchestrator failure envelope."
+  (let* ((task-id     (or (plist-get task :id) "anon"))
+         (virtual-id  (concat anvil-orchestrator--manifest-virtual-server-prefix
+                              (symbol-name profile)))
+         (path        (anvil-orchestrator--manifest-config-file-path task-id))
+         (entry       (list :type "stdio"
+                            :command anvil-orchestrator-manifest-stdio-command
+                            :args (vector (concat "--server-id=" virtual-id)
+                                          "--init-function=anvil-enable")
+                            :env (make-hash-table)))
+         (servers     (let ((h (make-hash-table :test 'equal)))
+                        (puthash virtual-id entry h)
+                        h))
+         (payload     (let ((h (make-hash-table :test 'equal)))
+                        (puthash "mcpServers" servers h)
+                        h)))
+    (with-temp-file path
+      (insert (json-serialize payload
+                              :false-object :false
+                              :null-object :null)))
+    path))
+
+(defun anvil-orchestrator--manifest-inject-mcp-config (cmd task)
+  "Append `--mcp-config FILE' to CMD when Phase 1b should fire for TASK.
+Returns CMD unchanged when the profile is disabled, the task opts
+out, or the stdio command customization is not usable.  The
+generated file is removed by the sentinel — see
+`--manifest-cleanup-config' further down."
+  (let ((profile (anvil-orchestrator--manifest-active-profile task)))
+    (cond
+     ((null profile) cmd)
+     ((not (anvil-orchestrator--manifest-stdio-ready-p)) cmd)
+     (t
+      (let ((path (anvil-orchestrator--manifest-write-config task profile)))
+        (append cmd (list "--mcp-config" path)))))))
+
+(defun anvil-orchestrator--manifest-cleanup-config (task-id)
+  "Remove the manifest MCP config file that belonged to TASK-ID.
+Called from the sentinel path; silently no-ops when the file is
+already gone (file not created because manifest injection was
+disabled for this task)."
+  (let ((path (anvil-orchestrator--manifest-config-file-path task-id)))
+    (when (and path (file-exists-p path))
+      (ignore-errors (delete-file path)))))
+
 ;;;; --- claude provider (built-in) -----------------------------------------
 
 (defconst anvil-orchestrator--claude-price-table
@@ -416,6 +544,12 @@ provider natively supports it)."
                cmd bare     "--bare"))
     (setq cmd (anvil-orchestrator--argv-append-when
                cmd wt-name  "--worktree" wt-name))
+    ;; Phase 1b (Doc 26): auto-inject --mcp-config pointing at the
+    ;; virtual server-id so the child session sees a profile-filtered
+    ;; tools/list without user-side config edits.  No-op when the
+    ;; profile is disabled, the task opts out, or the stdio command
+    ;; customization is not usable.
+    (setq cmd (anvil-orchestrator--manifest-inject-mcp-config cmd task))
     ;; Prompt is the positional argument; CLI treats remaining argv as prompt.
     (append cmd (list prompt))))
 
@@ -1466,6 +1600,10 @@ stream-json NDJSON survives round-trip."
       (with-current-buffer err-buf
         (write-region (point-min) (point-max) stderr nil 'silent))
       (kill-buffer err-buf))
+    ;; Phase 1b cleanup: remove the per-task MCP config file generated
+    ;; by `--manifest-inject-mcp-config'.  No-op when injection was
+    ;; disabled for this task (file never existed).
+    (anvil-orchestrator--manifest-cleanup-config id)
     (let ((out-orig (and stdout
                          (anvil-orchestrator--truncate-output-file stdout)))
           (err-orig (and stderr
