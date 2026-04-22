@@ -923,6 +923,203 @@ fresh :decay-score float."
       (should (integerp (plist-get result :rebuilt))))))
 
 
+;;;; --- Phase 2b-ii: LLM save-check verdict --------------------------------
+
+(defmacro anvil-memory-test--with-llm-mock (response-plists &rest body)
+  "Run BODY with `anvil-orchestrator-submit-and-collect' stubbed.
+RESPONSE-PLISTS is an expression evaluating to a list of plists;
+each orchestrator call pops one off a shared queue.  A dynamic
+variable `mock-calls' is let-bound and records the plists of
+forwarded keyword args so tests can assert call counts / contents."
+  (declare (indent 1))
+  `(let* ((mock-queue (copy-sequence ,response-plists))
+          (mock-calls nil))
+     (cl-letf (((symbol-function 'anvil-orchestrator-submit-and-collect)
+                (lambda (&rest kwargs)
+                  (push kwargs mock-calls)
+                  (or (pop mock-queue)
+                      (list :status 'done :summary "orthogonal" :pending nil)))))
+       ,@body)))
+
+(defun anvil-memory-test--seed-duplicate-pair (root)
+  "Populate ROOT with two similar feedback memories for save-check."
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit.md" root)
+   "---\ntype: feedback\n---\nAlways include Co-Authored-By in every commit.\n")
+  (anvil-memory-test--write
+   (expand-file-name "feedback_commit_rules.md" root)
+   "---\ntype: feedback\n---\nAlways include Co-Authored-By tag.\n"))
+
+(ert-deftest anvil-memory-test/llm-verdict-without-flag-unchanged ()
+  "`save-check' without :with-llm returns the Phase 1b shape (no verdict)."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (let ((hits (anvil-memory-save-check
+                 "Co-Authored-By rule"
+                 "Always include Co-Authored-By in every commit."
+                 3)))
+      (should (> (length hits) 0))
+      (dolist (h hits)
+        (should-not (plist-member h :verdict))
+        (should-not (plist-member h :verdict-raw))
+        (should-not (plist-member h :verdict-error))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-duplicate-parsed ()
+  "LLM response \"duplicate\" is parsed into :verdict 'duplicate."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "duplicate" :pending nil)
+              (list :status 'done :summary "duplicate" :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "Co-Authored-By rule"
+                   "Always include Co-Authored-By in every commit."
+                   3 :with-llm t)))
+        (should (> (length hits) 0))
+        (dolist (h hits)
+          (should (eq 'duplicate (plist-get h :verdict))))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-contradicting-parsed ()
+  "LLM response \"contradicting\" maps to 'contradicting."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "contradicting" :pending nil)
+              (list :status 'done :summary "contradicting" :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "Co-Authored-By rule"
+                   "Never include Co-Authored-By."
+                   3 :with-llm t)))
+        (should (> (length hits) 0))
+        (should (eq 'contradicting (plist-get (car hits) :verdict)))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-orthogonal-parsed ()
+  "LLM response \"orthogonal\" maps to 'orthogonal."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "orthogonal" :pending nil)
+              (list :status 'done :summary "orthogonal" :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "Co-Authored-By rule" "Commit body 123"
+                   3 :with-llm t)))
+        (should (> (length hits) 0))
+        (dolist (h hits)
+          (should (eq 'orthogonal (plist-get h :verdict))))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-case-punctuation-robust ()
+  "Verdict parser is case-insensitive and tolerates surrounding punctuation."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "Verdict: DUPLICATE." :pending nil)
+              (list :status 'done :summary "The answer is: CONTRADICTING." :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "S" "B" 3 :with-llm t)))
+        (should (memq (plist-get (car hits) :verdict)
+                      '(duplicate contradicting orthogonal)))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-unknown-response ()
+  "Unparseable LLM response yields :verdict nil + :verdict-raw."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "maybe perhaps" :pending nil)
+              (list :status 'done :summary "something else" :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "S" "B" 3 :with-llm t)))
+        (should (> (length hits) 0))
+        (dolist (h hits)
+          (should (null (plist-get h :verdict)))
+          (should (stringp (plist-get h :verdict-raw))))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-failed-status ()
+  "Orchestrator :status failed propagates to :verdict-error."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'failed :error "boom" :pending nil)
+              (list :status 'failed :error "boom" :pending nil))
+      (let ((hits (anvil-memory-save-check
+                   "S" "B" 3 :with-llm t)))
+        (should (> (length hits) 0))
+        (dolist (h hits)
+          (should (null (plist-get h :verdict)))
+          (should (stringp (plist-get h :verdict-error))))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-pending-timeout ()
+  "Orchestrator :pending t collapses into :verdict-error."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'running :pending t)
+              (list :status 'running :pending t))
+      (let ((hits (anvil-memory-save-check
+                   "S" "B" 3 :with-llm t)))
+        (should (> (length hits) 0))
+        (dolist (h hits)
+          (should (null (plist-get h :verdict)))
+          (should (stringp (plist-get h :verdict-error))))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-called-per-candidate ()
+  "One orchestrator call per candidate returned (N candidates → N calls)."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "duplicate" :pending nil)
+              (list :status 'done :summary "duplicate" :pending nil)
+              (list :status 'done :summary "duplicate" :pending nil))
+      (let ((hits (anvil-memory-save-check "S" "B" 5 :with-llm t)))
+        (should (= (length hits) (length mock-calls)))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-no-candidates-no-call ()
+  "Zero candidates → orchestrator is never called."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock nil
+      (let ((hits (anvil-memory-save-check "nothing" "matches" 3 :with-llm t)))
+        (should (null hits))
+        (should (null mock-calls))))))
+
+(ert-deftest anvil-memory-test/llm-verdict-mcp-tool-roundtrip ()
+  "MCP `memory-save-check' forwards with_llm/provider/model through the handler."
+  (skip-unless (anvil-memory-test--supported-p 'llm-verdict))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--seed-duplicate-pair root)
+    (anvil-memory-scan)
+    (anvil-memory-test--with-llm-mock
+        (list (list :status 'done :summary "duplicate" :pending nil)
+              (list :status 'done :summary "duplicate" :pending nil))
+      (let* ((result (anvil-memory--tool-save-check
+                      "S" "B" "true" "claude" "sonnet-4-6"))
+             (cands (plist-get result :candidates)))
+        (should (> (length cands) 0))
+        (dolist (c cands)
+          (should (eq 'duplicate (plist-get c :verdict))))
+        ;; provider / model were forwarded to the mock.
+        (should (equal "claude"      (plist-get (car mock-calls) :provider)))
+        (should (equal "sonnet-4-6"  (plist-get (car mock-calls) :model)))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
