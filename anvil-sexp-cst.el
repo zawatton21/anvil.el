@@ -44,7 +44,7 @@
   "Server ID under which sexp-cst-* MCP tools are registered.")
 
 (defconst anvil-sexp-cst-supported-types
-  '(integer nil symbol string list alist plist)
+  '(integer nil symbol string list alist plist hash-table vector cons)
   "Type tags that `anvil-inspect-object' renders in the current build.
 Phase 1a chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
@@ -240,6 +240,55 @@ with the plist key as JSON `k' and the following value's repr as `v'."
      :entries (apply #'vector entries))))
 
 
+;;;; --- hash-table / vector / cons handlers (chunk 3) --------------------
+
+(defun anvil-sexp-cst--inspect-hash-table (h)
+  "Render hash-table H as shape-lock JSON.
+Key ordering is undefined by `maphash', so the first
+`anvil-sexp-cst-top-limit' entries seen are taken; chunk 4 tags
+the remainder with a drill cursor for deterministic paging."
+  (let* ((len (hash-table-count h))
+         (limit anvil-sexp-cst-top-limit)
+         (count 0)
+         entries)
+    (catch 'cap
+      (maphash
+       (lambda (k v)
+         (when (>= count limit) (throw 'cap nil))
+         (push (list :k (anvil-sexp-cst--repr k)
+                     :v (anvil-sexp-cst--repr v))
+               entries)
+         (cl-incf count))
+       h))
+    (anvil-sexp-cst--encode
+     'hash-table
+     :length len
+     :entries (apply #'vector (nreverse entries)))))
+
+(defun anvil-sexp-cst--inspect-vector (vec)
+  "Render vector VEC as shape-lock JSON.
+Index-keyed entries up to `anvil-sexp-cst-top-limit'."
+  (let* ((len (length vec))
+         (take (min len anvil-sexp-cst-top-limit))
+         (entries (cl-loop for i below take
+                           collect (list :k (number-to-string i)
+                                         :v (anvil-sexp-cst--repr (aref vec i))))))
+    (anvil-sexp-cst--encode
+     'vector
+     :length len
+     :entries (apply #'vector entries))))
+
+(defun anvil-sexp-cst--inspect-cons (c)
+  "Render an improper cons C as shape-lock JSON.
+Emits the pair as two fixed-key entries `car' / `cdr'.  Length
+is omitted — a pair has no meaningful sequence length."
+  (anvil-sexp-cst--encode
+   'cons
+   :entries (vector
+             (list :k "car" :v (anvil-sexp-cst--repr (car c)))
+             (list :k "cdr" :v (anvil-sexp-cst--repr (cdr c))))))
+
+
 ;;;; --- dispatcher --------------------------------------------------------
 
 (defun anvil-sexp-cst--inspect-dispatch (value)
@@ -256,10 +305,13 @@ so the MCP client sees a typed error rather than undefined shape."
       ('integer (anvil-sexp-cst--inspect-integer value))
       ('nil     (anvil-sexp-cst--inspect-nil))
       ('symbol  (anvil-sexp-cst--inspect-symbol value))
-      ('string  (anvil-sexp-cst--inspect-string value))
-      ('list    (anvil-sexp-cst--inspect-list value))
-      ('alist   (anvil-sexp-cst--inspect-alist value))
-      ('plist   (anvil-sexp-cst--inspect-plist value))
+      ('string     (anvil-sexp-cst--inspect-string value))
+      ('list       (anvil-sexp-cst--inspect-list value))
+      ('alist      (anvil-sexp-cst--inspect-alist value))
+      ('plist      (anvil-sexp-cst--inspect-plist value))
+      ('hash-table (anvil-sexp-cst--inspect-hash-table value))
+      ('vector     (anvil-sexp-cst--inspect-vector value))
+      ('cons       (anvil-sexp-cst--inspect-cons value))
       (_
        ;; Unreachable — guard above rejects unlisted tags.
        (signal 'anvil-server-tool-error
