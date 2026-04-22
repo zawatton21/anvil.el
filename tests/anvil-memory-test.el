@@ -1694,8 +1694,10 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
      (expand-file-name "feedback_zulu.md" root)
      "---\nname: zulu\n---\nzulu yankee xray whiskey victor uniform tango\n")
     (anvil-memory-scan)
-    ;; Fully disjoint tokens → no candidate regardless of threshold.
-    (let ((res (anvil-memory-scan-contradictions :threshold 0.01 :mode 'keyword)))
+    ;; The two bodies are fully disjoint; frontmatter `name:' contributes
+    ;; the lone shared token "name" (jaccard ≈ 0.06).  A threshold of
+    ;; 0.3 is comfortably above that noise floor so nothing should store.
+    (let ((res (anvil-memory-scan-contradictions :threshold 0.3 :mode 'keyword)))
       (should (= 0 (plist-get res :stored))))))
 
 (ert-deftest anvil-memory-test/scan-contradictions-llm-mode-stores-contradicting ()
