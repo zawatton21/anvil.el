@@ -1,16 +1,20 @@
-;;; anvil-discovery-test.el --- Tests for anvil-discovery Doc 34 Phase A -*- lexical-binding: t; -*-
+;;; anvil-discovery-test.el --- Tests for anvil-discovery Doc 34 Phase A + C -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
 ;; Unit tests for the Doc 34 Phase A intent-based tool discovery:
 ;; metadata propagation through anvil-server-register-tool, intent /
 ;; layer / query / stability filtering, and deterministic sort order.
+;;
+;; Phase C coverage: usage-counter dispatch hook, report shape,
+;; never-called / unused-since-days classification.
 
 ;;; Code:
 
 (require 'ert)
 (require 'cl-lib)
 (require 'anvil-server)
+(require 'anvil-state)
 (require 'anvil-discovery)
 
 
@@ -256,6 +260,134 @@ returned, including the untagged fixture (default intent general)."
       (should (plist-get tool :layer))
       (should (plist-get tool :intent))
       (should (plist-get tool :stability)))))
+
+
+;;;; --- Phase C: usage counter --------------------------------------------
+
+(defmacro anvil-discovery-test--with-usage (&rest body)
+  "Run BODY with a fresh tool registry AND a fresh anvil-state DB so
+usage-counter tests are hermetic."
+  (declare (indent 0))
+  `(let ((anvil-server--tools (make-hash-table :test #'equal))
+         (anvil-server-tool-filter-function nil)
+         (anvil-server-tool-dispatch-hook nil)
+         (anvil-state-db-path (make-temp-file
+                               "anvil-discovery-usage-" nil ".db"))
+         (anvil-state--db nil))
+     (unwind-protect
+         (progn
+           (anvil-state-enable)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-a"
+            :description "a" :intent '(file-edit) :layer 'core)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-b"
+            :description "b" :intent '(file-read) :layer 'core)
+           (anvil-server-register-tool
+            (lambda () "ok") :id "stub-c"
+            :description "c" :intent '(http) :layer 'io)
+           ,@body)
+       (anvil-discovery-usage-clear)
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(ert-deftest anvil-discovery-test-record-call-increments-counter ()
+  "Each record-call bumps :count and refreshes :last-called."
+  (anvil-discovery-test--with-usage
+    (anvil-discovery--record-call "stub-a" "default")
+    (anvil-discovery--record-call "stub-a" "default")
+    (anvil-discovery--record-call "stub-a" "default")
+    (let ((entry (anvil-discovery--usage-entry "stub-a")))
+      (should (= 3 (plist-get entry :count)))
+      (should (numberp (plist-get entry :last-called)))
+      (should (numberp (plist-get entry :first-seen)))
+      (should (equal "default" (plist-get entry :server-id))))))
+
+(ert-deftest anvil-discovery-test-record-call-no-state-silent ()
+  "Without anvil-state loaded the hook is a silent no-op."
+  (let ((anvil-server--tools (make-hash-table :test #'equal))
+        (anvil-server-tool-dispatch-hook nil))
+    ;; Simulate `anvil-state' feature missing: shadow `featurep' so the
+    ;; record-call helper takes the no-state branch.
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (f &rest _) (not (eq f 'anvil-state)))))
+      (should-not (condition-case err
+                      (progn
+                        (anvil-discovery--record-call "missing" "default")
+                        nil)
+                    (error err))))))
+
+(ert-deftest anvil-discovery-test-parse-days-arg ()
+  (should (= 14 (anvil-discovery--parse-days-arg nil)))
+  (should (= 14 (anvil-discovery--parse-days-arg "")))
+  (should (= 7  (anvil-discovery--parse-days-arg "7")))
+  (should (= 14 (anvil-discovery--parse-days-arg "-3")))
+  (should (= 30 (anvil-discovery--parse-days-arg 30))))
+
+(ert-deftest anvil-discovery-test-usage-report-classifies-tools ()
+  "After seeding one recent + one stale + leaving one untouched,
+the report returns each in the correct bucket."
+  (anvil-discovery-test--with-usage
+    (let ((now (truncate (float-time))))
+      ;; stub-a called now (recent)
+      (anvil-state-set
+       "stub-a"
+       (list :count 5 :last-called now :first-seen now
+             :server-id "default")
+       :ns anvil-discovery--usage-ns)
+      ;; stub-b called 30 days ago (stale against 14-day threshold)
+      (anvil-state-set
+       "stub-b"
+       (list :count 1
+             :last-called (- now (* 30 86400))
+             :first-seen  (- now (* 30 86400))
+             :server-id "default")
+       :ns anvil-discovery--usage-ns))
+    (let ((report (anvil-discovery-usage-report "14")))
+      (should (= 14 (plist-get report :days-threshold)))
+      (should (= 3 (plist-get report :total-registered)))
+      (should (= 2 (plist-get report :with-usage)))
+      (should (member "stub-c" (plist-get report :never-called)))
+      (should (member "stub-b" (plist-get report :unused-since-days)))
+      (should-not (member "stub-a"
+                          (plist-get report :unused-since-days)))
+      (let ((per-tool (plist-get report :per-tool)))
+        ;; stub-a (recent) sorts before stub-b (stale)
+        (should (equal "stub-a" (plist-get (car per-tool) :id)))))))
+
+(ert-deftest anvil-discovery-test-usage-report-empty-registry ()
+  "No registered tools → zeros, nil lists, no error."
+  (let ((anvil-server--tools (make-hash-table :test #'equal))
+        (anvil-state-db-path (make-temp-file
+                              "anvil-discovery-empty-" nil ".db"))
+        (anvil-state--db nil))
+    (unwind-protect
+        (progn
+          (anvil-state-enable)
+          (let ((r (anvil-discovery-usage-report "7")))
+            (should (= 0 (plist-get r :total-registered)))
+            (should (= 0 (plist-get r :with-usage)))
+            (should (null (plist-get r :never-called)))
+            (should (null (plist-get r :unused-since-days)))
+            (should (null (plist-get r :per-tool)))))
+      (anvil-state-disable)
+      (ignore-errors (delete-file anvil-state-db-path)))))
+
+
+;;;; --- dispatch hook end-to-end ------------------------------------------
+
+(ert-deftest anvil-discovery-test-enable-installs-dispatch-hook ()
+  "`anvil-discovery-enable' adds `anvil-discovery--record-call' to
+the dispatch hook; disable removes it."
+  (let ((anvil-server--tools (make-hash-table :test #'equal))
+        (anvil-server-tool-dispatch-hook nil))
+    (anvil-discovery-enable)
+    (unwind-protect
+        (should (memq #'anvil-discovery--record-call
+                      anvil-server-tool-dispatch-hook))
+      (anvil-discovery-disable))
+    (should-not (memq #'anvil-discovery--record-call
+                      anvil-server-tool-dispatch-hook))))
 
 (provide 'anvil-discovery-test)
 ;;; anvil-discovery-test.el ends here
