@@ -152,12 +152,31 @@ MCP Parameters:
 
 ;;; Project info
 
+(defun anvil-ide--project-for-buffer (buffer)
+  "Return the project object for BUFFER, or nil."
+  (when (and (featurep 'project)
+             (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (when (and (stringp default-directory)
+                 (file-directory-p default-directory))
+        (ignore-errors (project-current nil))))))
+
+(defun anvil-ide--current-project ()
+  "Return the most relevant current project, or nil."
+  (or (anvil-ide--project-for-buffer
+       (window-buffer (selected-window)))
+      (anvil-ide--project-for-buffer (current-buffer))
+      (cl-loop for buffer in (buffer-list)
+               when (or (buffer-file-name buffer)
+                        (buffer-local-value 'default-directory buffer))
+               thereis (anvil-ide--project-for-buffer buffer))))
+
 (defun anvil-ide--project-info ()
   "Get information about the current project.
 
 MCP Parameters: (none)"
   (anvil-server-with-error-handling
-   (if-let* ((proj (project-current)))
+   (if-let* ((proj (anvil-ide--current-project)))
        (let ((root (project-root proj)))
          (format "Project: %s\nFiles: %d"
                  root
@@ -395,7 +414,9 @@ MCP Parameters:
          (results '()))
      (if (and file-path (not (string-empty-p file-path)))
          ;; Single file
-         (when-let ((buffer (get-file-buffer (expand-file-name file-path))))
+         (when-let ((buffer (or (get-file-buffer (expand-file-name file-path))
+                                (find-file-noselect
+                                 (expand-file-name file-path)))))
            (when (eq backend 'auto)
              (setq backend (cond
                             ((and (featurep 'flycheck)
