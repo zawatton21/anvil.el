@@ -1762,6 +1762,9 @@ through unchanged.  Keywords serialize as their bare name (no colon)."
     (cl-loop for (k v) on x by #'cddr
              collect (cons (intern (substring (symbol-name k) 1))
                            (anvil-server--to-json-value v))))
+   ((and (consp x) (not (proper-list-p x)))
+    (vector (anvil-server--to-json-value (car x))
+            (anvil-server--to-json-value (cdr x))))
    ((listp x)
     (apply #'vector (mapcar #'anvil-server--to-json-value x)))
    (t x)))
@@ -1778,10 +1781,28 @@ Strings and nil pass through unchanged; other shapes round-trip through
   "Return a wrapper around HANDLER that JSON-encodes its result.
 Lets the underlying tool body keep returning a rich plist for direct
 Elisp / ERT callers while the MCP transport receives a JSON string.
-HANDLER is called with whatever positional/rest arguments the
-wrapper receives."
-  (lambda (&rest args)
-    (anvil-server-encode-for-mcp (apply handler args))))
+The wrapper preserves HANDLER's original arglist so
+`anvil-server--generate-schema-from-function' can still derive a
+correct MCP schema — a naïve `(lambda (&rest args) ...)' wrapper
+would be rejected by the schema generator's `&rest' guard."
+  (let ((arglist (help-function-arglist handler t))
+        (rest-var nil)
+        (call-args nil)
+        (saw-rest nil))
+    (dolist (a arglist)
+      (cond
+       ((eq a '&optional) nil)
+       ((eq a '&rest) (setq saw-rest t))
+       (saw-rest (setq rest-var a))
+       (t (push a call-args))))
+    (setq call-args (nreverse call-args))
+    (eval
+     `(lambda ,arglist
+        (anvil-server-encode-for-mcp
+         ,(if rest-var
+              `(apply (function ,handler) ,@call-args ,rest-var)
+            `(funcall (function ,handler) ,@call-args))))
+     t)))
 
 (provide 'anvil-server)
 ;;; anvil-server.el ends here

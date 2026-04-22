@@ -575,4 +575,61 @@ checkpoint's `:value' and `:cursor' when the handler called
                  `((,#'anvil-test--spec-handler-a :id "x")))
                 :type 'error))
 
+
+;;;; --- bundle: anvil-server-encode-handler / --to-json-value ------------
+
+(defun anvil-test--encode-handler-fixture-handler (a &optional b)
+  "Fixture returning a plist with a dotted-pair alist inside."
+  (list :a a :b (or b "default")
+        :matrix (list (cons "k1" 1.0) (cons "k2" 2.0))))
+
+(ert-deftest anvil-test-encode-handler-preserves-arglist ()
+  "`anvil-server-encode-handler' wrapper must keep the original arglist
+so `anvil-server--generate-schema-from-function' accepts it — a
+`(lambda (&rest args) ...)' wrapper would be rejected by the &rest
+guard (see memory feedback_mcp_encoding_plumbing)."
+  (let ((wrapped (anvil-server-encode-handler
+                  #'anvil-test--encode-handler-fixture-handler)))
+    (should (equal '(a &optional b)
+                   (help-function-arglist wrapped t)))
+    ;; Round-trip: schema generation must succeed.
+    (should (anvil-server--generate-schema-from-function wrapped))))
+
+(ert-deftest anvil-test-encode-handler-registers-with-register-tool ()
+  "Wrapped handler must pass the full register-tool path (schema gen)."
+  (let ((wrapped (anvil-server-encode-handler
+                  #'anvil-test--encode-handler-fixture-handler)))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           wrapped
+           :id "anvil-test-encode-handler-tool"
+           :server-id "anvil-test"
+           :description "encode-handler round-trip fixture")
+          (should (member "anvil-test-encode-handler-tool"
+                          (anvil-test-fixtures-registered-tool-ids
+                           "anvil-test"))))
+      (ignore-errors
+        (anvil-server-unregister-tool "anvil-test-encode-handler-tool"
+                                      "anvil-test")))))
+
+(ert-deftest anvil-test-to-json-value-handles-dotted-pair ()
+  "`anvil-server--to-json-value' must emit [car, cdr] for dotted pairs
+that slip through plist detection (alist entries), otherwise
+`mapcar' on the improper list crashes with listp error."
+  (let* ((out (anvil-server--to-json-value (cons "k" 1.0))))
+    (should (vectorp out))
+    (should (equal "k" (aref out 0)))
+    (should (equal 1.0 (aref out 1))))
+  ;; Via encode-for-mcp + round-trip to JSON.
+  (let* ((result (anvil-test--encode-handler-fixture-handler "hi"))
+         (json (anvil-server-encode-for-mcp result))
+         (parsed (let ((json-object-type 'alist)
+                       (json-array-type 'list))
+                   (json-read-from-string json))))
+    (should (stringp json))
+    (should (equal "hi" (cdr (assq 'a parsed))))
+    (should (equal "default" (cdr (assq 'b parsed))))
+    (should (listp (cdr (assq 'matrix parsed))))))
+
 ;;; anvil-test.el ends here
