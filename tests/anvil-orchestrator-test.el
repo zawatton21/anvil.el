@@ -497,6 +497,75 @@ process-put."
     (should (equal p1 p1-again))
     (should-not (equal p1 p2))))
 
+(ert-deftest anvil-orchestrator-test-manifest-agent-profile-injects-virtual-server-id ()
+  "Doc 34 Phase B: `agent' profile flows through the same Phase 1b
+machinery as `ultra', producing an `emacs-eval-agent' virtual
+server-id in the injected MCP config."
+  (let* ((stdio (make-temp-file "anvil-orch-stdio-"))
+         (anvil-orchestrator-manifest-profile 'agent)
+         (anvil-orchestrator-manifest-stdio-command stdio)
+         generated-path)
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_) "/usr/bin/claude")))
+          (let* ((cmd (anvil-orchestrator--claude-build-cmd
+                       (list :name "agent" :provider 'claude :prompt "p"
+                             :id "task-agent-shape")))
+                 (mcp-pos (cl-position "--mcp-config" cmd :test #'equal)))
+            (should mcp-pos)
+            (setq generated-path (nth (1+ mcp-pos) cmd))
+            (let* ((json
+                    (with-temp-buffer
+                      (insert-file-contents generated-path)
+                      (json-parse-string (buffer-string)
+                                         :object-type 'hash-table
+                                         :array-type 'array
+                                         :null-object :null
+                                         :false-object :false)))
+                   (servers (gethash "mcpServers" json))
+                   (entry (gethash "emacs-eval-agent" servers)))
+              (should (hash-table-p entry))
+              (let ((args (gethash "args" entry)))
+                (should (cl-some (lambda (a)
+                                   (equal a "--server-id=emacs-eval-agent"))
+                                 (append args nil)))))))
+      (ignore-errors (delete-file stdio))
+      (when (and generated-path (file-exists-p generated-path))
+        (ignore-errors (delete-file generated-path))))))
+
+(ert-deftest anvil-orchestrator-test-manifest-edit-profile-injects-virtual-server-id ()
+  "Doc 34 Phase B: `edit' profile flows through Phase 1b with
+virtual server-id `emacs-eval-edit'."
+  (let* ((stdio (make-temp-file "anvil-orch-stdio-"))
+         (anvil-orchestrator-manifest-profile 'edit)
+         (anvil-orchestrator-manifest-stdio-command stdio)
+         generated-path)
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_) "/usr/bin/claude")))
+          (let* ((cmd (anvil-orchestrator--claude-build-cmd
+                       (list :name "edit" :provider 'claude :prompt "p"
+                             :id "task-edit-shape")))
+                 (mcp-pos (cl-position "--mcp-config" cmd :test #'equal)))
+            (should mcp-pos)
+            (setq generated-path (nth (1+ mcp-pos) cmd))
+            (let* ((json
+                    (with-temp-buffer
+                      (insert-file-contents generated-path)
+                      (json-parse-string (buffer-string)
+                                         :object-type 'hash-table
+                                         :array-type 'array)))
+                   (servers (gethash "mcpServers" json))
+                   (entry (gethash "emacs-eval-edit" servers)))
+              (should (hash-table-p entry))
+              (let ((args (gethash "args" entry)))
+                (should (cl-some (lambda (a)
+                                   (equal a "--server-id=emacs-eval-edit"))
+                                 (append args nil)))))))
+      (ignore-errors (delete-file stdio))
+      (when (and generated-path (file-exists-p generated-path))
+        (ignore-errors (delete-file generated-path))))))
+
 (ert-deftest anvil-orchestrator-test-should-worktree-requires-git-repo ()
   "Non-git cwd → never triggers worktree handling."
   (let* ((tmp (make-temp-file "anvil-orch-no-git-" t))

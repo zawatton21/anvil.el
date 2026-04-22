@@ -217,7 +217,8 @@ support.  Override per task with `:no-worktree t'."
 
 (defcustom anvil-orchestrator-manifest-profile nil
   "Active `anvil-manifest' profile for orchestrator child sessions.
-Symbol (e.g. `ultra', `nav', `core') or nil (Phase 1b disabled).
+Symbol (one of `ultra', `nav', `core', `lean', `agent', `edit') or
+nil (Phase 1b disabled).
 
 When non-nil AND `anvil-orchestrator-manifest-stdio-command' is
 populated, each provider that supports MCP config injection (claude
@@ -230,11 +231,20 @@ The Phase 0 ROI measurement (2026-04-20) concluded main-session
 applications save <1% tokens, so this is *opt-in* — leave nil for
 main-session main-daemon behavior unchanged.
 
+Doc 34 Phase B added `agent' (orchestrator / session / memory /
+browser + edit tools, layer=core+workflow) and `edit' (file / org /
+code / json / db only, layer=core).  For long-running orchestrator
+tasks, `agent' is the recommended default — child sessions get
+enough surface to plan + edit but drop bench / meta / experimental
+layers.
+
 Override per task with `:no-manifest-override t' on the task plist
 (useful for tasks that need the full MCP surface — debugging
 orchestrator, running `manifest-cost' against the unfiltered
 server, etc.)."
   :type '(choice (const :tag "Disabled" nil)
+                 (const :tag "Agent (Doc 34 Phase B, recommended)" agent)
+                 (const :tag "Edit (Doc 34 Phase B)" edit)
                  (const ultra) (const nav) (const core) (const lean)
                  (symbol :tag "Other profile"))
   :group 'anvil-orchestrator)

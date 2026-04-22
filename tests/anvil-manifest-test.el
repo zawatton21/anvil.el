@@ -444,5 +444,24 @@ and sees only ultra tools while `emacs-eval' still shows everything."
   (should-error (anvil-manifest--profile-toolset 'nonsense)
                 :type 'user-error))
 
+(ert-deftest anvil-manifest-test-default-aliases-include-agent-edit ()
+  "Doc 34 Phase B: agent / edit virtual server-ids ship in the
+default alias table so orchestrator injection works without the
+user editing `anvil-server-id-aliases' by hand."
+  (should (member '("emacs-eval-agent" . "emacs-eval")
+                  anvil-manifest--default-aliases))
+  (should (member '("emacs-eval-edit" . "emacs-eval")
+                  anvil-manifest--default-aliases)))
+
+(ert-deftest anvil-manifest-test-default-server-profiles-include-agent-edit ()
+  "Doc 34 Phase B: virtual server-ids map to the right profile
+symbols in the default `anvil-manifest-server-profiles'."
+  (should (eq 'agent
+              (cdr (assoc "emacs-eval-agent"
+                          (default-value 'anvil-manifest-server-profiles)))))
+  (should (eq 'edit
+              (cdr (assoc "emacs-eval-edit"
+                          (default-value 'anvil-manifest-server-profiles))))))
+
 (provide 'anvil-manifest-test)
 ;;; anvil-manifest-test.el ends here
