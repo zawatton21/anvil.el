@@ -8,7 +8,10 @@
   :PROPERTIES:
   :ID:       e5f55571-89d5-4dd9-94de-13c244cd9a05
   :END:
-~DRAFT~ (2026-04-19)
+~DRAFT~ (2026-04-19) → ~SHIPPED~ (2026-04-22, develop branch) —
+Phase 1 (registry + 3 org scanners) complete, anvil-lint-test 13/13
+pass.  Phase 2 (elisp scanners via Doc 11 defs index) and Phase 3
+(pre-commit hook integration) are deferred until concrete demand.
 
 Tier 2 of Week-2 roadmap.  Detects the classes of stale/broken state
 that silently accumulate in a fast-moving repo.
@@ -120,10 +123,34 @@ Read-only.  Pre-commit entry is CLI-only (not MCP).
 
 * Phases
 
-** Phase 1 — registry + org scanners
+** Phase 1 — registry + org scanners (~SHIPPED~ 2026-04-22)
 
 Conflict-markers + orphan-ids + broken-scheduled.  Would have caught
-today's journal issue in <1s.  ERT 6.
+the auto-cron journal issue in <1s.
+
+Ships as `anvil-lint.el' (opt-in via `anvil-optional-modules' →
+`lint'):
+- `anvil-lint-register-scanner' / `-unregister-scanner' /
+  `-scanners' for plugin authoring.
+- `anvil-lint' (cl-defun) with `:family' / `:scope' / `:severity-min'
+  filters.  SCOPE accepts file path, directory, or list; directories
+  are walked recursively while skipping `.git' / `.worktrees' /
+  `.claude' / other dot-dirs.
+- 3 built-in org scanners registered by `anvil-lint-enable':
+  - `lint-org/conflict-markers' (error) — anchors on
+    `^<<<<<<< ' / `^=======$' / `^>>>>>>> ' so org tables and
+    section separators do not produce false positives.
+  - `lint-org/orphan-ids' (info) — repo-wide cross-file analysis;
+    a link in any in-scope org file satisfies a `:ID:' definition
+    in any other.
+  - `lint-org/broken-scheduled' (warning) — validates the date
+    head + optional weekday + optional time + repeater (`+1w' /
+    `++3d' / `.+1m' shapes accepted).  Flags shapes like `+w1'.
+- 2 read-only MCP tools: `lint', `lint-scanners'.
+
+ERT 13 (registry × 4, conflict-markers × 2, orphan-ids × 2,
+broken-scheduled × 2, severity-min filter, family filter,
+enable / disable).
 
 ** Phase 2 — elisp scanners (depends on Doc 11)
 
