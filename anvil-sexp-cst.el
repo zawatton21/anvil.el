@@ -44,11 +44,21 @@
   "Server ID under which sexp-cst-* MCP tools are registered.")
 
 (defconst anvil-sexp-cst-supported-types
-  '(integer nil symbol string list alist plist hash-table vector cons)
-  "Type tags that `anvil-inspect-object' renders in the current build.
+  '(integer nil symbol string list alist plist hash-table vector cons
+            record truncation circular)
+  "Type tags + behaviors that `anvil-inspect-object' handles today.
 Phase 1a chunks extend this list; tests in
 tests/anvil-sexp-cst-test.el gate their `skip-unless' on membership
-here so a half-shipped chunk never breaks CI.")
+here so a half-shipped chunk never breaks CI.  The pseudo-tags
+`truncation' and `circular' describe emitted *behaviors* rather
+than Emacs runtime types — they live on the same list so each
+test can self-describe its capability gate.")
+
+(defconst anvil-sexp-cst--real-type-tags
+  '(integer nil symbol string list alist plist hash-table vector cons record)
+  "Runtime type tags returned by `anvil-sexp-cst--type-tag'.
+Subset of `anvil-sexp-cst-supported-types' that the dispatcher
+can match with a live handler.")
 
 (defcustom anvil-sexp-cst-cap-bytes 4096
   "Soft cap on `anvil-inspect-object' JSON output in bytes.
@@ -166,11 +176,76 @@ single deeply-nested child from blowing the 4 KB output budget.")
 
 (defun anvil-sexp-cst--repr (v)
   "Return a short printed representation of V, capped at
-`anvil-sexp-cst--repr-cap' characters with a trailing ellipsis when cut."
+`anvil-sexp-cst--repr-cap' characters with a trailing ellipsis when cut.
+Callers are expected to bind `print-circle' to t before invoking repr
+on anything that may be part of a cycle."
   (let ((s (format "%S" v)))
     (if (> (length s) anvil-sexp-cst--repr-cap)
         (concat (substring s 0 (- anvil-sexp-cst--repr-cap 3)) "...")
       s)))
+
+
+;;;; --- cycle detection + cursor generation (chunk 4) ---------------------
+
+(defvar anvil-sexp-cst--current-client-id nil
+  "Client-id in scope for the current `anvil-inspect-object' call.
+Handlers that emit a drill cursor read this to namespace the
+cursor string.  Defaults to \"local\" when nil.")
+
+(defun anvil-sexp-cst--circular-list-p (v)
+  "Return non-nil when V is a cons that contains a cycle reachable via cdr.
+Uses Floyd's tortoise-and-hare so this terminates even on deeply
+cyclic structures.  Returns nil for proper lists, improper
+non-circular pairs, and non-cons values."
+  (and (consp v)
+       (let ((slow v) (fast v))
+         (catch 'found
+           (while (and (consp fast) (consp (cdr fast)))
+             (setq slow (cdr slow)
+                   fast (cddr fast))
+             (when (eq slow fast)
+               (throw 'found t)))
+           nil))))
+
+(defun anvil-sexp-cst--gen-uuid ()
+  "Return a short slash-free token suitable for a cursor suffix.
+Deliberately lightweight — 16 hex chars, ~64 bits of entropy,
+enough for per-session uniqueness inside the
+`inspect-object/<client-id>/' namespace."
+  (format "%08x%08x"
+          (random (expt 2 32))
+          (logand #xffffffff
+                  (truncate (* (float-time) 1000000)))))
+
+(defun anvil-sexp-cst--make-cursor (value)
+  "Return a drill cursor for VALUE and (best-effort) persist it.
+Cursor namespace: `inspect-object/<client-id>/<uuid>' per Doc 31
+consensus critique.  Storage goes through anvil-state Doc 08 when
+that module is loaded; callers get a valid cursor even if storage
+is unavailable (drill resolution lands in Phase 1b)."
+  (let* ((cid (or anvil-sexp-cst--current-client-id "local"))
+         (uuid (anvil-sexp-cst--gen-uuid))
+         (ns (format "inspect-object/%s" cid))
+         (cursor (format "%s/%s" ns uuid)))
+    (when (fboundp 'anvil-state-set)
+      (condition-case _err
+          (funcall (symbol-function 'anvil-state-set)
+                   uuid value :ns ns :ttl 86400)
+        (error nil)))
+    cursor))
+
+(defun anvil-sexp-cst--truncation-info (full-len value)
+  "Return (TRUNCATED . CURSOR-OR-NIL) for VALUE of FULL-LEN.
+TRUNCATED is t only when FULL-LEN exceeds `anvil-sexp-cst-top-limit'."
+  (if (> full-len anvil-sexp-cst-top-limit)
+      (cons t (anvil-sexp-cst--make-cursor value))
+    (cons nil nil)))
+
+(defun anvil-sexp-cst--encode-error (type kind message)
+  "Encode TYPE plus a typed error envelope (no entries)."
+  (anvil-sexp-cst--encode
+   type
+   :error (list :kind kind :message message)))
 
 
 ;;;; --- string / list / alist / plist handlers (chunk 2) ------------------
@@ -190,54 +265,64 @@ up to 40 leading characters so a downstream LLM sees actual content."
 
 (defun anvil-sexp-cst--inspect-list (lst)
   "Render proper list LST as shape-lock JSON.
-Entries use the index as key and `anvil-sexp-cst--repr' for value.
-Caps at `anvil-sexp-cst-top-limit' elements; chunk 4 wires the
-remainder to a drill cursor."
+Entries use the index as key and `anvil-sexp-cst--repr' for value;
+if LST length exceeds `anvil-sexp-cst-top-limit' a drill cursor is
+emitted under the `inspect-object/<client-id>/' namespace."
   (let* ((len (length lst))
          (take (min len anvil-sexp-cst-top-limit))
          (head (cl-subseq lst 0 take))
          (entries (cl-loop for cell in head
                            for i from 0
                            collect (list :k (number-to-string i)
-                                         :v (anvil-sexp-cst--repr cell)))))
+                                         :v (anvil-sexp-cst--repr cell))))
+         (ti (anvil-sexp-cst--truncation-info len lst)))
     (anvil-sexp-cst--encode
      'list
      :length len
-     :entries (apply #'vector entries))))
+     :entries (apply #'vector entries)
+     :truncated (car ti)
+     :cursor (cdr ti))))
 
 (defun anvil-sexp-cst--inspect-alist (al)
   "Render alist AL as shape-lock JSON.
 Each entry is ((KEY-REPR . VAL-REPR)) → {k, v}; keys are run
-through `anvil-sexp-cst--repr' so symbols surface readably
-while still round-tripping via `read'."
+through `anvil-sexp-cst--repr' so symbols surface readably while
+still round-tripping via `read'.  Emits a drill cursor past the top limit."
   (let* ((len (length al))
          (take (min len anvil-sexp-cst-top-limit))
          (head (cl-subseq al 0 take))
          (entries (cl-loop for cell in head
                            collect (list :k (anvil-sexp-cst--repr (car-safe cell))
-                                         :v (anvil-sexp-cst--repr (cdr-safe cell))))))
+                                         :v (anvil-sexp-cst--repr (cdr-safe cell)))))
+         (ti (anvil-sexp-cst--truncation-info len al)))
     (anvil-sexp-cst--encode
      'alist
      :length len
-     :entries (apply #'vector entries))))
+     :entries (apply #'vector entries)
+     :truncated (car ti)
+     :cursor (cdr ti))))
 
 (defun anvil-sexp-cst--inspect-plist (pl)
   "Render plist PL as shape-lock JSON.
 Plist `length' is the raw element count (not pair count) — matches
-`length' semantics the shape-lock test enforces.  Entries are paired
-with the plist key as JSON `k' and the following value's repr as `v'."
+`length' semantics the shape-lock test enforces.  Truncation fires
+on pair count past the top limit."
   (let* ((len (length pl))
          (pairs (cl-loop for (k v) on pl by #'cddr
                          collect (cons k v)))
-         (take (min (length pairs) anvil-sexp-cst-top-limit))
+         (pair-count (length pairs))
+         (take (min pair-count anvil-sexp-cst-top-limit))
          (head (cl-subseq pairs 0 take))
          (entries (cl-loop for cell in head
                            collect (list :k (anvil-sexp-cst--repr (car cell))
-                                         :v (anvil-sexp-cst--repr (cdr cell))))))
+                                         :v (anvil-sexp-cst--repr (cdr cell)))))
+         (ti (anvil-sexp-cst--truncation-info pair-count pl)))
     (anvil-sexp-cst--encode
      'plist
      :length len
-     :entries (apply #'vector entries))))
+     :entries (apply #'vector entries)
+     :truncated (car ti)
+     :cursor (cdr ti))))
 
 
 ;;;; --- hash-table / vector / cons handlers (chunk 3) --------------------
@@ -245,8 +330,8 @@ with the plist key as JSON `k' and the following value's repr as `v'."
 (defun anvil-sexp-cst--inspect-hash-table (h)
   "Render hash-table H as shape-lock JSON.
 Key ordering is undefined by `maphash', so the first
-`anvil-sexp-cst-top-limit' entries seen are taken; chunk 4 tags
-the remainder with a drill cursor for deterministic paging."
+`anvil-sexp-cst-top-limit' entries seen are taken; past the cap
+a drill cursor is emitted so a later call can retrieve the rest."
   (let* ((len (hash-table-count h))
          (limit anvil-sexp-cst-top-limit)
          (count 0)
@@ -260,23 +345,28 @@ the remainder with a drill cursor for deterministic paging."
                entries)
          (cl-incf count))
        h))
-    (anvil-sexp-cst--encode
-     'hash-table
-     :length len
-     :entries (apply #'vector (nreverse entries)))))
+    (let ((ti (anvil-sexp-cst--truncation-info len h)))
+      (anvil-sexp-cst--encode
+       'hash-table
+       :length len
+       :entries (apply #'vector (nreverse entries))
+       :truncated (car ti)
+       :cursor (cdr ti)))))
 
 (defun anvil-sexp-cst--inspect-vector (vec)
-  "Render vector VEC as shape-lock JSON.
-Index-keyed entries up to `anvil-sexp-cst-top-limit'."
+  "Render vector VEC as shape-lock JSON with drill cursor past cap."
   (let* ((len (length vec))
          (take (min len anvil-sexp-cst-top-limit))
          (entries (cl-loop for i below take
                            collect (list :k (number-to-string i)
-                                         :v (anvil-sexp-cst--repr (aref vec i))))))
+                                         :v (anvil-sexp-cst--repr (aref vec i)))))
+         (ti (anvil-sexp-cst--truncation-info len vec)))
     (anvil-sexp-cst--encode
      'vector
      :length len
-     :entries (apply #'vector entries))))
+     :entries (apply #'vector entries)
+     :truncated (car ti)
+     :cursor (cdr ti))))
 
 (defun anvil-sexp-cst--inspect-cons (c)
   "Render an improper cons C as shape-lock JSON.
@@ -288,19 +378,28 @@ is omitted — a pair has no meaningful sequence length."
              (list :k "car" :v (anvil-sexp-cst--repr (car c)))
              (list :k "cdr" :v (anvil-sexp-cst--repr (cdr c))))))
 
+(defun anvil-sexp-cst--inspect-record (rec)
+  "Render record REC as a Phase 1a stub: type tag + slot count only.
+Slot 0 holds the record type, so `length' is `(length rec) - 1'
+to match the user-visible slot count.  Drill into individual
+slots lands in Phase 1b."
+  (anvil-sexp-cst--encode
+   'record
+   :length (max 0 (1- (length rec)))))
+
 
 ;;;; --- dispatcher --------------------------------------------------------
 
 (defun anvil-sexp-cst--inspect-dispatch (value)
   "Return JSON for VALUE, dispatching on `anvil-sexp-cst--type-tag'.
-Only the tags listed in `anvil-sexp-cst-supported-types' have a
-live handler in chunk 1; others signal `anvil-server-tool-error'
-so the MCP client sees a typed error rather than undefined shape."
+Tags not listed in `anvil-sexp-cst--real-type-tags' signal
+`anvil-server-tool-error' so the MCP client sees a typed error
+rather than undefined shape."
   (let ((tag (anvil-sexp-cst--type-tag value)))
-    (unless (memq tag anvil-sexp-cst-supported-types)
+    (unless (memq tag anvil-sexp-cst--real-type-tags)
       (signal 'anvil-server-tool-error
               (list (format "inspect-object: type %S not implemented in this build (supported: %S)"
-                            tag anvil-sexp-cst-supported-types))))
+                            tag anvil-sexp-cst--real-type-tags))))
     (pcase tag
       ('integer (anvil-sexp-cst--inspect-integer value))
       ('nil     (anvil-sexp-cst--inspect-nil))
@@ -312,6 +411,7 @@ so the MCP client sees a typed error rather than undefined shape."
       ('hash-table (anvil-sexp-cst--inspect-hash-table value))
       ('vector     (anvil-sexp-cst--inspect-vector value))
       ('cons       (anvil-sexp-cst--inspect-cons value))
+      ('record     (anvil-sexp-cst--inspect-record value))
       (_
        ;; Unreachable — guard above rejects unlisted tags.
        (signal 'anvil-server-tool-error
@@ -324,9 +424,14 @@ so the MCP client sees a typed error rather than undefined shape."
 (defun anvil-inspect-object (value &optional client-id)
   "Return a shape-locked JSON inspection of VALUE.
 
-CLIENT-ID (optional) is used to namespace any drill cursors
-emitted on truncation.  It defaults to \"local\" when omitted so
-direct Elisp callers do not have to care.
+CLIENT-ID (optional) is used to namespace drill cursors emitted on
+truncation.  It defaults to \"local\" when omitted so direct Elisp
+callers do not have to care.
+
+Circular structures are detected before dispatch and returned as
+a typed error envelope (`inspect-object/circular-reference');
+`print-circle' is bound while rendering so repr on deeper cyclic
+children emits `#N=' notation rather than looping.
 
 Output shape (Doc 31 Phase 1a):
   {type, length?, entries?, truncated, cursor?, error?}
@@ -334,9 +439,17 @@ Output shape (Doc 31 Phase 1a):
 MCP Parameters:
   VALUE     Lisp value to inspect (any type)
   CLIENT-ID Optional string used to namespace drill cursors"
-  (ignore client-id)                    ; consumed in chunk 2+ for truncation
-  (anvil-server-with-error-handling
-   (anvil-sexp-cst--inspect-dispatch value)))
+  (let ((print-circle t)
+        (anvil-sexp-cst--current-client-id client-id))
+    (anvil-server-with-error-handling
+     (cond
+      ((anvil-sexp-cst--circular-list-p value)
+       (anvil-sexp-cst--encode-error
+        'list
+        "inspect-object/circular-reference"
+        "Value is a circular structure; full traversal suppressed."))
+      (t
+       (anvil-sexp-cst--inspect-dispatch value))))))
 
 
 ;;;; --- module lifecycle --------------------------------------------------
