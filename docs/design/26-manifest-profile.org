@@ -10,7 +10,10 @@
   :END:
 ~APPROVED~ (2026-04-20) — DRAFT 1 回目は Phase 1 impl を main session
 で先行 ship したが、*opt-in 化* と *Phase 0 実測* を待たずに develop
-merge した点で別 session の review から reset がかかった。
+merge した点で別 session の review から reset がかかった。 →
+~SHIPPED~ (2026-04-22, develop branch) — Phase 1 + 1a + 1b 全完了、
+make test-all 907/912 pass 0 failed、anvil-orchestrator-test 174/175
+pass +1 skipped。
 
 方針調整 (2026-04-20 review):
 - =manifest= モジュールは =anvil-optional-modules= 側に置く。
@@ -23,6 +26,17 @@ merge した点で別 session の review から reset がかかった。
   orchestrator child session 限定に絞る。
 
 Week-3 Ship 1、競合 token-savior の =TOKEN_SAVIOR_PROFILE= 移植。
+
+実装状況:
+- Phase 1: =anvil-manifest.el= 4 profile + full sentinel +
+  =anvil-server-tool-filter-function= + per-server-id alias 解決。
+- Phase 1a: =anvil-manifest-server-profiles= defcustom + virtual
+  server-id (=emacs-eval-PROFILE=) + =manifest-cost= MCP tool。
+- Phase 1b: orchestrator child session への =--mcp-config= 自動注入
+  (=anvil-orchestrator-manifest-profile= +
+  =anvil-orchestrator-manifest-stdio-command= 2 defcustom)。
+  Sentinel cleanup で temp file leak なし。Provider scope: claude
+  のみ wire-up (helper は provider-agnostic、codex/gemini は別 phase)。
 
 * Motivation
 
