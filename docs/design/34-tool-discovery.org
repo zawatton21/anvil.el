@@ -9,14 +9,19 @@
   :ID:       019dafb1-0000-7000-0000-tool-discovery-doc34
   :END:
 ~DRAFT~ (2026-04-22) → ~Phase A SHIPPED~ (2026-04-22, develop branch)
-→ ~Phase B SHIPPED~ (2026-04-22, develop branch)。
+→ ~Phase B SHIPPED~ (2026-04-22, develop branch)
+→ ~Orchestrator wiring SHIPPED~ (2026-04-22, develop branch)。
 Phase A: anvil-discovery.el (273 lines) + 19 ERT + 41 core tool tagged、
 ~anvil-server-register-tool~ が ~:intent~/~:layer~/~:stability~ を
 plist pass-through。
 Phase B: =anvil-manifest-profile-agent= / =-edit= 2 profile 追加、
 ~(:filter t ...)~ sentinel plist 形式の filter spec、
 =anvil-manifest--filter-match-p= helper、12 ERT 追加。
-make test-all 1155/1160 pass 0 failed。
+Orchestrator wiring: =anvil-manifest--default-aliases= /
+=-server-profiles= に agent/edit の virtual server-id 追加、
+=anvil-orchestrator-manifest-profile= defcustom に agent / edit 明示、
++4 ERT (manifest 2 + orchestrator 2)。
+make test-all 1159/1164 pass 0 failed。
 Phase C は Phase B 運用後 (usage counter + release-audit 拡張)。
 
 Week-4 の主題「module 臨界点対策」の 1 本目。
