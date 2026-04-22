@@ -796,6 +796,133 @@ fresh :decay-score float."
     (should (equal "" (anvil-memory-regenerate-index root)))))
 
 
+;;;; --- Phase 2b-i trigram tokenizer ---------------------------------------
+
+(ert-deftest anvil-memory-test/trigram-supports-probe ()
+  "Probe reports non-nil when the SQLite build ships FTS5 trigram."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let ((db (anvil-memory--db)))
+      ;; Probe is allowed to return nil on older SQLite — we assert
+      ;; only that it is a boolean (non-signaling).
+      (should (memq (and (anvil-memory--sqlite-supports-trigram-p db) t)
+                    '(t nil))))))
+
+(ert-deftest anvil-memory-test/trigram-resolve-auto-prefers-trigram ()
+  "`auto' resolves to trigram on an SQLite that supports it."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let* ((db (anvil-memory--db))
+           (anvil-memory-fts-tokenizer 'auto))
+      (when (anvil-memory--sqlite-supports-trigram-p db)
+        (should (eq 'trigram (anvil-memory--resolve-tokenizer db)))))))
+
+(ert-deftest anvil-memory-test/trigram-resolve-forced-values ()
+  "`trigram' / `unicode61' are returned verbatim when forced."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let ((db (anvil-memory--db)))
+      (let ((anvil-memory-fts-tokenizer 'trigram))
+        (should (eq 'trigram (anvil-memory--resolve-tokenizer db))))
+      (let ((anvil-memory-fts-tokenizer 'unicode61))
+        (should (eq 'unicode61 (anvil-memory--resolve-tokenizer db)))))))
+
+(ert-deftest anvil-memory-test/trigram-resolve-invalid-errors ()
+  "Unknown tokenizer symbol raises a user-error rather than silently booting."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let ((db (anvil-memory--db))
+          (anvil-memory-fts-tokenizer 'bogus))
+      (should-error (anvil-memory--resolve-tokenizer db)))))
+
+(ert-deftest anvil-memory-test/trigram-ensure-schema-honours-auto ()
+  "Fresh DB picks the auto-resolved tokenizer when creating the FTS table."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let* ((db (anvil-memory--db))
+           (current (anvil-memory--current-fts-tokenizer db)))
+      (if (anvil-memory--sqlite-supports-trigram-p db)
+          (should (eq 'trigram current))
+        (should (eq 'unicode61 current))))))
+
+(ert-deftest anvil-memory-test/trigram-reindex-switches-tokenizer ()
+  "Reindex swaps the FTS table in-place; current-tokenizer reflects it."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root) "---\ntype: feedback\n---\nhello world\n")
+    (anvil-memory-scan)
+    (let ((db (anvil-memory--db)))
+      (anvil-memory-reindex-fts 'unicode61)
+      (should (eq 'unicode61 (anvil-memory--current-fts-tokenizer db)))
+      (when (anvil-memory--sqlite-supports-trigram-p db)
+        (anvil-memory-reindex-fts 'trigram)
+        (should (eq 'trigram (anvil-memory--current-fts-tokenizer db)))))))
+
+(ert-deftest anvil-memory-test/trigram-reindex-preserves-body ()
+  "Reindex rebuilds the FTS body index; previously-indexed rows stay searchable."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let ((db (anvil-memory--db)))
+      (skip-unless (anvil-memory--sqlite-supports-trigram-p db))
+      (anvil-memory-test--write
+       (expand-file-name "feedback_b.md" root) "---\ntype: feedback\n---\nalpha bravo charlie\n")
+      (anvil-memory-scan)
+      (anvil-memory-reindex-fts 'trigram)
+      (let ((hits (anvil-memory-search "bravo")))
+        (should (> (length hits) 0))
+        (should (plist-get (car hits) :file))))))
+
+(ert-deftest anvil-memory-test/trigram-reindex-returns-report ()
+  "Reindex returns a plist carrying the tokenizer and rebuilt count."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_c.md" root) "---\ntype: feedback\n---\nseed one\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_d.md" root) "---\ntype: feedback\n---\nseed two\n")
+    (anvil-memory-scan)
+    (let ((report (anvil-memory-reindex-fts 'unicode61)))
+      (should (eq 'unicode61 (plist-get report :tokenizer)))
+      (should (= 2 (plist-get report :rebuilt))))))
+
+(ert-deftest anvil-memory-test/trigram-reindex-rejects-invalid ()
+  "Explicit invalid tokenizer symbol raises before touching the DB."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (should-error (anvil-memory-reindex-fts 'bogus-tokenizer))))
+
+(ert-deftest anvil-memory-test/trigram-japanese-substring-matches ()
+  "Trigram indexing lets a 3-char Japanese substring find a longer body."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (let ((db (anvil-memory--db)))
+      (skip-unless (anvil-memory--sqlite-supports-trigram-p db))
+      (anvil-memory-test--write
+       (expand-file-name "project_jp.md" root)
+       "---\ntype: project\n---\n藤澤電気管理事務所の月次点検\n")
+      (anvil-memory-scan)
+      (anvil-memory-reindex-fts 'trigram)
+      (let ((hits (anvil-memory-search "澤電気")))
+        (should (> (length hits) 0))))))
+
+(ert-deftest anvil-memory-test/trigram-mcp-tool-roundtrip ()
+  "`memory-reindex-fts' MCP handler returns an encoded :tokenizer / :rebuilt plist."
+  (skip-unless (anvil-memory-test--supported-p 'reindex-fts))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_e.md" root) "---\ntype: feedback\n---\nplist check\n")
+    (anvil-memory-scan)
+    (let ((result (anvil-memory--tool-reindex-fts "unicode61")))
+      ;; The MCP handler goes through `anvil-server-encode-handler' at
+      ;; registration, so here we call the underlying plain function and
+      ;; assert the plist shape — registration wrapping is covered by the
+      ;; existing release-audit marker.
+      (should (eq 'unicode61 (plist-get result :tokenizer)))
+      (should (integerp (plist-get result :rebuilt))))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here

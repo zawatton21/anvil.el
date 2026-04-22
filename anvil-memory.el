@@ -92,7 +92,7 @@ indexed in a single DB.  Explicit list overrides auto-detection."
 (defconst anvil-memory-supported
   '(scan audit access list
          search save-check duplicates audit-urls
-         decay promote regenerate)
+         decay promote regenerate reindex-fts)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -125,6 +125,24 @@ Higher weights buoy long-lived rows (user / feedback) against the
 pure recency signal, so rarely-read-but-load-bearing memories do
 not drop off the MEMORY.md index."
   :type '(alist :key-type symbol :value-type number)
+  :group 'anvil-memory)
+
+(defcustom anvil-memory-fts-tokenizer 'auto
+  "Tokenizer used when (re-)creating the `memory_body_fts' table.
+Valid values:
+  `auto'      — probe the SQLite build: use `trigram' when the FTS5
+                trigram extension is available (SQLite 3.34+), else
+                fall back to `unicode61'.
+  `trigram'   — force the trigram tokenizer (better CJK substring
+                hits).  Errors at create time on older SQLite.
+  `unicode61' — force the SQLite default tokenizer (legacy).
+
+Changing this value does NOT rebuild the on-disk FTS table on its
+own — call `anvil-memory-reindex-fts' (or the `memory-reindex-fts'
+MCP tool) to swap tokenizers in-place."
+  :type '(choice (const :tag "Auto (trigram if available)" auto)
+                 (const :tag "Trigram (SQLite 3.34+)" trigram)
+                 (const :tag "unicode61 (default)" unicode61))
   :group 'anvil-memory)
 
 (defconst anvil-memory-ttl-policies
@@ -167,6 +185,62 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
 (defun anvil-memory--db ()
   (or anvil-memory--db (anvil-memory--open)))
 
+(defun anvil-memory--sqlite-supports-trigram-p (db)
+  "Return non-nil when DB's SQLite build ships the FTS5 trigram tokenizer.
+Probes by creating (and dropping) a throwaway virtual table; any
+signalled error is treated as an unsupported build."
+  (condition-case nil
+      (progn
+        (sqlite-execute
+         db
+         "CREATE VIRTUAL TABLE anvil_memory_trigram_probe
+            USING fts5(x, tokenize=trigram)")
+        (sqlite-execute db "DROP TABLE anvil_memory_trigram_probe")
+        t)
+    (error nil)))
+
+(defun anvil-memory--resolve-tokenizer (db)
+  "Return the tokenizer symbol (`trigram' / `unicode61') DB should use.
+Respects `anvil-memory-fts-tokenizer'; `auto' consults
+`anvil-memory--sqlite-supports-trigram-p' to decide."
+  (pcase anvil-memory-fts-tokenizer
+    ('trigram 'trigram)
+    ('unicode61 'unicode61)
+    ('auto (if (anvil-memory--sqlite-supports-trigram-p db)
+               'trigram
+             'unicode61))
+    (other (user-error
+            "anvil-memory: invalid `anvil-memory-fts-tokenizer': %S"
+            other))))
+
+(defun anvil-memory--current-fts-tokenizer (db)
+  "Return the tokenizer symbol currently configured on memory_body_fts.
+Parses the stored CREATE statement from sqlite_master; returns nil
+when the table does not exist."
+  (let ((rows (sqlite-select
+               db
+               "SELECT sql FROM sqlite_master WHERE name = 'memory_body_fts'")))
+    (when rows
+      (let ((sql (or (nth 0 (car rows)) "")))
+        (if (string-match-p "tokenize *= *['\"]?trigram" sql)
+            'trigram
+          'unicode61)))))
+
+(defun anvil-memory--create-fts-table (db tokenizer)
+  "Create memory_body_fts on DB using TOKENIZER (symbol).
+Uses `IF NOT EXISTS' so first-open is a no-op when the table is
+already present with a matching tokenizer."
+  (let ((tok-sql (pcase tokenizer
+                   ('trigram   ", tokenize='trigram'")
+                   ('unicode61 "")
+                   (_ (user-error
+                       "anvil-memory: invalid tokenizer: %S" tokenizer)))))
+    (sqlite-execute
+     db
+     (format "CREATE VIRTUAL TABLE IF NOT EXISTS memory_body_fts
+                USING fts5(file UNINDEXED, body%s)"
+             tok-sql))))
+
 (defun anvil-memory--ensure-schema ()
   (sqlite-execute anvil-memory--db
                   "CREATE TABLE IF NOT EXISTS memory_meta (
@@ -183,14 +257,15 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
   (sqlite-execute anvil-memory--db
                   "CREATE INDEX IF NOT EXISTS memory_meta_type_idx
                      ON memory_meta(type)")
-  ;; Phase 1b: FTS5 virtual table carrying memory bodies for
-  ;; full-text search / jaccard-based save-check / duplicate
-  ;; detection.  Tokenizer is unicode61 (SQLite default) — works
-  ;; for English and URL fragments; Japanese hits are weak until
-  ;; Phase 2 swaps in a trigram tokenizer (SQLite 3.34+).
-  (sqlite-execute anvil-memory--db
-                  "CREATE VIRTUAL TABLE IF NOT EXISTS memory_body_fts
-                     USING fts5(file UNINDEXED, body)"))
+  ;; FTS5 virtual table carrying memory bodies for full-text
+  ;; search / jaccard-based save-check / duplicate detection.
+  ;; Phase 2b-i: tokenizer is now resolvable (`auto' picks trigram
+  ;; on SQLite 3.34+ for better CJK substring hits; existing
+  ;; deployments keep unicode61 until `anvil-memory-reindex-fts'
+  ;; rebuilds the table).
+  (anvil-memory--create-fts-table
+   anvil-memory--db
+   (anvil-memory--resolve-tokenizer anvil-memory--db)))
 
 
 ;;;; --- type inference + row → plist ---------------------------------------
@@ -726,6 +801,46 @@ writes it to disk (the memory-pruner skill owns that step)."
      "\n")))
 
 
+;;;; --- Phase 2b-i: FTS tokenizer reindex ---------------------------------
+
+(defun anvil-memory-reindex-fts (&optional tokenizer)
+  "Rebuild `memory_body_fts' with TOKENIZER (symbol).
+TOKENIZER nil resolves from `anvil-memory-fts-tokenizer'.  Valid
+explicit values: `trigram' / `unicode61'.
+
+Drops the existing FTS virtual table, recreates it, then repopulates
+the body index by re-reading each indexed .md file from disk.  Rows
+whose underlying file disappeared are silently skipped so a stale
+index does not block the rebuild.
+
+Returns (:tokenizer SYM :rebuilt N) — the tokenizer actually
+installed and the number of bodies repopulated.  Raises a
+`user-error' on invalid TOKENIZER so callers fail fast."
+  (let* ((db (anvil-memory--db))
+         (tok (cond
+               ((null tokenizer) (anvil-memory--resolve-tokenizer db))
+               ((memq tokenizer '(trigram unicode61)) tokenizer)
+               (t (user-error
+                   "anvil-memory-reindex-fts: invalid tokenizer %S"
+                   tokenizer))))
+         (files (sqlite-select db "SELECT file FROM memory_meta"))
+         (rebuilt 0))
+    (sqlite-execute db "DROP TABLE IF EXISTS memory_body_fts")
+    (anvil-memory--create-fts-table db tok)
+    (dolist (row files)
+      (let* ((path (nth 0 row))
+             (body (and (file-readable-p path)
+                        (ignore-errors
+                          (anvil-memory--read-body-utf8 path)))))
+        (when body
+          (sqlite-execute
+           db
+           "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
+           (list path body))
+          (cl-incf rebuilt))))
+    (list :tokenizer tok :rebuilt rebuilt)))
+
+
 ;;;; --- MCP tool handlers --------------------------------------------------
 
 (defun anvil-memory--coerce-type (v)
@@ -909,6 +1024,28 @@ Returns (:body TEXT) — read-only; the caller writes the file."
   (anvil-server-with-error-handling
    (list :body (anvil-memory-regenerate-index root))))
 
+(defun anvil-memory--tool-reindex-fts (&optional tokenizer)
+  "Rebuild memory_body_fts with TOKENIZER (trigram / unicode61).
+
+MCP Parameters:
+  tokenizer - Optional string / symbol.  `trigram' forces the
+              CJK-friendly trigram tokenizer (SQLite 3.34+);
+              `unicode61' forces the legacy default.  Empty /
+              omitted resolves from `anvil-memory-fts-tokenizer'
+              (`auto' picks trigram when the build supports it).
+
+Returns (:tokenizer SYM :rebuilt N)."
+  (anvil-server-with-error-handling
+   (let ((tok (cond
+               ((null tokenizer) nil)
+               ((and (stringp tokenizer) (string-empty-p tokenizer)) nil)
+               ((stringp tokenizer) (intern tokenizer))
+               ((symbolp tokenizer) tokenizer)
+               (t (user-error
+                   "tokenizer: expected string / symbol / nil, got %S"
+                   tokenizer)))))
+     (anvil-memory-reindex-fts tok))))
+
 
 ;;;; --- module lifecycle ---------------------------------------------------
 
@@ -994,7 +1131,17 @@ by :decay-score descending.  Lines are `- [NAME](FILE) — DESC'
 using YAML frontmatter when present (fallback: prettified file
 stem).  Read-only — the caller (memory-pruner skill) writes the
 returned body to disk after human review."
-     :read-only t))
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-reindex-fts)
+     :id "memory-reindex-fts"
+     :description
+     "Rebuild the memory_body_fts virtual table with a chosen tokenizer.
+Phase 2b-i: `trigram' (SQLite 3.34+) is CJK-friendly — Japanese
+substring queries (3+ chars) that miss under `unicode61' start
+matching.  Omit tokenizer to use `anvil-memory-fts-tokenizer'
+(defaults to `auto', which picks trigram when available).  Returns
+:tokenizer / :rebuilt."))
   "Spec list consumed by `anvil-server-register-tools'.")
 
 (defun anvil-memory--register-tools ()
