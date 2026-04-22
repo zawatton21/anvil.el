@@ -1788,6 +1788,18 @@ will be caught by the resource handler infrastructure."
   "Return non-nil when X is a plist (keyword-keyed list)."
   (and (consp x) (keywordp (car x))))
 
+(defun anvil-server--list-to-json-array (xs)
+  "Recursively convert proper or improper list XS into a JSON array.
+A dotted tail becomes the final array element, so `(1 . 2)' becomes
+`[1, 2]' on the wire."
+  (let (out)
+    (while (consp xs)
+      (push (anvil-server--to-json-value (car xs)) out)
+      (setq xs (cdr xs)))
+    (when xs
+      (push (anvil-server--to-json-value xs) out))
+    (vconcat (nreverse out))))
+
 (defun anvil-server--to-json-value (x)
   "Recursively convert X into a value that `json-encode' renders sensibly.
 Plists become alists with symbol keys (leading colon stripped).
@@ -1805,7 +1817,7 @@ through unchanged.  Keywords serialize as their bare name (no colon)."
              collect (cons (intern (substring (symbol-name k) 1))
                            (anvil-server--to-json-value v))))
    ((listp x)
-    (apply #'vector (mapcar #'anvil-server--to-json-value x)))
+    (anvil-server--list-to-json-array x))
    (t x)))
 
 (defun anvil-server-encode-for-mcp (value)
