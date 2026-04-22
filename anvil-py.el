@@ -1038,6 +1038,14 @@ MCP Parameters:
       (push (cdr entry) out))
     (nreverse out)))
 
+(defun anvil-py--normalize-plist-keys (plist)
+  "Return PLIST with keys normalized for the planners."
+  (let (out)
+    (while plist
+      (push (anvil-py--spec-keyword (pop plist)) out)
+      (push (pop plist) out))
+    (nreverse out)))
+
 (defun anvil-py--parse-spec-string (spec)
   "Parse string SPEC as JSON or Lisp data and return the resulting object."
   (let ((trimmed (string-trim spec)))
@@ -1065,7 +1073,7 @@ a plist whose values are ready for the elisp planners."
   (let* ((s (cond
              ((null spec) nil)
              ((anvil-py--plist-p spec)
-              (copy-sequence spec))
+              (anvil-py--normalize-plist-keys (copy-sequence spec)))
              ((hash-table-p spec)
               (let (out)
                 (maphash (lambda (k v)
