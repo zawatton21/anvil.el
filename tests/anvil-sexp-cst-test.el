@@ -38,6 +38,7 @@
 (require 'json)
 (require 'anvil-sexp-cst nil t)
 (require 'anvil-state nil t)
+(require 'eieio nil t)
 
 ;;;; --- fixture helpers ----------------------------------------------------
 
@@ -470,6 +471,89 @@ time the same huge value is inspected."
       ;; mint two.  (Entry count may be smaller than top-limit 3 due to
       ;; the byte cap biting first.)
       (should (equal (anvil-sexp-cst-test--get obj "length") 20)))))
+
+
+;;;; --- char-table + EIEIO + purge (Phase 1b-c) ---------------------------
+
+(ert-deftest anvil-sexp-cst-test-char-table-shape ()
+  "A char-table reports type=char-table with non-empty sampled entries.
+Char-table enumeration goes through `map-char-table', which yields
+single chars or `(FROM . TO)' ranges — entry keys reflect either form."
+  (skip-unless (anvil-sexp-cst-test--available-p 'char-table))
+  (let* ((ct (make-char-table 'case-table))
+         (_ (set-char-table-range ct ?a 'letter-a))
+         (_ (set-char-table-range ct ?b 'letter-b))
+         (_ (set-char-table-range ct ?c 'letter-c))
+         (obj (anvil-sexp-cst-test--invoke ct)))
+    (should (equal (anvil-sexp-cst-test--get obj "type") "char-table"))
+    (let ((entries (anvil-sexp-cst-test--entries-as-alist obj)))
+      (should (> (length entries) 0)))
+    (should (null (anvil-sexp-cst-test--get obj "error")))))
+
+(ert-deftest anvil-sexp-cst-test-char-table-truncation ()
+  "A densely-populated char-table must emit a drill cursor once the
+`anvil-sexp-cst-top-limit' cap is hit during `map-char-table'
+enumeration.  `map-char-table' order is well-defined (ascending by
+code point) but drill pagination is best-effort because we cannot
+cheaply resume — documented caveat for the 1b-c handler."
+  (skip-unless (anvil-sexp-cst-test--available-p 'char-table))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((anvil-sexp-cst-top-limit 3)
+           (ct (make-char-table 'case-table)))
+      (dotimes (i 20)
+        (set-char-table-range ct (+ ?A i) i))
+      (let ((obj (anvil-sexp-cst-test--invoke ct)))
+        (should (equal (anvil-sexp-cst-test--get obj "type") "char-table"))
+        (should (eq (anvil-sexp-cst-test--get obj "truncated") t))
+        (should (stringp (anvil-sexp-cst-test--get obj "cursor")))
+        (should (string-prefix-p
+                 (format "inspect-object/%s/"
+                         anvil-sexp-cst-test--client-id)
+                 (anvil-sexp-cst-test--get obj "cursor")))))))
+
+(defclass anvil-sexp-cst-test-dog ()
+  ((name :initarg :name :initform "rex")
+   (breed :initarg :breed :initform 'husky))
+  "EIEIO shape-lock fixture.")
+
+(ert-deftest anvil-sexp-cst-test-eieio-object-shape ()
+  "An EIEIO object reports type=eieio-object with class slot names as
+entry keys.  Non-EIEIO records (cl-defstruct) retain the Phase 1a
+stub shape — see `anvil-sexp-cst-test-record-stub-shape'."
+  (skip-unless (anvil-sexp-cst-test--available-p 'eieio))
+  (let* ((dog (anvil-sexp-cst-test-dog :name "rex" :breed 'husky))
+         (obj (anvil-sexp-cst-test--invoke dog))
+         (entries (anvil-sexp-cst-test--entries-as-alist obj))
+         (keys (mapcar #'car entries)))
+    (should (equal (anvil-sexp-cst-test--get obj "type") "eieio-object"))
+    (should (member "name" keys))
+    (should (member "breed" keys))
+    (should (null (anvil-sexp-cst-test--get obj "error")))))
+
+(ert-deftest anvil-sexp-cst-test-purge-deletes-cursors ()
+  "`anvil-inspect-object-purge' drops every row under the client-id's
+namespace.  After purge, re-drilling a cursor minted pre-purge returns
+the `inspect-object/cursor-expired' typed error — this is the clean
+shutdown path session-end hooks will invoke."
+  (skip-unless (and (anvil-sexp-cst-test--available-p 'purge)
+                    (fboundp 'anvil-inspect-object-purge)
+                    (fboundp 'anvil-state-enable)))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((big (cl-loop for i below 20 collect i))
+           (obj (anvil-sexp-cst-test--invoke big))
+           (cursor (anvil-sexp-cst-test--get obj "cursor")))
+      (should (stringp cursor))
+      (let ((deleted (anvil-inspect-object-purge
+                      anvil-sexp-cst-test--client-id)))
+        (should (integerp deleted))
+        (should (>= deleted 1)))
+      (let* ((drilled (anvil-sexp-cst-test--parse-drill
+                       (anvil-inspect-object-drill
+                        cursor anvil-sexp-cst-test--client-id)))
+             (err (anvil-sexp-cst-test--get drilled "error")))
+        (should (hash-table-p err))
+        (should (equal (anvil-sexp-cst-test--get err "kind")
+                       "inspect-object/cursor-expired"))))))
 
 
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
