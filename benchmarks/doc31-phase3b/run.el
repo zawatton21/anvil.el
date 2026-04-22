@@ -67,7 +67,10 @@ classifies `:actual-kind' and whether `:matches-expected'."
           (cl-incf (plist-get p :matches)))
         (cond
          ((member (plist-get r :actual-kind)
-                  '("close-paren-added" "open-paren-prepended" "noop"))
+                  '("close-paren-added" "open-paren-prepended" "noop"
+                    "unterminated-string-closed"
+                    "unterminated-string-and-close-paren-added"
+                    "unterminated-string-and-open-paren-prepended"))
           (cl-incf (plist-get p :repaired)))
          (t
           (cl-incf (plist-get p :failed))))
@@ -112,7 +115,10 @@ classifies `:actual-kind' and whether `:matches-expected'."
           (cl-count-if
            (lambda (r)
              (member (plist-get r :actual-kind)
-                     '("close-paren-added" "open-paren-prepended" "noop")))
+                     '("close-paren-added" "open-paren-prepended" "noop"
+                       "unterminated-string-closed"
+                       "unterminated-string-and-close-paren-added"
+                       "unterminated-string-and-open-paren-prepended")))
            results))
          ;; "Retry rate without repair" = how many cases would have
          ;; required the LLM to retry (any case not already clean).

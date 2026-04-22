@@ -6,7 +6,7 @@
 ;;   :id             integer — stable identifier
 ;;   :category       string  — one of
 ;;     "trailing-close" / "leading-excess" / "deep-nested" /
-;;     "multi-form" / "unfixable"
+;;     "multi-form" / "string-repair" / "unfixable"
 ;;   :description    human-readable one-liner
 ;;   :input          raw elisp string (possibly unparseable)
 ;;   :expected-kind  one of "close-paren-added" / "open-paren-prepended"
@@ -182,17 +182,17 @@
      :expected-added 0)
 
     (:id 26
-     :category "unfixable"
+     :category "string-repair"
      :description "unterminated string inside form"
      :input "(foo \"unterminated"
-     :expected-kind "sexp-cst/repair-failed"
-     :expected-added nil)
+     :expected-kind "unterminated-string-and-close-paren-added"
+     :expected-added 2)
     (:id 27
-     :category "unfixable"
+     :category "string-repair"
      :description "unterminated string with paren-looking chars inside"
      :input "(message \"hello (world"
-     :expected-kind "sexp-cst/repair-failed"
-     :expected-added nil)
+     :expected-kind "unterminated-string-and-close-paren-added"
+     :expected-added 2)
     (:id 28
      :category "unfixable"
      :description "swapped parens (structural, not count)"

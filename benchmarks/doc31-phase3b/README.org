@@ -46,11 +46,12 @@ amplified by the aggregate table.
 | leading-excess  |  5 | LLM over-closes, emits spurious `)` past the form    |
 | deep-nested     |  5 | Body is deep (let inside cond inside defun) and miss |
 | multi-form      |  5 | Good forms before / after a broken one               |
-| unfixable       |  5 | Damage beyond paren count (unterminated string etc.) |
+| string-repair   |  2 | Truncated mid-`"'-literal (Phase 3c)                 |
+| unfixable       |  3 | Damage outside paren/string count (swap, reader)     |
 
-The =unfixable= bucket is the honesty check: close-paren balancing
-must *not* claim a repair it cannot prove, so a high
-=expected-match= in that row means the tool correctly refused.
+The =unfixable= bucket is the honesty check: neither close-paren
+balancing nor string-close can claim a repair it cannot prove, so
+a high =expected-match= there means the tool correctly refused.
 
 * Interpreting the aggregate
 
@@ -66,20 +67,23 @@ must *not* claim a repair it cannot prove, so a high
   tool, only the residual unfixable cases need a retry.  Phase 0 G3
   budget was =≥ 60%= reduction.
 
-* 2026-04-22 results summary
+* 2026-04-22 results summary (Phase 3a + 3c)
 
 - *Expected-match: 30/30 (100%)* — every dataset label matches the
-  tool's live output, including `added` count on the 25 repairable
+  tool's live output, including `added` count on the 27 repairable
   cases.
-- *Repair success: 25/30 (83%)* — 25 rescued, 5 correctly refused.
-- *Retry-rate reduction: 83%* of broken cases rescued (vs Phase 0
-  G3's 60% bar).
+- *Repair success: 27/30 (90%)* — 25 paren-balanced (Phase 3a) + 2
+  unterminated-string closed (Phase 3c) + 3 correctly refused.
+- *Retry-rate reduction: 90%* of broken cases rescued (vs Phase 0
+  G3's 60% bar; Phase 3a alone hit 83%, Phase 3c +7 points).
 
-The bar is met.  Phase 3a's close-paren balancing is worth
-registering as a permanent MCP tool; the residual 17% unfixable
-cases are damage beyond paren count (unterminated strings, swapped
-parens, half-written symbols) and need a richer repair strategy
-than this phase promises.
+The bar is met with margin.  Phase 3a close-paren balancing +
+Phase 3c unterminated-string close are both worth keeping.  The
+residual 10% (3 cases) is damage outside paren/string count —
+swapped parens (`)foo(`), unreadable reader syntax
+(`#<void>`), stray reader macros (trailing backtick).  No
+rule-based repair can fix those without risking false positives;
+they remain `sexp-cst/repair-failed' by design.
 
 See [[file:report-2026-04-22.org][report-2026-04-22.org]] for the full per-case table.
 

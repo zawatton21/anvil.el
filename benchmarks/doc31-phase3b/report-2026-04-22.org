@@ -18,11 +18,12 @@
 | leading-excess   | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
 | deep-nested      | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
 | multi-form       | 5 | 5/5 (100%)     | 5/5 (100%)         | 0/5  |
-| unfixable        | 5 | 5/5 (100%)     | 0/5 (0%)         | 5/5  |
+| string-repair    | 2 | 2/2 (100%)     | 2/2 (100%)         | 0/2  |
+| unfixable        | 3 | 3/3 (100%)     | 0/3 (0%)         | 3/3  |
 
 *Total expected-match:* 30/30 (100%)
-*Repair success (close/open/noop):* 25/30 (83%)
-*Estimated retry-rate reduction:* 97% → 17% (83% of broken cases rescued)
+*Repair success (close/open/noop):* 27/30 (90%)
+*Estimated retry-rate reduction:* 97% → 10% (90% of broken cases rescued)
 
 * Per-case detail
 
@@ -53,8 +54,8 @@
 | 23 | multi-form       | open-paren-prepended | open-paren-prepended |          1 |          1 | ✓  | three defvars, middle over-closed |
 | 24 | multi-form       | close-paren-added   | close-paren-added   |          2 |          2 | ✓  | provide + require + broken defun |
 | 25 | multi-form       | noop                | noop                |          0 |          0 | ✓  | clean form + clean form — already balanced |
-| 26 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | unterminated string inside form |
-| 27 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | unterminated string with paren-looking chars inside |
+| 26 | string-repair    | unterminated-string-and-close-paren-added | unterminated-string-and-close-paren-added |          2 |          2 | ✓  | unterminated string inside form |
+| 27 | string-repair    | unterminated-string-and-close-paren-added | unterminated-string-and-close-paren-added |          2 |          2 | ✓  | unterminated string with paren-looking chars inside |
 | 28 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | swapped parens (structural, not count) |
 | 29 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | paren-balanced but half-written symbol |
 | 30 | unfixable        | sexp-cst/repair-failed | sexp-cst/repair-failed |          — |          — | ✓  | balanced but has stray ` at EOF |
