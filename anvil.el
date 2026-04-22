@@ -132,9 +132,11 @@ These are not loaded by default.  Available modules:
                 (Doc 28 Phase 1)
 - `sexp-cst'  — Tree-sitter CST + runtime `inspect-object' tool:
                 token-bounded JSON view of any live Lisp value.
-                Phase 1a chunk 1 covers scalar types; later chunks
-                add containers, truncation cursors, and CST edits
-                (Doc 31, requires Emacs 29+ for later CST phases)"
+                Phase 1a ships 9 core types + record stub + truncation
+                cursor + circular-reference typed error.  Phase 1b-a
+                adds `inspect-object-drill' for cursor resolution
+                with offset/limit pagination (Doc 31, requires
+                Emacs 29+ for later CST phases)"
   :type '(repeat symbol)
   :group 'anvil)
 
