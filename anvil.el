@@ -192,7 +192,21 @@ These are not loaded by default.  Available modules:
                 broken-scheduled (warning) catches SCHEDULED /
                 DEADLINE timestamps with unparseable repeaters.
                 Run via `lint' / `lint-scanners' MCP tools or
-                `M-x anvil-lint' (Doc 16 Phase 1)"
+                `M-x anvil-lint' (Doc 16 Phase 1)
+- `memory'    — Auto-memory metadata index + per-type TTL audit +
+                access tracker.  Opens a SQLite DB at
+                `anvil-memory-db-path' and walks every memory/
+                directory under ~/.claude/projects/*/ (or
+                `anvil-memory-roots') to index ~.md files with
+                inferred type (feedback / project / reference /
+                user / memo).  Adds MCP tools memory-scan /
+                memory-audit / memory-access / memory-list that
+                surface stale rows to the memory-pruner skill
+                without touching memory file contents (non-
+                destructive).  Doc 29 Phase 1a, requires Emacs
+                29+.  Phase 1b (FTS5 + contradiction detection +
+                URL HEAD) and Phase 2 (decay + promote) stay
+                DRAFT."
   :type '(repeat symbol)
   :group 'anvil)
 

@@ -8,10 +8,22 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~DRAFT~ (2026-04-20) — Week-3 Ship 4, 競合 token-savior の
-"memory engine" を anvil + Claude Code auto-memory に統合する。
-実装 ETA 1 週間。Convention-coupled (auto-memory の file layout に
-食い込む)。
+~Phase 1a SHIPPED~ (2026-04-22, feat/doc-29-memory-engine-phase1a) —
+Week-3 Ship 4、競合 token-savior の "memory engine" を anvil +
+Claude Code auto-memory に統合する。Phase 1a は非 destructive な
+foundation (metadata 索引 + TTL audit + access tracker) のみで、
+FTS5 / contradiction / URL HEAD は Phase 1b、decay / promote / MDL
+は Phase 2 に切り出し。
+
+*Phase 1a 実装範囲:* =anvil-memory.el= (~460 行) + 4 MCP tool
+(=memory-scan= / =memory-audit= / =memory-access= / =memory-list=)。
+SQLite 索引 =~/.emacs.d/anvil-memory-index.db= を scan で populate、
+per-type TTL table を当てて expired / needs-recheck flag、access 時
+access_count + last_accessed を bump。Memory =.md= files には書き込
+まない non-destructive 設計。
+
+*module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
+SQLite 依存、opt-in)。
 
 * Motivation
 
@@ -182,14 +194,42 @@ Phase 1 は skeleton のみ、Phase 2 で LLM 呼び出しで distillation。
 
 * Phases
 
-** Phase 1 — metadata + contradiction + audit (~DRAFT~)
+** Phase 1a — metadata + audit + access (~SHIPPED~ 2026-04-22)
 
-1. =anvil-memory-index.db= schema 設計 + 初期化 (全既存 memory を
-   parse して metadata 登録)。
-2. =memory-save-check= tool (FTS5 類似検索 + 矛盾判定 skeleton)。
-3. =memory-audit= tool (TTL 判定 + reference URL HEAD)。
-4. =memory-access= hook (memory file 読み込み時に自動発火)。
-5. memory-pruner skill を metadata 参照するよう update。
+1. =anvil-memory-index.db= schema + 初期化 SHIPPED。=memory_meta=
+   テーブル (file PK / type / created / last_accessed /
+   access_count / validity_prior / ttl_policy / decay_score /
+   tags) + type index。=INSERT ... ON CONFLICT DO NOTHING= で
+   re-scan 時 access_count 保持。
+2. =memory-scan= tool SHIPPED。=anvil-memory-roots= (default は
+   =~/.claude/projects/*/memory/= auto-detect) を walk、MEMORY.md は
+   skip、filename prefix から type 推論 (=feedback_= /
+   =project_= / =reference_= / =user_= / fallback =memo=)。
+3. =memory-audit= tool SHIPPED (TTL 判定のみ、reference URL HEAD
+   は Phase 1b)。per-type policy: user/memo 永続、feedback 180d
+   soft、project 90d hard / 60d soft、reference 30d hard / 21d
+   soft。
+4. =memory-access= tool SHIPPED (access_count++ + last_accessed
+   更新、未 index file は nil 返却で graceful)。
+5. =memory-list= tool SHIPPED (metadata plist dump、type filter 可)。
+
+commit: =9a853d4= (test-lock、17 ERT) → =9be37fb= (impl、460 行
++ anvil.el docstring)。
+
+** Phase 1b — contradiction + URL HEAD + skill integration (~DRAFT~)
+
+Phase 1a foundation の上に:
+1. =memory-search= tool (SQLite FTS5 index for body text、
+   =anvil-memory-index.db= に =memory_body_fts= virtual table 追加)。
+2. =memory-save-check= tool (類似 memory top-3 + Levenshtein
+   based contradiction skeleton、LLM 判定は Phase 2)。
+3. =memory-audit= の reference-type 拡張: URL HEAD 経由で 404
+   検知 (=anvil-http= 依存)。
+4. =memory-pruner= skill の metadata 参照 update (skill edits は
+   anvil の外、MCP 面が揃ってから user が land)。
+5. =memory-duplicates= tool (keyword 重複のみ、Phase 2 で semantic)。
+
+** Phase 2 — ROI + promote + MDL
 
 ** Phase 2 — ROI + promote + MDL
 
