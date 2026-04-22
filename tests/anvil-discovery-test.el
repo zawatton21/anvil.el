@@ -102,11 +102,11 @@ via the discovery accessors."
     (let* ((table (gethash "default" anvil-server--tools))
            (tool  (gethash "stub-untagged" table)))
       (should (equal '(general)
-                     (anvil-discovery--tool-intent tool)))
+                     (anvil-discovery--intent-of tool)))
       (should (eq 'core
-                  (anvil-discovery--tool-layer tool)))
+                  (anvil-discovery--layer-of tool)))
       (should (eq 'stable
-                  (anvil-discovery--tool-stability tool))))))
+                  (anvil-discovery--stability-of tool))))))
 
 
 ;;;; --- arg parsing --------------------------------------------------------

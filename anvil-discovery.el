@@ -45,15 +45,15 @@
 
 ;;;; --- metadata accessors -------------------------------------------------
 
-(defun anvil-discovery--tool-intent (tool)
+(defun anvil-discovery--intent-of (tool)
   "Return TOOL's `:intent' list, falling back to the default."
   (or (plist-get tool :intent) anvil-discovery--default-intent))
 
-(defun anvil-discovery--tool-layer (tool)
+(defun anvil-discovery--layer-of (tool)
   "Return TOOL's `:layer' symbol, falling back to the default."
   (or (plist-get tool :layer) anvil-discovery--default-layer))
 
-(defun anvil-discovery--tool-stability (tool)
+(defun anvil-discovery--stability-of (tool)
   "Return TOOL's `:stability' symbol, falling back to the default."
   (or (plist-get tool :stability) anvil-discovery--default-stability))
 
@@ -93,9 +93,9 @@ string of intent names."
 INTENT-SYMS is the caller's intent list (nil = any); LAYER-SYM is the
 layer filter (nil = any); QUERY-RE is a precompiled regexp or nil;
 INCLUDE-EXPERIMENTAL is non-nil to keep `:stability experimental'."
-  (let ((stability (anvil-discovery--tool-stability tool))
-        (layer     (anvil-discovery--tool-layer tool))
-        (intents   (anvil-discovery--tool-intent tool)))
+  (let ((stability (anvil-discovery--stability-of tool))
+        (layer     (anvil-discovery--layer-of tool))
+        (intents   (anvil-discovery--intent-of tool)))
     (and
      ;; Stability gate: deprecated always excluded; experimental gated.
      (not (eq stability 'deprecated))
@@ -116,15 +116,15 @@ INCLUDE-EXPERIMENTAL is non-nil to keep `:stability experimental'."
   "Count common symbols between intent lists A and B."
   (length (cl-intersection a b)))
 
-(defun anvil-discovery--tool-summary (server-id tool query-intents)
+(defun anvil-discovery--summary-of (server-id tool query-intents)
   "Return a plist summarising TOOL for MCP response output.
 QUERY-INTENTS is used to compute an overlap score for sorting."
   (let* ((id (or (plist-get tool :id) ""))
          (desc (or (plist-get tool :description) ""))
          (oneline (car (split-string desc "\n")))
-         (intents (anvil-discovery--tool-intent tool))
-         (layer (anvil-discovery--tool-layer tool))
-         (stability (anvil-discovery--tool-stability tool)))
+         (intents (anvil-discovery--intent-of tool))
+         (layer (anvil-discovery--layer-of tool))
+         (stability (anvil-discovery--stability-of tool)))
     (list :id id
           :server-id server-id
           :layer layer
@@ -148,7 +148,7 @@ QUERY-INTENTS is used to compute an overlap score for sorting."
               (when (anvil-discovery--match-p
                      tool query-re intent-syms layer-sym
                      include-experimental)
-                (push (anvil-discovery--tool-summary
+                (push (anvil-discovery--summary-of
                        server-id tool intent-syms)
                       results)))
             tools-table)))
