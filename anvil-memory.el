@@ -89,7 +89,9 @@ indexed in a single DB.  Explicit list overrides auto-detection."
                  (repeat directory))
   :group 'anvil-memory)
 
-(defconst anvil-memory-supported '(scan audit access list)
+(defconst anvil-memory-supported
+  '(scan audit access list
+         search save-check duplicates audit-urls)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -149,7 +151,15 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
                    )")
   (sqlite-execute anvil-memory--db
                   "CREATE INDEX IF NOT EXISTS memory_meta_type_idx
-                     ON memory_meta(type)"))
+                     ON memory_meta(type)")
+  ;; Phase 1b: FTS5 virtual table carrying memory bodies for
+  ;; full-text search / jaccard-based save-check / duplicate
+  ;; detection.  Tokenizer is unicode61 (SQLite default) — works
+  ;; for English and URL fragments; Japanese hits are weak until
+  ;; Phase 2 swaps in a trigram tokenizer (SQLite 3.34+).
+  (sqlite-execute anvil-memory--db
+                  "CREATE VIRTUAL TABLE IF NOT EXISTS memory_body_fts
+                     USING fts5(file UNINDEXED, body)"))
 
 
 ;;;; --- type inference + row → plist ---------------------------------------
@@ -193,12 +203,21 @@ type.  Durations match the Doc 29 Phase 1 policy table.")
                  when (file-directory-p memdir)
                  collect memdir))))))
 
+(defun anvil-memory--read-body-utf8 (path)
+  "Return the UTF-8 decoded body of PATH as a string."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8))
+      (insert-file-contents path))
+    (buffer-substring-no-properties (point-min) (point-max))))
+
 ;;;###autoload
 (defun anvil-memory-scan (&optional roots)
   "Walk ROOTS (or `anvil-memory--effective-roots' when omitted) and
 (re-)register every .md file under them in the metadata index.
-`MEMORY.md' index files are skipped.  Existing rows are preserved
-on conflict (so access-count and validity-prior are never reset).
+`MEMORY.md' index files are skipped.  Existing metadata rows are
+preserved on conflict (so access_count / validity_prior are never
+reset).  The FTS body index is always refreshed per file so
+re-scanning a changed .md reflects immediately in `memory-search'.
 Returns the number of .md files seen."
   (let* ((roots (or roots (anvil-memory--effective-roots)))
          (db (anvil-memory--db))
@@ -210,13 +229,23 @@ Returns the number of .md files seen."
             (unless (equal base "MEMORY.md")
               (let* ((type (anvil-memory--infer-type base))
                      (mtime (truncate (float-time
-                                       (nth 5 (file-attributes path))))))
+                                       (nth 5 (file-attributes path)))))
+                     (body (ignore-errors
+                             (anvil-memory--read-body-utf8 path))))
                 (sqlite-execute
                  db
                  "INSERT INTO memory_meta(file, type, created, ttl_policy)
                     VALUES (?1, ?2, ?3, ?2)
                     ON CONFLICT(file) DO NOTHING"
                  (list path (symbol-name type) mtime))
+                (sqlite-execute
+                 db
+                 "DELETE FROM memory_body_fts WHERE file = ?1"
+                 (list path))
+                (sqlite-execute
+                 db
+                 "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
+                 (list path (or body "")))
                 (cl-incf n)))))))
     n))
 
@@ -278,14 +307,39 @@ decide whether to `anvil-memory-scan' first)."
 
 ;;;; --- audit --------------------------------------------------------------
 
+(defun anvil-memory--first-url (body)
+  "Return the first http/https URL found in BODY, or nil."
+  (when (and body (string-match "\\(https?://[^ \t\n<>\"']+\\)" body))
+    (match-string 1 body)))
+
+(defun anvil-memory--check-url-for-row (row)
+  "Return `ok' / `broken' / nil for the first URL in ROW's body.
+Uses `anvil-http-head' (Doc 09).  Any HTTP status < 400 counts as
+`ok', >= 400 counts as `broken', errors / missing backend return
+nil."
+  (let* ((path (plist-get row :file))
+         (body (anvil-memory--get-body path))
+         (url (anvil-memory--first-url body)))
+    (when (and url (fboundp 'anvil-http-head))
+      (let* ((result (ignore-errors (anvil-http-head url)))
+             (status (and result (plist-get result :status))))
+        (cond
+         ((null status) nil)
+         ((and (integerp status) (>= status 200) (< status 400)) 'ok)
+         ((and (integerp status) (>= status 400)) 'broken)
+         (t nil))))))
+
 ;;;###autoload
-(defun anvil-memory-audit (&optional type)
+(cl-defun anvil-memory-audit (&optional type &key with-urls)
   "Apply `anvil-memory-ttl-policies' to every row (or filtered by TYPE).
 Returns a list of plists extending each `anvil-memory-list' row
 with:
-  :age-days  integer days since `:created'
-  :flag      `expired' | `needs-recheck' | nil
-  :reason    short string (nil when `:flag' is nil)"
+  :age-days   integer days since `:created'
+  :flag       `expired' | `needs-recheck' | nil
+  :reason     short string (nil when `:flag' is nil)
+  :url-status `ok' | `broken' | nil   (only when :WITH-URLS non-nil
+              AND row is of type `reference'; all other rows leave
+              the key absent)"
   (let* ((rows (anvil-memory-list type))
          (now (truncate (float-time))))
     (mapcar
@@ -303,10 +357,158 @@ with:
            (setq flag 'expired reason "hard-ttl-exceeded"))
           ((and soft (> age-sec soft))
            (setq flag 'needs-recheck reason "soft-window")))
-         (append row (list :age-days age-days
-                           :flag flag
-                           :reason reason))))
+         (let ((extra (list :age-days age-days
+                            :flag flag
+                            :reason reason)))
+           (when (and with-urls (eq typ 'reference))
+             (setq extra (append extra
+                                 (list :url-status
+                                       (anvil-memory--check-url-for-row
+                                        row)))))
+           (append row extra))))
      rows)))
+
+
+;;;; --- Phase 1b: FTS5 search / jaccard / duplicates ------------------------
+
+(defun anvil-memory--get-body (path)
+  "Return the raw body indexed for PATH, or nil when absent."
+  (let* ((db (anvil-memory--db))
+         (rows (sqlite-select
+                db
+                "SELECT body FROM memory_body_fts WHERE file = ?1"
+                (list path))))
+    (car (car rows))))
+
+(defun anvil-memory--tokens (s)
+  "Tokenize S into lower-case words ≥3 chars long.
+Splits on any non-alphanumeric run so URL fragments / dashes
+contribute their sub-words; tokens shorter than 3 chars are
+dropped to cut stopwords without a real stoplist."
+  (when (and s (stringp s))
+    (cl-delete-if (lambda (tok) (< (length tok) 3))
+                  (split-string (downcase s) "[^[:alnum:]]+" t))))
+
+(defun anvil-memory--jaccard (xs ys)
+  "Jaccard similarity over the two token lists XS / YS (0.0 – 1.0)."
+  (let* ((xs-set (delete-dups (copy-sequence xs)))
+         (ys-set (delete-dups (copy-sequence ys)))
+         (inter (cl-intersection xs-set ys-set :test #'equal))
+         (union (cl-union xs-set ys-set :test #'equal)))
+    (if (null union)
+        0.0
+      (/ (float (length inter)) (length union)))))
+
+(defun anvil-memory--tokens-to-fts-query (tokens &optional cap)
+  "Turn TOKENS into an FTS5 \"OR\" query string.
+CAP limits the number of unique tokens emitted (default 12) so a
+wall-of-text draft does not produce a query SQLite refuses."
+  (let* ((cap (or cap 12))
+         (uniq (cl-delete-duplicates (copy-sequence tokens)
+                                     :test #'equal))
+         (slice (seq-take uniq cap)))
+    (when slice
+      (mapconcat (lambda (tok) (format "\"%s\"" tok)) slice " OR "))))
+
+;;;###autoload
+(cl-defun anvil-memory-search (query &key type limit)
+  "Full-text search the FTS body index for QUERY.
+  :type   restrict to that memory type symbol.
+  :limit  max number of rows (default 20).
+Returns a list of plists (:file :type :snippet :rank) ordered by
+FTS5 rank (best first).  Empty / whitespace-only QUERY returns nil."
+  (when (and query (stringp query)
+             (not (string-empty-p (string-trim query))))
+    (let* ((db (anvil-memory--db))
+           (limit (or limit 20))
+           (sql (if type
+                    "SELECT m.file, m.type,
+                            snippet(memory_body_fts, 1, '<<', '>>', '...', 16) AS snip,
+                            rank
+                       FROM memory_body_fts
+                       JOIN memory_meta m ON m.file = memory_body_fts.file
+                      WHERE memory_body_fts MATCH ?1
+                        AND m.type = ?2
+                   ORDER BY rank
+                      LIMIT ?3"
+                  "SELECT m.file, m.type,
+                          snippet(memory_body_fts, 1, '<<', '>>', '...', 16) AS snip,
+                          rank
+                     FROM memory_body_fts
+                     JOIN memory_meta m ON m.file = memory_body_fts.file
+                    WHERE memory_body_fts MATCH ?1
+                 ORDER BY rank
+                    LIMIT ?2"))
+           (params (if type
+                       (list query (symbol-name type) limit)
+                     (list query limit)))
+           (rows (ignore-errors (sqlite-select db sql params))))
+      (mapcar (lambda (r)
+                (list :file (nth 0 r)
+                      :type (intern (nth 1 r))
+                      :snippet (nth 2 r)
+                      :rank (nth 3 r)))
+              rows))))
+
+;;;###autoload
+(defun anvil-memory-save-check (subject body &optional top-n)
+  "Return top-N memories similar to the draft SUBJECT/BODY.
+TOP-N defaults to 3.  Uses FTS5 keyword search against
+SUBJECT + BODY to shortlist candidates, then ranks them by
+jaccard overlap against BODY.  Each result plist:
+(:file :type :snippet :similarity)."
+  (let* ((top-n (or top-n 3))
+         (query (anvil-memory--tokens-to-fts-query
+                 (append (anvil-memory--tokens subject)
+                         (anvil-memory--tokens body))))
+         (candidates (when query
+                       (anvil-memory-search query :limit (max 10 top-n))))
+         (draft-toks (anvil-memory--tokens body))
+         scored)
+    (dolist (cand candidates)
+      (let* ((path (plist-get cand :file))
+             (cand-body (anvil-memory--get-body path))
+             (sim (anvil-memory--jaccard
+                   draft-toks (anvil-memory--tokens cand-body))))
+        (when (> sim 0.0)
+          (push (list :file path
+                      :type (plist-get cand :type)
+                      :snippet (plist-get cand :snippet)
+                      :similarity sim)
+                scored))))
+    (let ((ranked (cl-sort scored #'>
+                           :key (lambda (x) (plist-get x :similarity)))))
+      (seq-take ranked top-n))))
+
+;;;###autoload
+(defun anvil-memory-duplicates (&optional threshold)
+  "Return pairs of memories whose body jaccard similarity > THRESHOLD.
+THRESHOLD defaults to 0.6.  Each entry is a plist
+(:pair (FILE1 FILE2) :similarity FLOAT) ordered by :similarity
+descending.  O(N²) in the number of indexed memories — fine up to
+a few hundred; defer semantic (embedding-based) duplicate
+detection to Phase 2."
+  (let* ((threshold (or threshold 0.6))
+         (db (anvil-memory--db))
+         (rows (sqlite-select
+                db "SELECT file, body FROM memory_body_fts ORDER BY file"))
+         (entries (mapcar (lambda (r)
+                            (cons (nth 0 r)
+                                  (anvil-memory--tokens (nth 1 r))))
+                          rows))
+         pairs)
+    (let ((tail entries))
+      (while (and tail (cdr tail))
+        (let ((a (car tail)))
+          (dolist (b (cdr tail))
+            (let ((sim (anvil-memory--jaccard (cdr a) (cdr b))))
+              (when (> sim threshold)
+                (push (list :pair (list (car a) (car b))
+                            :similarity sim)
+                      pairs)))))
+        (setq tail (cdr tail))))
+    (cl-sort pairs #'>
+             :key (lambda (p) (plist-get p :similarity)))))
 
 
 ;;;; --- MCP tool handlers --------------------------------------------------
@@ -337,18 +539,84 @@ Returns (:count N :roots DIRS)."
           (n (anvil-memory-scan roots*)))
      (list :count n :roots resolved))))
 
-(defun anvil-memory--tool-audit (&optional type)
+(defun anvil-memory--coerce-int (v default)
+  "Coerce V (integer / digit-string / nil) to an integer, else DEFAULT."
+  (cond ((integerp v) v)
+        ((and (stringp v) (string-match "\\`[0-9]+\\'" v))
+         (string-to-number v))
+        (t default)))
+
+(defun anvil-memory--coerce-number (v default)
+  "Coerce V (number / numeric-string / nil) to a number, else DEFAULT."
+  (cond ((numberp v) v)
+        ((and (stringp v)
+              (string-match "\\`-?[0-9]+\\(\\.[0-9]+\\)?\\'" v))
+         (string-to-number v))
+        (t default)))
+
+(defun anvil-memory--tool-audit (&optional type with_urls)
   "Run the per-type TTL audit against the index.
 
 MCP Parameters:
-  type - Optional memory type symbol (user / feedback / project /
-         reference / memo).  Empty / omitted audits every row.
+  type      - Optional memory type symbol (user / feedback /
+              project / reference / memo).  Empty / omitted audits
+              every row.
+  with_urls - Truthy (non-nil / non-empty string) opts into
+              `anvil-http-head' checks against the first URL in
+              each reference-type row; the row gains :url-status
+              (`ok' / `broken' / nil).
 
 Returns (:entries ROWS) where each ROW extends the list shape
-with :age-days / :flag / :reason."
+with :age-days / :flag / :reason, and — when WITH_URLS was on and
+the row is a reference — :url-status."
   (anvil-server-with-error-handling
-   (let ((typ (anvil-memory--coerce-type type)))
-     (list :entries (anvil-memory-audit typ)))))
+   (let* ((typ (anvil-memory--coerce-type type))
+          (urls (cond ((null with_urls) nil)
+                      ((and (stringp with_urls)
+                            (string-empty-p with_urls))
+                       nil)
+                      (t t))))
+     (list :entries (anvil-memory-audit typ :with-urls urls)))))
+
+(defun anvil-memory--tool-search (query &optional type limit)
+  "Full-text search the memory FTS index.
+
+MCP Parameters:
+  query - FTS5 query string.  Empty / whitespace returns (:rows nil).
+  type  - Optional memory type filter.
+  limit - Optional max result count (default 20, digit-string accepted).
+
+Returns (:rows ROWS) ordered by FTS rank (best first)."
+  (anvil-server-with-error-handling
+   (list :rows
+         (anvil-memory-search
+          query
+          :type (anvil-memory--coerce-type type)
+          :limit (anvil-memory--coerce-int limit 20)))))
+
+(defun anvil-memory--tool-save-check (subject body)
+  "Return top-N indexed memories similar to a draft SUBJECT/BODY.
+
+MCP Parameters:
+  subject - Draft memory subject (or empty).
+  body    - Draft memory body.  FTS5 shortlist + jaccard ranking.
+
+Returns (:candidates ROWS), each :file :type :snippet :similarity."
+  (anvil-server-with-error-handling
+   (list :candidates
+         (anvil-memory-save-check (or subject "") (or body "")))))
+
+(defun anvil-memory--tool-duplicates (&optional threshold)
+  "Return memory pairs whose body jaccard overlap exceeds THRESHOLD.
+
+MCP Parameters:
+  threshold - Float (or numeric string).  Default 0.6.
+
+Returns (:pairs PAIRS) sorted by :similarity descending."
+  (anvil-server-with-error-handling
+   (list :pairs
+         (anvil-memory-duplicates
+          (anvil-memory--coerce-number threshold 0.6)))))
 
 (defun anvil-memory--tool-access (file)
   "Record an access of the memory identified by FILE.
@@ -388,14 +656,18 @@ Returns (:rows ROWS) ordered by file path."
 directory under ~/.claude/projects/*/ (or an explicit ROOTS list),
 reads each .md file's mtime as `created' when the row is new, and
 leaves access_count / validity_prior untouched on conflict so
-existing metadata survives a rescan.")
+existing metadata survives a rescan.  Phase 1b also refreshes the
+FTS5 body index for every file encountered.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-audit)
      :id "memory-audit"
      :description
      "Apply the per-type TTL policy and return flagged rows.  Each entry
 carries :age-days plus a :flag field — `expired' (hard-ttl
-exceeded) or `needs-recheck' (inside the soft window) or nil."
+exceeded) or `needs-recheck' (inside the soft window) or nil.
+Pass with_urls=true to opt into `anvil-http-head' checks on the
+first URL of every reference-type row; the row gains :url-status
+(`ok' / `broken' / nil)."
      :read-only t)
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-access)
@@ -411,6 +683,34 @@ the index (run `memory-scan' first in that case).")
      "Dump the metadata index, optionally filtered by TYPE.  Intended as
 a Layer-1 slim overview for memory-pruner / audit workflows
 rather than for loading memory contents."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-search)
+     :id "memory-search"
+     :description
+     "Full-text search the memory FTS5 index.  Returns file / type /
+snippet / rank per hit, ordered by FTS5 rank (best first).  Use
+this as Layer 2 before `memory-get'-ish full-body reads."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-save-check)
+     :id "memory-save-check"
+     :description
+     "Return top-N indexed memories similar to a draft SUBJECT/BODY.
+FTS5 candidate shortlist plus jaccard overlap scoring (Phase 1b
+keyword / Levenshtein baseline; Phase 2 will add LLM
+contradiction classification).  Each row carries :similarity in
+the 0.0–1.0 range — callers flag >=0.7 as a duplicate / merge
+candidate."
+     :read-only t)
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-duplicates)
+     :id "memory-duplicates"
+     :description
+     "Return every memory pair whose body jaccard similarity exceeds
+THRESHOLD (default 0.6).  O(N^2) over the index — fine up to a
+few hundred memories, defer semantic (embedding) duplicates to
+Phase 2."
      :read-only t))
   "Spec list consumed by `anvil-server-register-tools'.")
 
