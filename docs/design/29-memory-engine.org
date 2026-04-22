@@ -8,13 +8,13 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b-i SHIPPED~ (2026-04-22、stacked feat
-branches) — Week-3 Ship 4、競合 token-savior の "memory engine" を
-anvil + Claude Code auto-memory に統合する。非 destructive
-(metadata layer のみ SQLite、memory =.md= files の rename 以外は
-不変) の foundation + 検出 + ranking & lifecycle + tokenizer swap。
-LLM 判定 (contradiction / MDL) は Phase 2b-ii/iii 送り、
-web viewer / cross-project は Phase 3/4。
+~Phase 1a + 1b + 2a + 2b-i + 2b-ii SHIPPED~ (2026-04-22、stacked
+feat branches) — Week-3 Ship 4、競合 token-savior の "memory
+engine" を anvil + Claude Code auto-memory に統合する。非
+destructive (metadata layer のみ SQLite、memory =.md= files の
+rename 以外は不変) の foundation + 検出 + ranking & lifecycle +
+tokenizer swap + LLM verdict。MDL distillation は Phase 2b-iii
+送り、web viewer / cross-project は Phase 3/4。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -43,6 +43,18 @@ tokenizer swap (SQLite 3.34+)。=anvil-memory-fts-tokenizer= defcustom
 tool、既存 DB は opt-in で rebuild (auto-migrate しない)。日本語
 3-char 以上 substring が unicode61 で hit しない問題を解消。
 11 ERT (合計 60)。
+
+*Phase 2b-ii (feat/doc-29-memory-engine-phase2b-ii):*
+=memory-save-check= を =:with-llm t= で LLM 判定拡張。
+=anvil-orchestrator-submit-and-collect= を candidate 毎に single-
+shot 呼び出し、reply を =duplicate= / =contradicting= / =orthogonal=
+に分類 (case-insensitive + 句読点ゆるやか)。0 candidate は
+orchestrator 呼び出しなし (miss cost 0)。=cl-defun= に signature
+変更 (backward-compat 維持、positional subject/body/top-n はそのまま、
+keyword =:with-llm= / =:provider= / =:model= / =:timeout-sec= 追加)。
+MCP tool は =with_llm= / =provider= / =model= keyword。module 側は
+=anvil-orchestrator= を require せず =declare-function= guard で
+optional 依存を保つ。11 ERT (合計 71)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -305,14 +317,34 @@ commit: =0b3b31c= (test-lock、16 ERT) → =fdbaf3e= (impl、+296 行)。
 
 commit: =55265b0= (test-lock、11 ERT) → =89f0372= (impl、+157 行)。
 
-** Phase 2b-ii — LLM save-check verdict (~DRAFT~)
+** Phase 2b-ii — LLM save-check verdict (~SHIPPED~ 2026-04-22)
 
-10. =memory-save-check= 拡張: Phase 1b は候補を返すだけ、Phase 2b-ii
-    で anvil-orchestrator へ contradiction 判定 prompt を投げて
-    verdict (=orthogonal= / =contradicting= / =duplicate=) を
-    plist に乗せる。=anvil-orchestrator-submit-and-collect= を
-    single-shot 呼び出しで使う想定。network-less ERT は
-    =cl-letf= mock。
+10. =memory-save-check= を opt-in で LLM 判定拡張:
+    - =cl-defun= signature に変更 (backward-compat: 3 positional
+      =SUBJECT BODY &optional TOP-N=、追加 keyword =:with-llm= /
+      =:provider= / =:model= / =:timeout-sec=)。
+    - =:with-llm t= 時、残った candidate 毎に
+      =anvil-orchestrator-submit-and-collect= を呼び、reply を
+      =anvil-memory--parse-verdict= で =duplicate= /
+      =contradicting= / =orthogonal= に分類
+      (case-insensitive + 句読点ゆるやか)。
+    - success: candidate に =:verdict= 付加。
+    - unparseable: =:verdict nil :verdict-raw STRING=。
+    - failed / pending: =:verdict nil :verdict-error STRING=。
+    - 0 candidate は orchestrator call 0 (miss cost 0)。
+    - defcustom: =anvil-memory-llm-provider= (default "claude") /
+      =llm-model= (nil = provider default) / =llm-timeout-sec=
+      (default 30)。
+    - MCP tool =memory-save-check= に =with_llm= / =provider= /
+      =model= param 追加。
+    - =anvil-memory= は =anvil-orchestrator= を require せず
+      =declare-function= guard で optional 依存を保つ (orchestrator
+      未 load でも keyword path は動く)。
+    - ERT は =cl-letf= で =submit-and-collect= stub、network-less
+      11 test (parse / verdict path / error / call count / MCP
+      roundtrip)。
+
+commit: =d31d86a= (test-lock、11 ERT) → =51900de= (impl、+196 行)。
 
 ** Phase 2b-iii — MDL distillation (~DRAFT~)
 
