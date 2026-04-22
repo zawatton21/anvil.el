@@ -8,8 +8,12 @@
   :PROPERTIES:
   :ID:       019dafb1-0000-7000-0000-tool-discovery-doc34
   :END:
-~DRAFT~ (2026-04-22) — Phase A / B / C に分割。
-Phase A は単独 ship 可能、Phase B は A の metadata を流用、Phase C は B 運用後に着手。
+~DRAFT~ (2026-04-22) → ~Phase A SHIPPED~ (2026-04-22, develop branch) —
+anvil-discovery.el (273 lines) + 19 ERT pass + 41 core tool tagged。
+~anvil-server-register-tool~ が ~:intent~/~:layer~/~:stability~ を
+plist pass-through。make test-all 1105/1110 pass 0 failed。
+Phase B は DRAFT 継続 (agent / edit intent-based profile)、
+Phase C は Phase B 運用後 (usage counter + release-audit 拡張)。
 
 Week-4 の主題「module 臨界点対策」の 1 本目。
 tool 数 ~90 を整理せず、*選び方* を runtime 側に移す approach。
