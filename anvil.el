@@ -146,9 +146,15 @@ These are not loaded by default.  Available modules:
                 the new file content).  Phase 2b-b adds
                 `sexp-cst-edit-write' — same validation plus a
                 timestamped backup copy of the original before the
-                patched content lands on disk (Doc 31, requires
-                Emacs 29+ and the tree-sitter-elisp grammar for
-                Phase 2 tools)"
+                patched content lands on disk.  Phase 3a adds
+                `sexp-cst-repair' — parinfer-less close-paren
+                balancing that appends missing `)' at EOF (or
+                prepends `(' at BOF when closes exceed opens) and
+                re-parses to verify ERROR nodes are gone; returns a
+                dry-run `repaired-content' for the caller to apply
+                via a separate write tool (Doc 31, requires Emacs
+                29+ and the tree-sitter-elisp grammar for Phase 2/3
+                tools)"
   :type '(repeat symbol)
   :group 'anvil)
 
