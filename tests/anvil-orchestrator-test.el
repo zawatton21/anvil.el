@@ -398,6 +398,105 @@ subprocess left behind by BODY before removing the work dir."
          (cmd  (anvil-orchestrator--claude-build-cmd task)))
     (should-not (member "--worktree" cmd))))
 
+;;;; --- Phase 1b (Doc 26): manifest auto-inject ---------------------------
+
+(ert-deftest anvil-orchestrator-test-manifest-disabled-adds-no-flag ()
+  "With `anvil-orchestrator-manifest-profile' nil (default) the claude
+build-cmd emits no `--mcp-config' flag, preserving the existing
+contract for users who haven't opted into Phase 1b."
+  (let ((anvil-orchestrator-manifest-profile nil)
+        (anvil-orchestrator-manifest-stdio-command "/tmp/never-used"))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/claude")))
+      (let ((cmd (anvil-orchestrator--claude-build-cmd
+                  (list :name "t1" :provider 'claude :prompt "p"))))
+        (should-not (member "--mcp-config" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-manifest-enabled-injects-mcp-config ()
+  "When `anvil-orchestrator-manifest-profile' is set AND the stdio
+command customization is populated, claude build-cmd appends
+`--mcp-config TMPFILE' and TMPFILE exists with the expected JSON shape
+(a single `mcpServers' entry keyed by the virtual server-id)."
+  (let* ((stdio (make-temp-file "anvil-orch-stdio-"))
+         (anvil-orchestrator-manifest-profile 'ultra)
+         (anvil-orchestrator-manifest-stdio-command stdio)
+         generated-path)
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_) "/usr/bin/claude")))
+          (let* ((cmd (anvil-orchestrator--claude-build-cmd
+                       (list :name "t2" :provider 'claude :prompt "p"
+                             :id "task-mcp-shape")))
+                 (mcp-pos (cl-position "--mcp-config" cmd :test #'equal)))
+            (should mcp-pos)
+            (setq generated-path (nth (1+ mcp-pos) cmd))
+            (should (stringp generated-path))
+            (should (file-exists-p generated-path))
+            (let* ((json
+                    (with-temp-buffer
+                      (insert-file-contents generated-path)
+                      (json-parse-string (buffer-string)
+                                         :object-type 'hash-table
+                                         :array-type 'array
+                                         :null-object :null
+                                         :false-object :false)))
+                   (servers (gethash "mcpServers" json))
+                   (entry (gethash "emacs-eval-ultra" servers)))
+              (should (hash-table-p servers))
+              (should (hash-table-p entry))
+              (should (equal (gethash "command" entry) stdio))
+              (let ((args (gethash "args" entry)))
+                (should (or (vectorp args) (listp args)))
+                (should (cl-some (lambda (a)
+                                   (equal a "--server-id=emacs-eval-ultra"))
+                                 (append args nil)))))))
+      (ignore-errors (delete-file stdio))
+      (when (and generated-path (file-exists-p generated-path))
+        (ignore-errors (delete-file generated-path))))))
+
+(ert-deftest anvil-orchestrator-test-manifest-opt-out-suppresses-flag ()
+  "A task plist with `:no-manifest-override t' keeps Phase 1b off for
+that individual call even when the global customizations are enabled.
+Needed for tasks that must talk to the full MCP surface (debugging
+orchestrator, running manifest-cost against the full server)."
+  (let* ((stdio (make-temp-file "anvil-orch-stdio-"))
+         (anvil-orchestrator-manifest-profile 'ultra)
+         (anvil-orchestrator-manifest-stdio-command stdio))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_) "/usr/bin/claude")))
+          (let ((cmd (anvil-orchestrator--claude-build-cmd
+                      (list :name "t3" :provider 'claude :prompt "p"
+                            :no-manifest-override t))))
+            (should-not (member "--mcp-config" cmd))))
+      (ignore-errors (delete-file stdio)))))
+
+(ert-deftest anvil-orchestrator-test-manifest-missing-stdio-skips-injection ()
+  "When `anvil-orchestrator-manifest-profile' is set but the stdio
+command customization is nil / empty (user hasn't configured their
+anvil-stdio.sh path) the build-cmd degrades to the no-flag form
+rather than generating a broken MCP config that would crash claude."
+  (let ((anvil-orchestrator-manifest-profile 'ultra)
+        (anvil-orchestrator-manifest-stdio-command nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_) "/usr/bin/claude")))
+      (let ((cmd (anvil-orchestrator--claude-build-cmd
+                  (list :name "t4" :provider 'claude :prompt "p"))))
+        (should-not (member "--mcp-config" cmd))))))
+
+(ert-deftest anvil-orchestrator-test-manifest-config-file-path-helper ()
+  "The `--manifest-config-file-path' helper returns a deterministic
+path keyed on the task id so sentinel cleanup can reliably remove the
+same file the build-cmd wrote to, without needing to stash path in
+process-put."
+  (let ((p1 (anvil-orchestrator--manifest-config-file-path "task-A"))
+        (p2 (anvil-orchestrator--manifest-config-file-path "task-B"))
+        (p1-again (anvil-orchestrator--manifest-config-file-path "task-A")))
+    (should (stringp p1))
+    (should (string-match-p "task-A" p1))
+    (should (equal p1 p1-again))
+    (should-not (equal p1 p2))))
+
 (ert-deftest anvil-orchestrator-test-should-worktree-requires-git-repo ()
   "Non-git cwd → never triggers worktree handling."
   (let* ((tmp (make-temp-file "anvil-orch-no-git-" t))
