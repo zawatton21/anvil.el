@@ -340,6 +340,96 @@ anticipated; swap in a dedicated FTS5 DB later if hot."
       matches)))
 
 
+;;;; --- Phase 3: Claude Code hook dispatch ---------------------------------
+
+(defconst anvil-session--auto-snapshot-prefix "auto/pre-compact/"
+  "Key prefix for snapshots created by the PreCompact hook.
+SessionStart filters on this prefix + session-id to pick up the
+freshest auto-capture of the previous session run.")
+
+(defun anvil-session--auto-snapshot-name (session-id)
+  "Return a unique snapshot NAME for SESSION-ID's PreCompact capture.
+Shape: `auto/pre-compact/<session-id>/<ISO-ts>' — human readable in
+`anvil-state-list-keys' output and sortable-by-recency."
+  (format "%s%s/%s"
+          anvil-session--auto-snapshot-prefix
+          (or session-id "unknown")
+          (format-time-string "%Y%m%dT%H%M%S")))
+
+(defun anvil-session--most-recent-auto-snapshot (session-id)
+  "Return the newest auto-snapshot plist for SESSION-ID, or nil."
+  (let* ((prefix (format "%s%s/"
+                         anvil-session--auto-snapshot-prefix
+                         session-id))
+         (names
+          (cl-remove-if-not
+           (lambda (k) (string-prefix-p prefix k))
+           (anvil-state-list-keys :ns anvil-session--snapshot-ns)))
+         (newest (car (sort names #'string-greaterp))))
+    (and newest (anvil-session-resume newest))))
+
+;;;###autoload
+(defun anvil-session-hook-dispatch (event &rest args)
+  "Route a Claude Code lifecycle EVENT to the right session primitive.
+
+EVENT is a symbol or string:
+  `pre-compact'    ARGS = (SESSION-ID &optional TASK-SUMMARY NOTES).
+                   Creates an auto-snapshot under
+                   `auto/pre-compact/SESSION-ID/ISO-TS' so the next
+                   SessionStart can resume seamlessly.
+  `session-start'  ARGS = (SESSION-ID).
+                   Returns the `:preamble-suggested' of the newest
+                   auto-snapshot for SESSION-ID, or an empty string.
+                   The hook wrapper forwards this to stdout; the
+                   caller pastes it into the new conversation.
+  `post-tool-use'  ARGS = (SESSION-ID TOOL &optional SUMMARY).
+                   Logs a `tool-use' event.
+  `user-prompt'    ARGS = (SESSION-ID PROMPT-EXCERPT).
+                   Logs a `user-prompt' event with PROMPT-EXCERPT
+                   as the summary (truncated).
+  `session-end'    ARGS = (SESSION-ID).
+                   Logs a `session-end' event.
+
+Unknown events return `(:error \"...\")' rather than signalling so
+the shell wrapper does not crash the Claude hook pipeline."
+  (let ((event* (cond ((symbolp event) event)
+                      ((stringp event) (intern event))
+                      (t event))))
+    (pcase event*
+      ('pre-compact
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (task-summary (nth 1 args))
+              (notes (nth 2 args))
+              (name (anvil-session--auto-snapshot-name session-id)))
+         (anvil-session-snapshot name
+                                 :task-summary task-summary
+                                 :notes notes)))
+      ('session-start
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (snap (anvil-session--most-recent-auto-snapshot session-id)))
+         (if snap
+             (or (plist-get snap :preamble-suggested) "")
+           "")))
+      ('post-tool-use
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (tool (nth 1 args))
+              (summary (nth 2 args)))
+         (anvil-session-log-event session-id 'tool-use
+                                  :tool tool :summary summary)))
+      ('user-prompt
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (prompt (nth 1 args)))
+         (anvil-session-log-event session-id 'user-prompt
+                                  :summary prompt)))
+      ('session-end
+       (let ((session-id (or (nth 0 args) "unknown")))
+         (anvil-session-log-event session-id 'session-end
+                                  :summary "session ended")))
+      (_ (list :error
+               (format "anvil-session-hook-dispatch: unknown event %S"
+                       event))))))
+
+
 ;;;; --- MCP tool wrappers --------------------------------------------------
 
 (defun anvil-session--tool-snapshot (name &optional task-summary notes

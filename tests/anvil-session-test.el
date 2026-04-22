@@ -199,5 +199,69 @@ chronological order (oldest first), dropping older events."
       (should (equal summaries '("event-2" "event-3" "event-4"))))))
 
 
+;;;; --- Phase 3 hook dispatch ---------------------------------------------
+
+(ert-deftest anvil-session-test-hook-pre-compact-writes-auto-snapshot ()
+  "`pre-compact' creates a snapshot under `auto/pre-compact/<sid>/…'
+so the next `session-start' can read it back as the freshest
+checkpoint for that session."
+  (anvil-session-test--with-clean-state
+    (anvil-session-hook-dispatch
+     'pre-compact "sess-hook-1" "refactor feature X" '("ran tests"))
+    (let ((descs (anvil-session-list)))
+      (should (cl-some (lambda (d)
+                         (string-prefix-p
+                          "auto/pre-compact/sess-hook-1/"
+                          (plist-get d :name)))
+                       descs)))))
+
+(ert-deftest anvil-session-test-hook-session-start-returns-preamble ()
+  "`session-start' finds the newest auto-snapshot for SESSION-ID and
+returns its `:preamble-suggested' string.  Missing session → empty."
+  (anvil-session-test--with-clean-state
+    (should (equal (anvil-session-hook-dispatch 'session-start "none") ""))
+    (anvil-session-hook-dispatch
+     'pre-compact "sess-hook-2" "debugging retry cap")
+    (let ((preamble (anvil-session-hook-dispatch
+                     'session-start "sess-hook-2")))
+      (should (stringp preamble))
+      (should (string-match-p "sess-hook-2" preamble))
+      (should (string-match-p "retry cap" preamble)))))
+
+(ert-deftest anvil-session-test-hook-post-tool-use-logs-event ()
+  "`post-tool-use' writes a tool-use event that becomes visible to
+`session-events-recent' / `session-events-search'."
+  (anvil-session-test--with-clean-state
+    (anvil-session-hook-dispatch
+     'post-tool-use "sess-hook-3" "file-batch" "anvil.el (3 edits)")
+    (let* ((events (anvil-session-events-recent :session-id "sess-hook-3"))
+           (r (car events)))
+      (should (= (length events) 1))
+      (should (equal (plist-get r :kind) "tool-use"))
+      (should (equal (plist-get r :tool) "file-batch"))
+      (should (string-match-p "anvil.el" (plist-get r :summary))))))
+
+(ert-deftest anvil-session-test-hook-user-prompt-logs-event ()
+  "`user-prompt' stores the excerpt under kind=user-prompt."
+  (anvil-session-test--with-clean-state
+    (anvil-session-hook-dispatch
+     'user-prompt "sess-hook-4" "Please refactor the worker retry logic")
+    (let* ((events (anvil-session-events-recent :session-id "sess-hook-4"))
+           (r (car events)))
+      (should (= (length events) 1))
+      (should (equal (plist-get r :kind) "user-prompt"))
+      (should (string-match-p "refactor the worker" (plist-get r :summary))))))
+
+(ert-deftest anvil-session-test-hook-unknown-event-returns-error ()
+  "Unknown events must not signal — the shell wrapper would crash
+the Claude Code hook pipeline.  Instead dispatch returns a typed
+error envelope the caller can log and ignore."
+  (anvil-session-test--with-clean-state
+    (let ((r (anvil-session-hook-dispatch 'bogus-event "sid")))
+      (should (plist-get r :error))
+      (should (string-match-p "unknown event"
+                              (plist-get r :error))))))
+
+
 (provide 'anvil-session-test)
 ;;; anvil-session-test.el ends here
