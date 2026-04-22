@@ -8,12 +8,12 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b SHIPPED~ (2026-04-22、stacked feat branches) —
+~Phase 1a + 1b + 2a SHIPPED~ (2026-04-22、stacked feat branches) —
 Week-3 Ship 4、競合 token-savior の "memory engine" を anvil +
 Claude Code auto-memory に統合する。非 destructive (metadata layer
-のみ SQLite、memory =.md= files 不変) の foundation + 検出系。LLM
-による contradiction 判定 / decay / promote / MDL は Phase 2+ に
-切り出し。
+のみ SQLite、memory =.md= files の rename 以外は不変) の foundation
++ 検出 + ranking & lifecycle。LLM 判定 (contradiction / MDL) は
+Phase 2b 送り、web viewer / cross-project は Phase 3/4。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -25,7 +25,16 @@ MCP tool (=memory-scan= / =memory-audit= / =memory-access= /
 (=memory-search= / =memory-save-check= / =memory-duplicates=) +
 既存 =memory-audit= に =with_urls= 拡張 (reference-type row に対し
 =anvil-http-head= で 404 検知、opt-in)。Jaccard + FTS5 rank の
-keyword ベース類似度、LLM 判定は Phase 2 送り。16 ERT (合計 33)。
+keyword ベース類似度、LLM 判定は Phase 2b 送り。16 ERT (合計 33)。
+
+*Phase 2a (feat/doc-29-memory-engine-phase2a):* decay-score 計算
+(=0.4 * recency + 0.3 * access + 0.3 * type-weight=、30d half-life
++ 10 saturation + type-weight alist)、=memory-list= に =:with-decay=
+/ =:sort 'decay= 追加、=memory-promote= (rename + 索引 update、
+refuse missing / overwrite)、=memory-regenerate-index= (=MEMORY.md=
+本文を decay-desc で生成、frontmatter name/description 解析、
+fallback 名は prefix strip + =_= → 空白)。2 新 MCP tool +
+=memory-list= 拡張。16 ERT (合計 49)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -246,11 +255,37 @@ commit: =9a853d4= (test-lock、17 ERT) → =9be37fb= (impl、460 行
 
 commit: =e5a29fc= (test-lock、16 ERT) → =c9f509e= (impl、+320 行)。
 
-** Phase 2 — ROI + promote + MDL (~DRAFT~)
+** Phase 2a — decay + promote + regenerate-index (~SHIPPED~ 2026-04-22)
 
-6. =memory-decay-score= 計算、MEMORY.md 並び替え。
-7. =memory-promote= tool + skill プロンプト。
-8. MDL distillation (LLM 呼び出しで重複 memory の統合案生成)。
+6. =decay-score= 計算 SHIPPED。純関数 =anvil-memory--compute-decay=
+   (0.4 * recency + 0.3 * access + 0.3 * type-weight、30d half-
+   life、access cap 10)。defcustom =anvil-memory-decay-half-
+   life-days= / =-access-saturation= / =-type-weights= でチューン
+   可。row の stored =decay_score= column は未 update in-place、
+   代わりに =anvil-memory-list :with-decay t= で on-demand 計算
+   (=plist-put= で stale な 0.0 を上書き)。
+7. =memory-promote OLD-FILE NEW-TYPE= SHIPPED。file rename +
+   =memory_meta= UPDATE + =memory_body_fts= UPDATE を 1 transaction
+   相当で。Source missing / unindexed / destination exists は
+   =user-error= で refuse、on-disk state consistent。body 不変。
+8. =memory-regenerate-index ROOT= SHIPPED。=:with-decay + :sort
+   'decay= で降順 list → frontmatter =name:= / =description:= を
+   line-level regexp で抽出 (no YAML lib)、fallback は filename
+   prefix strip + =_= → space。=`- [NAME](BASE) — DESC'= 行を
+   =mapconcat= で join。読み取り専用 — 書き出しは caller (memory-
+   pruner skill) 責任。
+
+commit: =0b3b31c= (test-lock、16 ERT) → =fdbaf3e= (impl、+296 行)。
+
+** Phase 2b — LLM contradiction + MDL distillation + trigram (~DRAFT~)
+
+9. =memory-save-check= 拡張: Phase 1b は候補を返すだけ、Phase 2b で
+   anvil-orchestrator へ contradiction 判定 prompt を投げて verdict
+   (=orthogonal= / =contradicting= / =duplicate=) を plist に乗せる。
+10. MDL distillation: 複数 memory の共通項を抽出し「convention
+    memory」の草稿を生成する提案機能 (orchestrator-dispatch)。
+11. Trigram tokenizer (SQLite 3.34+): 日本語 FTS hit 改善。
+    Fallback: version check で既存 unicode61 を keep。
 
 ** Phase 3 — web-viewer
 

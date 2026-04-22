@@ -556,6 +556,246 @@ Binds:
         (should (= 0 calls))))))
 
 
+;;;; --- Phase 2a: decay-score ------------------------------------------------
+
+(ert-deftest anvil-memory-test/decay-score-key-present-with-opt ()
+  "`anvil-memory-list :with-decay t' decorates each row with a
+fresh :decay-score float."
+  (skip-unless (anvil-memory-test--supported-p 'decay))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_x.md" root) "x\n")
+    (anvil-memory-scan)
+    (let ((row (car (anvil-memory-list nil :with-decay t))))
+      (should (plist-member row :decay-score))
+      (should (numberp (plist-get row :decay-score))))))
+
+(ert-deftest anvil-memory-test/decay-recent-access-outranks-stale ()
+  "Two same-type memories differ in decay: recent+accessed > stale+unaccessed."
+  (skip-unless (anvil-memory-test--supported-p 'decay))
+  (anvil-memory-test--with-env
+    (let ((old (- (truncate (float-time)) (* 30 86400))))
+      (anvil-memory-test--write
+       (expand-file-name "feedback_stale.md" root) "s\n" old))
+    (anvil-memory-test--write
+     (expand-file-name "feedback_hot.md" root) "h\n")
+    (anvil-memory-scan)
+    (anvil-memory-access (expand-file-name "feedback_hot.md" root))
+    (anvil-memory-access (expand-file-name "feedback_hot.md" root))
+    (let* ((rows (anvil-memory-list nil :with-decay t))
+           (hot (cl-find "feedback_hot.md" rows
+                         :key (lambda (r)
+                                (file-name-nondirectory (plist-get r :file)))
+                         :test #'equal))
+           (stale (cl-find "feedback_stale.md" rows
+                           :key (lambda (r)
+                                  (file-name-nondirectory
+                                   (plist-get r :file)))
+                           :test #'equal)))
+      (should (> (plist-get hot :decay-score)
+                 (plist-get stale :decay-score))))))
+
+(ert-deftest anvil-memory-test/decay-type-weight-user-beats-reference ()
+  "With identical recency / access, user type outranks reference type."
+  (skip-unless (anvil-memory-test--supported-p 'decay))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "user_a.md" root) "a\n")
+    (anvil-memory-test--write
+     (expand-file-name "reference_a.md" root) "a\n")
+    (anvil-memory-scan)
+    (let* ((rows (anvil-memory-list nil :with-decay t))
+           (u (cl-find 'user rows :key (lambda (r) (plist-get r :type))))
+           (r (cl-find 'reference rows
+                       :key (lambda (r) (plist-get r :type)))))
+      (should (> (plist-get u :decay-score)
+                 (plist-get r :decay-score))))))
+
+(ert-deftest anvil-memory-test/decay-null-last-accessed-returns-number ()
+  "An unaccessed row still produces a valid (non-nil) decay score."
+  (skip-unless (anvil-memory-test--supported-p 'decay))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_x.md" root) "x\n")
+    (anvil-memory-scan)
+    (let ((row (car (anvil-memory-list nil :with-decay t))))
+      (should (numberp (plist-get row :decay-score)))
+      (should (>= (plist-get row :decay-score) 0.0))
+      (should (<= (plist-get row :decay-score) 1.0)))))
+
+(ert-deftest anvil-memory-test/list-sort-by-decay-desc ()
+  "`anvil-memory-list :sort 'decay' orders rows by :decay-score descending."
+  (skip-unless (anvil-memory-test--supported-p 'decay))
+  (anvil-memory-test--with-env
+    (let ((old (- (truncate (float-time)) (* 60 86400))))
+      (anvil-memory-test--write
+       (expand-file-name "feedback_stale.md" root) "s\n" old))
+    (anvil-memory-test--write
+     (expand-file-name "feedback_hot.md" root) "h\n")
+    (anvil-memory-scan)
+    (anvil-memory-access (expand-file-name "feedback_hot.md" root))
+    (let* ((rows (anvil-memory-list nil :with-decay t :sort 'decay))
+           (files (mapcar (lambda (r)
+                            (file-name-nondirectory (plist-get r :file)))
+                          rows)))
+      (should (equal "feedback_hot.md" (car files)))
+      (should (equal "feedback_stale.md" (cadr files))))))
+
+
+;;;; --- Phase 2a: memory-promote -------------------------------------------
+
+(ert-deftest anvil-memory-test/promote-renames-file-on-disk ()
+  "Promoting a MEMO row to feedback renames the file on disk."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (let ((old (expand-file-name "notes.md" root)))
+      (anvil-memory-test--write old "body\n")
+      (anvil-memory-scan)
+      (anvil-memory-promote old 'feedback)
+      (should-not (file-exists-p old))
+      (should (file-exists-p (expand-file-name "feedback_notes.md" root))))))
+
+(ert-deftest anvil-memory-test/promote-updates-metadata-row ()
+  "Promote updates the index so `memory-list' reflects new path + type."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (let ((old (expand-file-name "notes.md" root)))
+      (anvil-memory-test--write old "body\n")
+      (anvil-memory-scan)
+      (anvil-memory-promote old 'feedback))
+    (let* ((rows (anvil-memory-list))
+           (row (car rows)))
+      (should (= 1 (length rows)))
+      (should (equal 'feedback (plist-get row :type)))
+      (should (string-match-p "/feedback_notes\\.md\\'"
+                              (plist-get row :file))))))
+
+(ert-deftest anvil-memory-test/promote-strips-existing-prefix ()
+  "Promote strips the old type prefix before prefixing the new type."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (let ((old (expand-file-name "project_alpha.md" root)))
+      (anvil-memory-test--write old "body\n")
+      (anvil-memory-scan)
+      (anvil-memory-promote old 'feedback))
+    (should (file-exists-p (expand-file-name "feedback_alpha.md" root)))))
+
+(ert-deftest anvil-memory-test/promote-errors-on-missing-source ()
+  "Promoting an unknown file signals a user-error, disk untouched."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (should-error
+     (anvil-memory-promote (expand-file-name "nope.md" root) 'feedback)
+     :type 'user-error)))
+
+(ert-deftest anvil-memory-test/promote-errors-on-destination-exists ()
+  "Promote refuses when the destination filename already exists."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "project_alpha.md" root) "a\n")
+    (anvil-memory-test--write
+     (expand-file-name "feedback_alpha.md" root) "b\n")
+    (anvil-memory-scan)
+    (should-error
+     (anvil-memory-promote (expand-file-name "project_alpha.md" root)
+                           'feedback)
+     :type 'user-error)))
+
+(ert-deftest anvil-memory-test/promote-refreshes-fts-body ()
+  "Promote rewrites the FTS row so search by the new path works."
+  (skip-unless (anvil-memory-test--supported-p 'promote))
+  (anvil-memory-test--with-env
+    (let ((old (expand-file-name "notes.md" root)))
+      (anvil-memory-test--write old "uniquetoken\n")
+      (anvil-memory-scan)
+      (anvil-memory-promote old 'feedback))
+    (let* ((hits (anvil-memory-search "uniquetoken"))
+           (files (mapcar (lambda (h)
+                            (file-name-nondirectory (plist-get h :file)))
+                          hits)))
+      (should (equal '("feedback_notes.md") files)))))
+
+
+;;;; --- Phase 2a: memory-regenerate-index ----------------------------------
+
+(ert-deftest anvil-memory-test/regenerate-returns-bullet-list ()
+  "regenerate-index emits `- [NAME](FILE) — DESC' lines for every row."
+  (skip-unless (anvil-memory-test--supported-p 'regenerate))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_a.md" root)
+     "---\nname: Alpha\ndescription: The alpha rule\ntype: feedback\n---\nbody\n")
+    (anvil-memory-test--write
+     (expand-file-name "project_b.md" root)
+     "---\nname: Beta\ndescription: The beta project\ntype: project\n---\nbody\n")
+    (anvil-memory-scan)
+    (let ((body (anvil-memory-regenerate-index root)))
+      (should (string-match-p
+               "^- \\[Alpha\\](feedback_a\\.md) — The alpha rule" body))
+      (should (string-match-p
+               "^- \\[Beta\\](project_b\\.md) — The beta project" body)))))
+
+(ert-deftest anvil-memory-test/regenerate-sorts-by-decay-desc ()
+  "The regenerated list is ordered by :decay-score descending."
+  (skip-unless (anvil-memory-test--supported-p 'regenerate))
+  (anvil-memory-test--with-env
+    (let ((old (- (truncate (float-time)) (* 90 86400))))
+      (anvil-memory-test--write
+       (expand-file-name "feedback_stale.md" root)
+       "---\nname: Stale\ndescription: old\n---\n" old))
+    (anvil-memory-test--write
+     (expand-file-name "feedback_hot.md" root)
+     "---\nname: Hot\ndescription: fresh\n---\n")
+    (anvil-memory-scan)
+    (anvil-memory-access (expand-file-name "feedback_hot.md" root))
+    (let* ((body (anvil-memory-regenerate-index root))
+           (hot-pos (string-match "Hot\\](" body))
+           (stale-pos (string-match "Stale\\](" body)))
+      (should hot-pos)
+      (should stale-pos)
+      (should (< hot-pos stale-pos)))))
+
+(ert-deftest anvil-memory-test/regenerate-filters-by-root ()
+  "Only rows under ROOT contribute to the output."
+  (skip-unless (anvil-memory-test--supported-p 'regenerate))
+  (anvil-memory-test--with-env
+    (let ((other (make-temp-file "anvil-memother-" t)))
+      (unwind-protect
+          (progn
+            (anvil-memory-test--write
+             (expand-file-name "feedback_here.md" root)
+             "---\nname: Here\ndescription: local\n---\n")
+            (anvil-memory-test--write
+             (expand-file-name "feedback_there.md" other)
+             "---\nname: There\ndescription: other\n---\n")
+            (let ((anvil-memory-roots (list root other)))
+              (anvil-memory-scan))
+            (let ((body (anvil-memory-regenerate-index root)))
+              (should (string-match-p "feedback_here\\.md" body))
+              (should-not (string-match-p "feedback_there\\.md" body))))
+        (ignore-errors (delete-directory other t))))))
+
+(ert-deftest anvil-memory-test/regenerate-fallback-name-from-filename ()
+  "Missing frontmatter name falls back to the filename without prefix/ext."
+  (skip-unless (anvil-memory-test--supported-p 'regenerate))
+  (anvil-memory-test--with-env
+    (anvil-memory-test--write
+     (expand-file-name "feedback_something_cool.md" root)
+     "no frontmatter here\n")
+    (anvil-memory-scan)
+    (let ((body (anvil-memory-regenerate-index root)))
+      (should (string-match-p "\\[something cool\\]" body)))))
+
+(ert-deftest anvil-memory-test/regenerate-empty-root-returns-empty-string ()
+  "A root with no indexed rows produces the empty string, not nil."
+  (skip-unless (anvil-memory-test--supported-p 'regenerate))
+  (anvil-memory-test--with-env
+    (anvil-memory-scan)
+    (should (equal "" (anvil-memory-regenerate-index root)))))
+
+
 (provide 'anvil-memory-test)
 
 ;;; anvil-memory-test.el ends here
