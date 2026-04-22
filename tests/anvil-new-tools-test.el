@@ -61,6 +61,27 @@
             (should (stringp (plist-get (car fails) :condition)))))
       (ignore-errors (delete-file tmp)))))
 
+(ert-deftest anvil-tools-test-ert-run-reload-still-runs-tests ()
+  "Reloading the same test file should still execute its tests."
+  (let* ((tmp (make-temp-file "anvil-ert-" nil ".el")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp
+           "(require 'ert)
+(ert-deftest anvil-tools-tmp-reload-a () (should (= 1 1)))
+(ert-deftest anvil-tools-tmp-reload-b () (should (= 2 2)))
+")
+          (let* ((first-out (anvil-elisp--ert-run tmp nil))
+                 (first-res (anvil-new-tools-test--read-plist first-out))
+                 (second-out (anvil-elisp--ert-run tmp nil))
+                 (second-res (anvil-new-tools-test--read-plist second-out)))
+            (should (= 2 (plist-get first-res :passed)))
+            (should (= 0 (plist-get first-res :failed)))
+            (should (= 2 (plist-get second-res :passed)))
+            (should (= 0 (plist-get second-res :failed)))))
+      (ignore-errors (delete-file tmp)))))
+
 (ert-deftest anvil-tools-test-ert-fresh-feature-strips-test-suffix ()
   "Helper infers a feature symbol by stripping the trailing `-test'."
   (should (eq 'anvil-worker
