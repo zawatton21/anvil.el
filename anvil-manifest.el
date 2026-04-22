@@ -70,7 +70,9 @@ attached at registration time."
 (defcustom anvil-manifest-server-profiles
   '(("emacs-eval-ultra" . ultra)
     ("emacs-eval-nav"   . nav)
-    ("emacs-eval-core"  . core))
+    ("emacs-eval-core"  . core)
+    ("emacs-eval-agent" . agent)
+    ("emacs-eval-edit"  . edit))
   "Alist of (SERVER-ID . PROFILE) overriding `anvil-manifest-profile'.
 Lets one MCP daemon advertise different tool subsets to different
 clients when each client connects under a distinct (virtual) server-id.
@@ -89,11 +91,16 @@ the unfiltered default for that connection."
 (defconst anvil-manifest--default-aliases
   '(("emacs-eval-ultra" . "emacs-eval")
     ("emacs-eval-nav"   . "emacs-eval")
-    ("emacs-eval-core"  . "emacs-eval"))
+    ("emacs-eval-core"  . "emacs-eval")
+    ("emacs-eval-agent" . "emacs-eval")
+    ("emacs-eval-edit"  . "emacs-eval"))
   "Default `anvil-server-id-aliases' entries installed by
 `anvil-manifest-enable'.  Each alias routes a virtual server-id at
 the anvil-server tool table for `emacs-eval', so the filter can apply
-a per-connection profile without duplicating registrations.")
+a per-connection profile without duplicating registrations.
+
+Doc 34 Phase B added `emacs-eval-agent' / `emacs-eval-edit' on top
+of the original ultra / nav / core trio.")
 
 ;;; Profile definitions
 
