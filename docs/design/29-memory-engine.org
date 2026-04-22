@@ -8,14 +8,14 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b (i/ii/iii) SHIPPED~ (2026-04-22、stacked
-feat branches) — Week-3 Ship 4、競合 token-savior の "memory
-engine" を anvil + Claude Code auto-memory に統合する。非
-destructive (metadata layer のみ SQLite、memory =.md= files の
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3a SHIPPED~ (2026-04-22、
+stacked feat branches) — Week-3 Ship 4、競合 token-savior の
+"memory engine" を anvil + Claude Code auto-memory に統合する。
+非 destructive (metadata layer のみ SQLite、memory =.md= files の
 rename 以外は不変) の foundation + 検出 + ranking & lifecycle +
-tokenizer swap + LLM verdict + MDL distillation。
-Phase 2b 3 sub-phase 全て完了、web viewer / cross-project 移行
-(Phase 3/4) はオプション扱い。
+tokenizer swap + LLM verdict + MDL distillation + static HTML
+viewer。Phase 3b (TCP server) / 3c (htmx + contradiction graph) /
+Phase 4 (cross-project) はオプション扱い。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -66,6 +66,17 @@ orchestrator に labelled source block (===--- FILE: path ---===
 採用判断)。empty / unindexed FILES は =user-error= で事前 reject、
 LLM call を無駄にしない。新 MCP tool =memory-mdl-distill= は
 colon-separated files param。10 ERT (合計 81)。
+
+*Phase 3a (feat/doc-29-memory-engine-phase3a):*
+=memory-export-html= 追加。=anvil-memory-export-html ROOT &key
+out-path title= で self-contained HTML snapshot を生成 (inline
+CSS + 外部 CDN 非依存、offline file:// OK)。type facet (user /
+feedback / project / reference / memo) で section 分割、各
+section は decay-score desc で sort。render 対象は frontmatter の
+name / description、filename、decay (数値 + 3 段階 color bar)、
+access_count、last-accessed。memory body は embed しない (.html 漏洩
+時の session text 保護)。新 MCP tool =memory-export-html=
+(root / out_path / title)。10 ERT (合計 91)。
 
 *module placement:* =anvil-optional-modules= の =memory= (Emacs 29+
 SQLite 依存、opt-in)。=with_urls= audit は =anvil-http= を別途
@@ -386,11 +397,53 @@ commit: =d31d86a= (test-lock、11 ERT) → =51900de= (impl、+196 行)。
 
 commit: =e8c1bd8= (test-lock、10 ERT) → =8e2d863= (impl、+150 行)。
 
-** Phase 3 — web-viewer
+** Phase 3a — static HTML export (~SHIPPED~ 2026-04-22)
 
-token-savior の htmx viewer 相当。=127.0.0.1:<port>= で memory
-graph を可視化 (feedback / project / reference 別、decay heatmap、
-contradiction 矢印)。opt-in。
+=anvil-memory-export-html ROOT &key out-path title= を新設。
+self-contained HTML snapshot (inline CSS のみ、=<link>= /
+=<script src=...>= 無し)、file:// で開ける。構造:
+
+- =<body>= に =<h1>= + summary line (total count / root path)
+- 各 type section =<section data-type="TYPE">=、user / feedback /
+  project / reference / memo の順 (=anvil-memory--html-type-order=
+  定数)
+- section 内 =<table>= は memory / decay / access / last column、
+  row は =data-decay="<float>"= attribute + 3 段階 color bar
+  (hot >=0.66 / warm >=0.33 / cold)
+- body は emit しない (.html 漏洩時の session text 保護)
+
+非 obvious 設計:
+- =anvil-memory--group-by-type=: decay-sorted rows を type 別 bucket
+  に分け、=anvil-memory--html-type-order= 順に並べ替え。key 順が
+  安定 (=memo= は最後)。bucket 内 row 順 = caller (decay desc)
+  そのまま preserve。
+- =anvil-memory--html-escape=: 5 entity (=&= =<= =>= =\"= ='=)
+  順序固定 (=&= 先頭、以降は既に置換済文字を触らない)。
+- =out-path= UTF-8 固定: =(let ((coding-system-for-write 'utf-8))
+  (with-temp-file ... (insert html)))= で OS locale 非依存。
+- 返り値は常に HTML 文字列、=out-path= は副作用。
+
+新 MCP tool =memory-export-html=: root / out_path / title (string
+coerce、empty → nil)、return =(:html STR :written PATH-OR-NIL)=。
+read-only flag 付き。
+
+commit: =f3ce484= (test-lock、10 ERT) → =a724206= (impl、+223 行)。
+
+** Phase 3b — live TCP server (~DRAFT~)
+
+=anvil-memory-serve &key port host= で =make-network-process= の
+TCP HTTP server を立て、=/= = Phase 3a HTML 同形、=/api/list= =
+JSON 応答、=/api/decay= = heatmap JSON。lifecycle は
+=anvil-memory-serve-stop= / process sentinel で管理。host は
+=127.0.0.1= default (localhost-only)。pty-broker / worker の
+=make-network-process= pattern を流用。
+
+** Phase 3c — htmx interactive + contradiction graph (~DRAFT~)
+
+Phase 3b の server に htmx script を inline、=hx-get= で
+per-type section を live refresh。Phase 2b-ii の verdict store
+(将来的に persist された時) を矢印化 (SVG, feedback ↔ feedback の
+contradicting pair)。opt-in、Phase 3b 前提。
 
 ** Phase 4 — cross-project memory
 
