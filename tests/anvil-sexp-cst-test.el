@@ -37,6 +37,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'anvil-sexp-cst nil t)
+(require 'anvil-state nil t)
 
 ;;;; --- fixture helpers ----------------------------------------------------
 
@@ -264,6 +265,136 @@ Errors if any entry is missing either `k' or `v'."
                     '("inspect-object/circular-reference"
                       "circular-reference")))
     (should (stringp (anvil-sexp-cst-test--get err "message")))))
+
+
+;;;; --- drill cursor resolution (Phase 1b-a) -------------------------------
+
+(defmacro anvil-sexp-cst-test--with-drill-env (&rest body)
+  "Run BODY against a freshly-enabled `anvil-state' DB.
+Binds `anvil-state-db-path' to a unique temp file, clears any
+cached handle, enables state for the duration of BODY, and cleans
+up on exit.  Drill tests need this because cursor round-trip is
+persisted through anvil-state per Doc 31 Phase 1b-a contract."
+  (declare (indent 0))
+  `(let ((anvil-state-db-path (make-temp-file "anvil-sct-drill-" nil ".db"))
+         (anvil-state--db nil))
+     (unwind-protect
+         (progn
+           (when (fboundp 'anvil-state-enable) (anvil-state-enable))
+           ,@body)
+       (when (fboundp 'anvil-state-disable) (anvil-state-disable))
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(defun anvil-sexp-cst-test--drill-available-p ()
+  "Return non-nil when drill impl + anvil-state are both present."
+  (and (anvil-sexp-cst-test--available-p 'drill)
+       (fboundp 'anvil-inspect-object-drill)
+       (fboundp 'anvil-state-enable)))
+
+(defun anvil-sexp-cst-test--parse-drill (raw)
+  "Parse RAW JSON from a drill call into a hash-table.  Mirror of `invoke'."
+  (cond ((stringp raw)
+         (json-parse-string raw :object-type 'hash-table
+                            :array-type 'array
+                            :null-object :null :false-object :false))
+        ((listp raw)
+         (json-parse-string (json-encode raw) :object-type 'hash-table
+                            :array-type 'array
+                            :null-object :null :false-object :false))
+        (t (error "drill returned non-string/list: %S" raw))))
+
+(ert-deftest anvil-sexp-cst-test-drill-resolves-valid-cursor ()
+  "A cursor emitted by `anvil-inspect-object' must round-trip through drill.
+Default offset 0, default limit = top-limit: drill returns the
+first window exactly as the original inspect call would have."
+  (skip-unless (anvil-sexp-cst-test--drill-available-p))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((big (cl-loop for i below 20 collect (* i 10)))
+           (obj (anvil-sexp-cst-test--invoke big))
+           (cursor (anvil-sexp-cst-test--get obj "cursor")))
+      (should (stringp cursor))
+      (let* ((drilled (anvil-sexp-cst-test--parse-drill
+                       (anvil-inspect-object-drill
+                        cursor anvil-sexp-cst-test--client-id)))
+             (entries (anvil-sexp-cst-test--entries-as-alist drilled)))
+        (should (equal (anvil-sexp-cst-test--get drilled "type") "list"))
+        (should (equal (anvil-sexp-cst-test--get drilled "length") 20))
+        (should (= (length entries) 10))
+        (should (equal (cdr (nth 0 entries)) "0"))
+        (should (equal (cdr (nth 9 entries)) "90"))))))
+
+(ert-deftest anvil-sexp-cst-test-drill-with-offset-pages ()
+  "Drill with explicit OFFSET/LIMIT pages past the first window.
+Requesting offset=10 limit=10 over a 20-element list must return
+entries 10-19, inclusive, with `truncated' = false (covers the tail)."
+  (skip-unless (anvil-sexp-cst-test--drill-available-p))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((big (cl-loop for i below 20 collect (* i 10)))
+           (obj (anvil-sexp-cst-test--invoke big))
+           (cursor (anvil-sexp-cst-test--get obj "cursor"))
+           (drilled (anvil-sexp-cst-test--parse-drill
+                     (anvil-inspect-object-drill
+                      cursor anvil-sexp-cst-test--client-id 10 10)))
+           (entries (anvil-sexp-cst-test--entries-as-alist drilled)))
+      (should (equal (anvil-sexp-cst-test--get drilled "type") "list"))
+      (should (= (length entries) 10))
+      (should (equal (cdr (nth 0 entries)) "100"))
+      (should (equal (cdr (nth 9 entries)) "190"))
+      (should (eq (anvil-sexp-cst-test--get drilled "truncated") :false)))))
+
+(ert-deftest anvil-sexp-cst-test-drill-malformed-cursor ()
+  "A cursor string that does not match
+`inspect-object/<cid>/<uuid>' returns a typed error envelope.
+Needs no state round-trip — parse-level rejection suffices."
+  (skip-unless (anvil-sexp-cst-test--drill-available-p))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((drilled (anvil-sexp-cst-test--parse-drill
+                     (anvil-inspect-object-drill
+                      "not-a-cursor" anvil-sexp-cst-test--client-id)))
+           (err (anvil-sexp-cst-test--get drilled "error")))
+      (should (hash-table-p err))
+      (should (equal (anvil-sexp-cst-test--get err "kind")
+                     "inspect-object/cursor-malformed"))
+      (should (stringp (anvil-sexp-cst-test--get err "message"))))))
+
+(ert-deftest anvil-sexp-cst-test-drill-missing-entry ()
+  "A well-formed cursor whose uuid is not in anvil-state returns a typed error.
+Distinguishes expiry / state flush from malformed input so the
+client can retry vs. give up."
+  (skip-unless (anvil-sexp-cst-test--drill-available-p))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((cursor (format "inspect-object/%s/no-such-uuid-0000"
+                           anvil-sexp-cst-test--client-id))
+           (drilled (anvil-sexp-cst-test--parse-drill
+                     (anvil-inspect-object-drill
+                      cursor anvil-sexp-cst-test--client-id)))
+           (err (anvil-sexp-cst-test--get drilled "error")))
+      (should (hash-table-p err))
+      (should (equal (anvil-sexp-cst-test--get err "kind")
+                     "inspect-object/cursor-expired"))
+      (should (stringp (anvil-sexp-cst-test--get err "message"))))))
+
+(ert-deftest anvil-sexp-cst-test-drill-cross-client-rejected ()
+  "Drill with a caller client-id that differs from the cursor's cid
+must reject with `inspect-object/cursor-forbidden'.  Locks the
+consensus-critique isolation contract: cursors minted for one
+client are not drillable by another."
+  (skip-unless (anvil-sexp-cst-test--drill-available-p))
+  (anvil-sexp-cst-test--with-drill-env
+    (let* ((big (cl-loop for i below 20 collect i))
+           (raw (anvil-inspect-object big "alice"))
+           (obj (json-parse-string raw :object-type 'hash-table
+                                   :array-type 'array
+                                   :null-object :null :false-object :false))
+           (cursor (gethash "cursor" obj))
+           (drilled (anvil-sexp-cst-test--parse-drill
+                     (anvil-inspect-object-drill cursor "bob")))
+           (err (anvil-sexp-cst-test--get drilled "error")))
+      (should (stringp cursor))
+      (should (hash-table-p err))
+      (should (equal (anvil-sexp-cst-test--get err "kind")
+                     "inspect-object/cursor-forbidden"))
+      (should (stringp (anvil-sexp-cst-test--get err "message"))))))
 
 
 ;;;; --- meta-test: shape lock file is loaded and TDD-lite gate active -----
