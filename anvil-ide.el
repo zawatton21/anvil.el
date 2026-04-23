@@ -129,6 +129,15 @@ FILE-PATH when no project is available."
                 (normalized-file (anvil-ide--normalize-path file)))
       (file-in-directory-p normalized-file scope-root))))
 
+(defun anvil-ide--xref-filter-items (items scope-root)
+  "Return xref ITEMS filtered to SCOPE-ROOT."
+  (if (not scope-root)
+      items
+    (cl-remove-if-not
+     (lambda (item)
+       (anvil-ide--xref-item-in-scope-p item scope-root))
+     items)))
+
 (defun anvil-ide--xref-format-item (item)
   "Format xref ITEM as a single `file:line: summary' string."
   (let* ((location (xref-item-location item))
@@ -146,14 +155,33 @@ FILE-PATH when no project is available."
 
 (defun anvil-ide--xref-format-items (items scope-root empty-message)
   "Format xref ITEMS filtered to SCOPE-ROOT, or return EMPTY-MESSAGE."
-  (let ((filtered
-         (cl-remove-if-not
-          (lambda (item)
-            (anvil-ide--xref-item-in-scope-p item scope-root))
-          items)))
+  (let ((filtered (anvil-ide--xref-filter-items items scope-root)))
     (if filtered
         (mapconcat #'anvil-ide--xref-format-item filtered "\n")
       empty-message)))
+
+(defun anvil-ide--xref-elisp-apropos-scope-message
+    (pattern items scope-root)
+  "Explain Elisp apropos PATTERN hits in ITEMS being filtered by SCOPE-ROOT."
+  (let ((loaded-file
+         (cl-loop for item in items
+                  thereis
+                  (anvil-ide--normalize-path
+                   (anvil-ide--xref-location-file
+                    (xref-item-location item))))))
+    (mapconcat
+     #'identity
+     (delq nil
+           (list
+            (format "No project-local symbols found matching '%s'."
+                    pattern)
+            "The Emacs Lisp xref backend returned only matches outside the current project scope."
+            (when loaded-file
+              (format "Loaded checkout hit: %s" loaded-file))
+            (when scope-root
+              (format "Current project scope: %s" scope-root))
+            "This usually means Emacs loaded a different checkout; try reloading the dev tree or running anvil-self-sync-check."))
+     "\n")))
 
 (defun anvil-ide--xref-find-references (identifier file-path)
   "Find references to IDENTIFIER using FILE-PATH as context.
@@ -203,10 +231,17 @@ MCP Parameters:
           (t
            (let ((xref-items (xref-backend-apropos backend pattern)))
              (if xref-items
-                 (anvil-ide--xref-format-items
-                  xref-items
-                  scope-root
-                  (format "No symbols found matching '%s'" pattern))
+                 (let ((filtered
+                        (anvil-ide--xref-filter-items
+                         xref-items scope-root)))
+                   (if filtered
+                       (mapconcat
+                        #'anvil-ide--xref-format-item filtered "\n")
+                     (if (eq backend 'elisp)
+                         (anvil-ide--xref-elisp-apropos-scope-message
+                          pattern xref-items scope-root)
+                       (format "No symbols found matching '%s'"
+                               pattern))))
                (format "No symbols found matching '%s'" pattern))))))))))
 
 ;;; Project info
