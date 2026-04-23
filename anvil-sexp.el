@@ -999,19 +999,35 @@ leak in."
     (with-temp-buffer
       (insert log-text)
       (goto-char (point-min))
-      (while (re-search-forward
-              "^\\(.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
-              nil t)
-        (let ((path (match-string 1))
-              (line (string-to-number (match-string 2)))
-              (col  (string-to-number (match-string 3)))
-              (kind-str (match-string 4))
-              (msg (match-string 5)))
-          (when (string-equal (file-name-nondirectory path) base)
-            (push (list :kind (if (equal kind-str "Error") 'error 'warning)
-                        :source 'byte-compile
-                        :line line :column col :message msg)
-                  diags)))))
+      (while (not (eobp))
+        (let ((line-text (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match
+             "^\\(.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((path (match-string 1 line-text))
+                  (line (string-to-number (match-string 2 line-text)))
+                  (col  (string-to-number (match-string 3 line-text)))
+                  (kind-str (match-string 4 line-text))
+                  (msg (match-string 5 line-text)))
+              (when (string-equal (file-name-nondirectory path) base)
+                (push (list :kind (if (equal kind-str "Error") 'error 'warning)
+                            :source 'byte-compile
+                            :line line :column col :message msg)
+                      diags))))
+           ((string-match
+             "^\\(.*?\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((path (match-string 1 line-text))
+                  (kind-str (match-string 2 line-text))
+                  (msg (match-string 3 line-text)))
+              (when (string-equal (file-name-nondirectory path) base)
+                (push (list :kind (if (equal kind-str "Error") 'error 'warning)
+                            :source 'byte-compile
+                            :line 0 :column 0 :message msg)
+                      diags)))))
+        (forward-line 1))))
     (nreverse diags)))
 
 (defun anvil-sexp--run-byte-compile (file)

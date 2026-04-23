@@ -1014,14 +1014,27 @@ caller does not have to scan it."
       (error (push (error-message-string err) errors)))
     (with-current-buffer log-buf
       (goto-char (point-min))
-      (while (re-search-forward
-              "^\\(?:.*?:\\)?\\(?:[0-9]+:[0-9]+: ?\\)?\\(Warning\\|Error\\): \\(.*\\)$"
-              nil t)
-        (let ((kind (match-string 1))
-              (msg  (match-string 2)))
-          (if (equal kind "Warning")
-              (push msg warnings)
-            (push msg errors)))))
+      (while (not (eobp))
+        (let ((line-text (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match
+             "^\\(?:.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((kind (match-string 3 line-text))
+                  (msg  (match-string 4 line-text)))
+              (if (equal kind "Warning")
+                  (push msg warnings)
+                (push msg errors))))
+           ((string-match
+             "^\\(?:.*?\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((kind (match-string 1 line-text))
+                  (msg  (match-string 2 line-text)))
+              (if (equal kind "Warning")
+                  (push msg warnings)
+                (push msg errors)))))
+        (forward-line 1))))
     (format "%S" (list :ok (and result (null errors))
                        :output (concat (file-name-sans-extension path) ".elc")
                        :warnings (nreverse warnings)

@@ -129,6 +129,30 @@
       (ignore-errors (delete-file tmp))
       (ignore-errors (delete-file (concat (file-name-sans-extension tmp) ".elc"))))))
 
+(ert-deftest anvil-tools-test-byte-compile-fatal-error ()
+  "A malformed file reports :ok nil and a populated :errors list."
+  (let ((tmp (make-temp-file "anvil-bc-bad-" nil ".el")))
+    (unwind-protect
+        (progn
+          (anvil-new-tools-test--write
+           tmp
+           ";;; tmp --- x -*- lexical-binding: t; -*-
+;;; Commentary: tmp
+;;; Code:
+(defun anvil-tools-tmp-bad (
+(provide 'tmp)
+;;; tmp ends here
+")
+          (let* ((out (anvil-elisp--byte-compile-file tmp))
+                 (res (anvil-new-tools-test--read-plist out)))
+            (should-not (plist-get res :ok))
+            (should (cl-find-if
+                     (lambda (msg)
+                       (string-match-p "End of file during parsing" msg))
+                     (plist-get res :errors)))))
+      (ignore-errors (delete-file tmp))
+      (ignore-errors (delete-file (concat (file-name-sans-extension tmp) ".elc"))))))
+
 (ert-deftest anvil-tools-test-byte-compile-offload-e2e ()
   "elisp-byte-compile-file goes through the offload REPL end-to-end.
 Register the real tool via `anvil-elisp-enable', call it over the
