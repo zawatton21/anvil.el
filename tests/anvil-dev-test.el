@@ -906,4 +906,142 @@ never-called tools against the current registry."
       (ignore-errors (delete-file anvil-state-db-path))
       (delete-directory d t))))
 
+;;;; --- secret-scan (gitleaks) --------------------------------------------
+
+(ert-deftest anvil-dev-test-audit-secrets-nil-when-disabled ()
+  "Scanner returns nil when `anvil-dev-audit-secrets-enabled' is nil,
+without ever shelling out."
+  (let ((d (anvil-dev-test--make-dir))
+        (anvil-dev-audit-secrets-enabled nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'call-process)
+                   (lambda (&rest _args)
+                     (error "call-process must not be invoked when disabled"))))
+          (should (null (anvil-dev--audit-scan-secrets d))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-secrets-nil-when-binary-missing ()
+  "Scanner returns nil (no signal) when `gitleaks' is not on PATH."
+  (let ((d (anvil-dev-test--make-dir)))
+    (make-directory (expand-file-name ".git" d))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (prog) (cond ((equal prog "gitleaks") nil)
+                                        ((equal prog "git") "/usr/bin/git")
+                                        (t nil))))
+                  ((symbol-function 'call-process)
+                   (lambda (&rest _args)
+                     (error "call-process must not be invoked without gitleaks"))))
+          (should (null (anvil-dev--audit-scan-secrets d))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-secrets-nil-when-not-git ()
+  "Scanner returns nil when ROOT is not a git worktree."
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          ;; no .git inside d
+          (should (null (anvil-dev--audit-scan-secrets d))))
+      (delete-directory d t))))
+
+(defun anvil-dev-test--executable-find-stub (prog)
+  "Return fake paths for `gitleaks' / `git', nil otherwise.
+Used in cl-letf binding to avoid recursing into the real
+`executable-find' during scanner tests."
+  (cond ((equal prog "gitleaks") "/fake/gitleaks")
+        ((equal prog "git")      "/usr/bin/git")
+        (t nil)))
+
+(ert-deftest anvil-dev-test-audit-secrets-parses-json-findings ()
+  "Scanner parses gitleaks JSON report into finding plists."
+  (let ((d (anvil-dev-test--make-dir)))
+    (make-directory (expand-file-name ".git" d))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   #'anvil-dev-test--executable-find-stub)
+                  ((symbol-function 'call-process)
+                   (lambda (_prog _in _buf _disp &rest args)
+                     (let ((rpath (cadr (member "--report-path" args))))
+                       (when rpath
+                         (with-temp-file rpath
+                           (insert "[{\"RuleID\":\"github-pat\","
+                                   "\"StartLine\":1,\"File\":\"s.txt\","
+                                   "\"Match\":\"REDACTED\","
+                                   "\"Fingerprint\":\"fp1\"}]"))))
+                     0)))
+          (let ((findings (anvil-dev--audit-scan-secrets d)))
+            (should (= 1 (length findings)))
+            (let ((f (car findings)))
+              (should (equal "s.txt" (plist-get f :file)))
+              (should (= 1 (plist-get f :line)))
+              (should (equal "github-pat" (plist-get f :rule)))
+              (should (equal "fp1" (plist-get f :fingerprint))))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-secrets-survives-malformed-json ()
+  "Scanner degrades to nil on malformed JSON without signaling."
+  (let ((d (anvil-dev-test--make-dir)))
+    (make-directory (expand-file-name ".git" d))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   #'anvil-dev-test--executable-find-stub)
+                  ((symbol-function 'call-process)
+                   (lambda (_prog _in _buf _disp &rest args)
+                     (let ((rpath (cadr (member "--report-path" args))))
+                       (when rpath
+                         (with-temp-file rpath
+                           (insert "this is not json"))))
+                     0)))
+          (should (null (anvil-dev--audit-scan-secrets d))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-secrets-empty-report-returns-nil ()
+  "Empty report file (no leaks) yields nil, not an error."
+  (let ((d (anvil-dev-test--make-dir)))
+    (make-directory (expand-file-name ".git" d))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   #'anvil-dev-test--executable-find-stub)
+                  ((symbol-function 'call-process)
+                   (lambda (_prog _in _buf _disp &rest args)
+                     (let ((rpath (cadr (member "--report-path" args))))
+                       (when rpath
+                         (with-temp-file rpath (insert ""))))
+                     0)))
+          (should (null (anvil-dev--audit-scan-secrets d))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-clean-p-reflects-secrets ()
+  "`:clean-p' becomes nil when the secret scan reports a finding."
+  (let ((d (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'anvil-dev--audit-scan-secrets)
+                   (lambda (_root)
+                     (list (list :file "x.el" :line 1
+                                 :rule "github-pat" :fingerprint "fp1")))))
+          (let ((r (anvil-dev-release-audit d)))
+            (should (equal 1 (length (plist-get r :secrets))))
+            (should-not (plist-get r :clean-p))))
+      (delete-directory d t))))
+
+(ert-deftest anvil-dev-test-audit-report-renders-secret-finding ()
+  "`anvil-dev--audit-format-report' emits a FAIL block for secrets."
+  (let* ((result (list :arglist-strip nil
+                       :missing-params nil
+                       :plist-return nil
+                       :issue-fix-no-test nil
+                       :non-shipped-docs nil
+                       :secrets (list (list :file "s.txt" :line 3
+                                            :rule "aws" :fingerprint "fp9"))
+                       :unused-tools nil
+                       :clean-p nil
+                       :root "/tmp/x/"
+                       :scope nil :unused-since nil
+                       :audited-at "2026-01-01 00:00:00"))
+         (text (anvil-dev--audit-format-report result)))
+    (should (string-match-p "FAIL gitleaks detected secrets" text))
+    (should (string-match-p "s.txt:3" text))
+    (should (string-match-p "aws" text))
+    (should (string-match-p "fp9" text))))
+
 ;;; anvil-dev-test.el ends here

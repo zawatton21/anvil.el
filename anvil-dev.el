@@ -960,10 +960,67 @@ the audit still runs on machines where Phase C is not enabled."
                                 (plist-get b :id)))))
       (error nil))))
 
+(defcustom anvil-dev-audit-secrets-enabled t
+  "When non-nil, `anvil-dev-release-audit' runs a gitleaks secret scan.
+Requires the `gitleaks' binary (https://github.com/gitleaks/gitleaks)
+on `PATH'.  The scan degrades to nil when the binary is unavailable,
+so the audit still runs on machines without gitleaks installed."
+  :type 'boolean
+  :group 'anvil-dev)
+
+(defun anvil-dev--audit--gitleaks-available-p (root)
+  "Return non-nil when ROOT is a git worktree and `gitleaks' is on PATH.
+Honours `anvil-dev-audit-secrets-enabled'."
+  (and anvil-dev-audit-secrets-enabled
+       (anvil-dev--audit--git-available-p root)
+       (executable-find "gitleaks")))
+
+(defun anvil-dev--audit-scan-secrets (root)
+  "Run `gitleaks detect' in ROOT and return a list of finding plists.
+Each plist: (:file REL :line INT :rule ID :fingerprint ID).  The
+scan passes `--redact' so the actual secret value never enters the
+audit output — only the rule-id and fingerprint (which `gitleaks'
+uses for its allowlist mechanism) are retained.
+
+Returns nil when gitleaks is unavailable or no leaks are found.
+Never signals — invocation or parse failures degrade to nil so a
+broken gitleaks install cannot block the rest of the audit."
+  (when (anvil-dev--audit--gitleaks-available-p root)
+    (let ((default-directory (file-name-as-directory root))
+          (report-file (make-temp-file "anvil-gitleaks-" nil ".json")))
+      (unwind-protect
+          (progn
+            (call-process "gitleaks" nil nil nil
+                          "detect"
+                          "--no-banner"
+                          "--exit-code" "0"
+                          "--redact"
+                          "--report-format" "json"
+                          "--report-path" report-file)
+            (condition-case nil
+                (let ((findings
+                       (with-temp-buffer
+                         (insert-file-contents report-file)
+                         (when (> (buffer-size) 0)
+                           (json-parse-buffer :object-type 'plist
+                                              :array-type 'list
+                                              :null-object nil
+                                              :false-object nil)))))
+                  (when (listp findings)
+                    (mapcar
+                     (lambda (f)
+                       (list :file        (or (plist-get f :File) "")
+                             :line        (or (plist-get f :StartLine) 0)
+                             :rule        (or (plist-get f :RuleID) "")
+                             :fingerprint (or (plist-get f :Fingerprint) "")))
+                     findings)))
+              (error nil)))
+        (ignore-errors (delete-file report-file))))))
+
 (cl-defun anvil-dev-release-audit (&optional project-dir &key scope unused-since)
   "Audit the anvil tree at PROJECT-DIR for pre-release hazards.
 
-Runs five cheap scanners (see the `release audit' section for
+Runs six cheap scanners (see the `release audit' section for
 details) and returns a plist:
 
   :arglist-strip    — list of wrapper plists hit by the Emacs 30
@@ -981,6 +1038,10 @@ details) and returns a plist:
                       when git history is unavailable (shallow clone).
   :non-shipped-docs — list of `(:file :status)' plists for design
                       docs whose STATUS line lacks `SHIPPED'
+  :secrets          — list of `(:file :line :rule :fingerprint)'
+                      plists for secrets detected by `gitleaks'.
+                      Skipped when gitleaks is not installed or
+                      `anvil-dev-audit-secrets-enabled' is nil.
   :unused-tools     — Doc 34 Phase C.  Populated only when
                       UNUSED-SINCE is a positive integer; list of
                       plists `(:id :reason :last-called :days-ago
@@ -988,7 +1049,7 @@ details) and returns a plist:
                       (>UNUSED-SINCE days) or absent.  Requires
                       `anvil-state' + `anvil-discovery' loaded.
                       Advisory — does not affect `:clean-p'.
-  :clean-p          — t iff the five release-blocker scans returned
+  :clean-p          — t iff the six release-blocker scans returned
                       empty (unused-tools excluded by design)
   :root             — absolute directory that was audited
   :scope            — SCOPE value when supplied, else nil
@@ -1023,19 +1084,22 @@ deprecation candidate list).  Omit or pass nil to skip."
                           scanner-files))
          (issue-fix-no-test (anvil-dev--audit-scan-issue-fix-without-test root))
          (non-shipped    (anvil-dev--audit-scan-design-docs root))
+         (secrets        (anvil-dev--audit-scan-secrets root))
          (unused-tools   (when (and (integerp unused-since) (> unused-since 0))
                            (anvil-dev--audit-scan-unused-tools unused-since)))
          (clean-p        (and (null arglist-strip)
                               (null missing-params)
                               (null plist-return)
                               (null issue-fix-no-test)
-                              (null non-shipped)))
+                              (null non-shipped)
+                              (null secrets)))
          (result
           (list :arglist-strip arglist-strip
                 :missing-params missing-params
                 :plist-return plist-return
                 :issue-fix-no-test issue-fix-no-test
                 :non-shipped-docs non-shipped
+                :secrets secrets
                 :unused-tools unused-tools
                 :clean-p clean-p
                 :root (file-name-as-directory (expand-file-name root))
@@ -1065,6 +1129,7 @@ return a one-line string."
         (plists  (plist-get result :plist-return))
         (issue-fix (plist-get result :issue-fix-no-test))
         (docs    (plist-get result :non-shipped-docs))
+        (secrets (plist-get result :secrets))
         (clean-p (plist-get result :clean-p)))
     (concat
      (format "anvil release audit — %s\n" (plist-get result :audited-at))
@@ -1106,6 +1171,15 @@ return a one-line string."
                    (plist-get f :sha)
                    (plist-get f :issue)
                    (plist-get f :subject))))
+        (anvil-dev--audit-format-findings
+         "FAIL gitleaks detected secrets in tracked content (value redacted;\n     use fingerprint with `gitleaks' allowlist if false positive)"
+         secrets
+         (lambda (f)
+           (format "%s:%d  %s  [%s]"
+                   (plist-get f :file)
+                   (plist-get f :line)
+                   (plist-get f :rule)
+                   (plist-get f :fingerprint))))
         (anvil-dev--audit-format-findings
          "WARN design docs not yet SHIPPED (master-gate informational)"
          docs
@@ -1176,16 +1250,18 @@ any real code lives in it."
    :layer 'dev
    :server-id anvil-dev--server-id
    :description
-   "Scan the anvil tree for five pre-release hazard classes:
+   "Scan the anvil tree for six pre-release hazard classes:
 Emacs 30 `_arg' arglist-strip regressions in MCP tool wrappers,
 wrappers with real args but no `MCP Parameters:' docstring
 section, wrappers whose body ends with a `(list :K ...)' plist
 literal (MCP string-or-nil contract violation, unless the file
 opts out via `;;; anvil-audit: tools-wrapped-at-registration'),
 issue-closing commits whose diff does not touch `tests/' (the
-37fcc52 pattern — ship a fix with no regression guard), and
-docs/design/*.org files whose STATUS text lacks `SHIPPED'.
-Returns a formatted report; `clean' when empty."
+37fcc52 pattern — ship a fix with no regression guard),
+docs/design/*.org files whose STATUS text lacks `SHIPPED', and
+secrets detected by `gitleaks' in tracked content (skipped when
+the binary is unavailable).  Returns a formatted report; `clean'
+when empty."
    :read-only t))
 
 (defun anvil-dev-disable ()
