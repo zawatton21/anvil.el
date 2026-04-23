@@ -238,8 +238,9 @@ Returns (:deleted N :file PATH :warnings LIST)."
     (list :deleted deleted :file abs :warnings warnings)))
 
 (defun anvil-file-append (path content)
-  "Append CONTENT to end of PATH.
-A leading newline is added if file does not end with one.
+  "Append CONTENT to the end of existing PATH.
+A leading newline is added if PATH does not end with one.
+Signals an error if PATH does not already exist as a regular file.
 Returns (:appended-bytes N :file PATH :warnings LIST)."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
@@ -2357,12 +2358,13 @@ read specific sections."
 
   (anvil-server-register-tool
    #'anvil-file--tool-append
-   :id "file-append"
-   :intent '(file-edit)
-   :layer 'core
-   :description
-   "Append text to the end of a file.  A leading newline is added
-if the file does not end with one.  Safe for files over 1.2MB."
+  :id "file-append"
+  :intent '(file-edit)
+  :layer 'core
+  :description
+   "Append text to the end of an existing file.  A leading newline is
+added if the file does not end with one.  Errors if the target file
+does not already exist.  Safe for files over 1.2MB."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
