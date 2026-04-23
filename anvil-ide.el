@@ -193,12 +193,21 @@ MCP Parameters:
    (let ((target-buffer (or (find-buffer-visiting file-path)
                             (find-file-noselect file-path))))
      (with-current-buffer target-buffer
-       (let ((backend (xref-find-backend))
-             (scope-root (anvil-ide--xref-scope-root
-                          target-buffer file-path)))
+       (let* ((backend (xref-find-backend))
+              (project (anvil-ide--project-for-buffer target-buffer))
+              (scope-root (anvil-ide--xref-scope-root
+                           target-buffer file-path)))
          (if (not backend)
              (format "No xref backend available for %s" file-path)
-           (let ((xref-items (xref-backend-references backend identifier)))
+           (let ((xref-items
+                  ;; The generic Elisp xref reference search falls back to
+                  ;; `project-current t', which can prompt on non-project
+                  ;; files and raise `minibuffer-quit' in MCP contexts.
+                  (if (and (eq backend 'elisp)
+                           (not project)
+                           scope-root)
+                      (xref-references-in-directory identifier scope-root)
+                    (xref-backend-references backend identifier))))
              (if xref-items
                  (anvil-ide--xref-format-items
                   xref-items

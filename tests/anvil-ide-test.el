@@ -96,5 +96,36 @@
                       result))
          (should-not (string-match-p "external apropos" result)))))))
 
+(ert-deftest anvil-ide-test-xref-find-references-elisp-no-project-falls-back-to-directory-search ()
+  "Non-project Elisp references should avoid the interactive project prompt."
+  (anvil-ide-test--with-temp-xref-layout
+   (lambda (_project-root target-file project-hit external-hit)
+     (let ((expected-root
+            (file-name-as-directory
+             (file-name-directory (expand-file-name target-file)))))
+       (cl-letf (((symbol-function 'xref-find-backend)
+                  (lambda () 'elisp))
+                 ((symbol-function 'anvil-ide--project-for-buffer)
+                  (lambda (_buffer) nil))
+                 ((symbol-function 'xref-backend-references)
+                  (lambda (&rest _)
+                    (signal 'quit '(minibuffer-quit))))
+                 ((symbol-function 'xref-references-in-directory)
+                  (lambda (_identifier dir)
+                    (should (equal expected-root
+                                   (file-name-as-directory dir)))
+                    (list
+                     (anvil-ide-test--make-xref target-file 3 "local reference")
+                     (anvil-ide-test--make-xref external-hit 3 "external reference")))))
+         (let ((result (anvil-ide--xref-find-references "sample" target-file)))
+           (should (string-match-p
+                    (regexp-quote target-file)
+                    result))
+           (should (string-match-p "local reference" result))
+           (should-not (string-match-p
+                        (regexp-quote external-hit)
+                        result))
+           (should-not (string-match-p "external reference" result))))))))
+
 (provide 'anvil-ide-test)
 ;;; anvil-ide-test.el ends here
