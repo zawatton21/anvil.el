@@ -1154,7 +1154,16 @@ Returns (:ok t :operations N :file PATH :warnings LIST) on success.
     (with-temp-buffer
       (anvil--insert-file abs)
       (dolist (op operations)
-        (let ((type (anvil-file--batch-get op 'op)))
+        (let* ((type (anvil-file--batch-get op 'op))
+               (legacy-type (anvil-file--batch-get op 'type)))
+          (when (null type)
+            (if legacy-type
+                (error
+                 "batch: operation objects use 'op', not 'type': %S"
+                 op)
+              (error
+               "batch: missing required field 'op' in operation: %S"
+               op)))
           (pcase type
             ("replace"
              (let ((old (anvil-file--batch-get op 'old))
@@ -1206,7 +1215,9 @@ Returns (:ok t :operations N :file PATH :warnings LIST) on success.
              (let ((c (anvil-file--batch-get op 'content)))
                (insert (if (string-suffix-p "\n" c) c (concat c "\n")))))
             (_
-             (error "batch: unknown op: %s" type))))
+             (error
+              "batch: unknown op %S (supported: replace, replace-regexp, insert-at-line, delete-lines, append, prepend)"
+              type))))
         (cl-incf op-count))
       (anvil--write-current-buffer-to abs))
     (list :ok t :operations op-count :file abs :warnings warnings)))
