@@ -76,6 +76,23 @@
 ;;     request proceed, matching RFC 9309 guidance for missing or
 ;;     unreadable robots files.
 ;;
+;; Phase 1.5 (POST + auth + retry jitter) is live as of the release
+;; containing this comment:
+;;   * `anvil-http-post URL &key body content-type headers auth ...':
+;;     Elisp API.  `:body' accepts a string (verbatim), an alist of
+;;     (KEY . VALUE) (auto-encoded as application/x-www-form-urlencoded),
+;;     or a plist (auto-encoded as application/json).  `:auth' takes
+;;     `(:bearer TOKEN)' / `(:basic (USER . PASS))' / `(:header (NAME
+;;     . VALUE))', or a list thereof.
+;;   * `http-post' MCP tool: body string + optional content_type,
+;;     bearer_token, headers_json (JSON object of extra headers),
+;;     accept, timeout_sec, body_mode, header_filter.  Mirrors
+;;     http-fetch's response shape; POSTs are never cached.
+;;   * Retry backoff now applies +/-`anvil-http-retry-jitter-ratio'
+;;     (default 25%) random jitter; cuts thunder-herd risk when
+;;     many clients retry the same upstream simultaneously.  Set the
+;;     ratio to 0 to restore deterministic backoff.
+;;
 ;; Phase 1d (batch fetch) is live as of the release containing this
 ;; comment:
 ;;   * `anvil-http-get-batch URLS &key concurrency timeout ...'
@@ -164,6 +181,14 @@ stores validators for conditional revalidation."
 Actual wait is `base * 2^attempt' unless the server sent a
 `Retry-After' header (429 only)."
   :type 'integer
+  :group 'anvil-http)
+
+(defcustom anvil-http-retry-jitter-ratio 0.25
+  "Random jitter applied to retry backoff, expressed as a fraction.
+0 disables jitter (deterministic backoff).  0.25 means the actual
+wait is uniformly random in `base * 2^attempt * [1 - 0.25, 1 + 0.25]'.
+Cuts thunder-herd risk when many clients retry simultaneously."
+  :type 'number
   :group 'anvil-http)
 
 (defcustom anvil-http-max-redirections 5
@@ -382,11 +407,16 @@ empty body otherwise.  The buffer is killed by the caller."
             :body body
             :final-url final))))
 
-(defun anvil-http--request (method url extra-headers timeout)
+(defun anvil-http--request (method url extra-headers timeout
+                                   &optional body)
   "Issue one METHOD request to URL with EXTRA-HEADERS and TIMEOUT (seconds).
+BODY is an optional request body for POST / PUT / PATCH; passed as
+`url-request-data' verbatim and the caller is responsible for any
+encoding (the higher-level `anvil-http-post' takes care of this).
 Returns a response plist (:status :headers :body :final-url) or
 signals `anvil-server-tool-error' on transport failure / timeout."
   (let* ((url-request-method method)
+         (url-request-data body)
          (url-request-extra-headers
           (append
            (unless (assoc "User-Agent" extra-headers)
@@ -425,9 +455,21 @@ signals `anvil-server-tool-error' on transport failure / timeout."
            (= status 408)
            (= status 429))))
 
+(defun anvil-http--apply-jitter (base-ms)
+  "Apply +/-`anvil-http-retry-jitter-ratio' random jitter to BASE-MS.
+A ratio of 0 returns BASE-MS unchanged; anything else returns a
+uniform sample from `BASE-MS * [1-ratio, 1+ratio]'.  Jitter cuts
+thunder-herd risk when many clients retry the same upstream after
+a 5xx burst."
+  (let ((j (max 0.0 (min 1.0 (or anvil-http-retry-jitter-ratio 0)))))
+    (if (= j 0) base-ms
+      (let ((delta (- (* 2.0 j (/ (random 10000) 10000.0)) j)))
+        (max 0 (round (* base-ms (+ 1.0 delta))))))))
+
 (defun anvil-http--backoff-ms (attempt response)
   "Return the wait time (ms) before retry ATTEMPT.
-RESPONSE is the last response plist; honours `Retry-After' for 429."
+RESPONSE is the last response plist; honours `Retry-After' for 429,
+otherwise applies exponential backoff with random jitter."
   (let* ((status (plist-get response :status))
          (headers (plist-get response :headers))
          (retry-after (and (= (or status 0) 429)
@@ -436,16 +478,20 @@ RESPONSE is the last response plist; honours `Retry-After' for 429."
     (cond
      ((and retry-after (string-match "\\`[0-9]+\\'" retry-after))
       (* 1000 (string-to-number retry-after)))
-     (t base))))
+     (t (anvil-http--apply-jitter base)))))
 
-(defun anvil-http--request-with-retry (method url extra-headers timeout)
-  "Run `anvil-http--request' with retry on 5xx / 408 / 429."
+(defun anvil-http--request-with-retry (method url extra-headers timeout
+                                              &optional body)
+  "Run `anvil-http--request' with retry on 5xx / 408 / 429.
+BODY is an optional request body for non-GET methods; passed
+through verbatim to the inner request."
   (let ((attempt 0)
         (max-total (1+ (max 0 anvil-http-retry-max)))
         (result nil))
     (catch 'done
       (while (< attempt max-total)
-        (setq result (anvil-http--request method url extra-headers timeout))
+        (setq result (anvil-http--request method url extra-headers
+                                          timeout body))
         (if (and (anvil-http--retryable-p (plist-get result :status))
                  (< attempt (1- max-total)))
             (let ((ms (anvil-http--backoff-ms attempt result)))
@@ -1136,6 +1182,106 @@ fetch-failure."
        "anvil-http: %s is Disallowed for %s by robots.txt at %s"
        url anvil-http-user-agent (plist-get r :origin)))))
 
+;;;; --- POST / auth helpers (Phase 1.5) ------------------------------------
+
+(defun anvil-http--url-encode-form (alist)
+  "Return ALIST encoded as application/x-www-form-urlencoded.
+Keys and values are coerced to strings via `format' before
+hexification, so symbols and numbers work transparently."
+  (mapconcat
+   (lambda (pair)
+     (format "%s=%s"
+             (url-hexify-string (format "%s" (car pair)))
+             (url-hexify-string (format "%s" (cdr pair)))))
+   alist
+   "&"))
+
+(defun anvil-http--plist-to-hash (plist)
+  "Return PLIST as a JSON-friendly hash table.
+Keyword keys lose their leading colon; non-keyword keys are
+formatted via `format'.  Used by `--encode-body' to feed
+`json-serialize'."
+  (let ((h (make-hash-table :test 'equal)))
+    (while plist
+      (let ((k (car plist))
+            (v (cadr plist)))
+        (puthash (cond ((keywordp k) (substring (symbol-name k) 1))
+                       ((symbolp k) (symbol-name k))
+                       (t (format "%s" k)))
+                 v h))
+      (setq plist (cddr plist)))
+    h))
+
+(defun anvil-http--alist-of-string-pairs-p (x)
+  "Non-nil when X looks like an alist of (KEY . VAL) pairs.
+Used to disambiguate alist-form bodies from plist-form bodies in
+`anvil-http--encode-body' — alists have cons-pair elements, plists
+start with a keyword."
+  (and (consp x)
+       (not (keywordp (car x)))
+       (consp (car x))
+       (not (consp (cdr (car x))))))
+
+(defun anvil-http--encode-body (body)
+  "Encode BODY into (DATA . CONTENT-TYPE).
+- nil → (nil . nil)
+- string → (BODY . nil) — caller specifies Content-Type via headers.
+- alist of (KEY . VAL) → (form-urlencoded-string .
+                         \"application/x-www-form-urlencoded\")
+- plist (starts with keyword) → (json-string . \"application/json\")"
+  (cond
+   ((null body) (cons nil nil))
+   ((stringp body) (cons body nil))
+   ((anvil-http--alist-of-string-pairs-p body)
+    (cons (anvil-http--url-encode-form body)
+          "application/x-www-form-urlencoded"))
+   ((and (listp body) (keywordp (car body)))
+    (cons (json-serialize (anvil-http--plist-to-hash body)
+                          :null-object :null
+                          :false-object :false)
+          "application/json"))
+   (t (signal 'anvil-server-tool-error
+              (list (format "anvil-http: cannot encode body of type %S"
+                            (type-of body)))))))
+
+(defun anvil-http--apply-auth (headers auth)
+  "Augment HEADERS alist with credentials from AUTH plist.
+AUTH forms (only one keyword recognised at a time):
+  (:bearer TOKEN)             → Authorization: Bearer TOKEN
+  (:basic (USER . PASS))      → Authorization: Basic base64(USER:PASS)
+  (:basic USER PASS)          → same as above (positional)
+  (:header (NAME . VALUE))    → custom request header
+
+A list of these forms is also accepted; each is applied in order.
+Existing Authorization in HEADERS is overwritten by Bearer/Basic."
+  (cond
+   ((null auth) headers)
+   ;; multi-spec list: ((:bearer ...) (:header ...) ...)
+   ((and (consp auth) (consp (car auth)) (keywordp (caar auth)))
+    (cl-reduce (lambda (h spec) (anvil-http--apply-auth h spec))
+               auth :initial-value headers))
+   (t
+    (pcase (car-safe auth)
+      (:bearer
+       (cons (cons "Authorization"
+                   (format "Bearer %s" (cadr auth)))
+             (assq-delete-all "Authorization" (copy-sequence headers))))
+      (:basic
+       (let* ((tail (cdr auth))
+              (user (if (consp (car tail)) (caar tail) (car tail)))
+              (pass (if (consp (car tail)) (cdar tail) (cadr tail)))
+              (encoded (base64-encode-string
+                        (encode-coding-string
+                         (format "%s:%s" user pass) 'utf-8)
+                        t)))
+         (cons (cons "Authorization" (format "Basic %s" encoded))
+               (assq-delete-all "Authorization"
+                                (copy-sequence headers)))))
+      (:header
+       (let ((pair (cadr auth)))
+         (cons (cons (car pair) (cdr pair)) headers)))
+      (_ headers)))))
+
 ;;;; --- public Elisp API ---------------------------------------------------
 
 ;;;###autoload
@@ -1282,6 +1428,86 @@ HEAD responses never touch the cache."
           :headers (plist-get resp :headers)
           :final-url (plist-get resp :final-url)
           :elapsed-ms elapsed-ms)))
+
+;;;###autoload
+(cl-defun anvil-http-post (url &key body content-type headers
+                               accept timeout-sec auth
+                               body-mode header-filter
+                               skip-robots-check)
+  "POST URL with BODY and return a response plist.
+
+Keyword args:
+  :body          Request body.  String → sent verbatim (caller sets
+                 :content-type or :headers).  Alist of (KEY . VALUE) →
+                 form-urlencoded (Content-Type forced to
+                 application/x-www-form-urlencoded).  Plist starting
+                 with a keyword → JSON serialised (Content-Type forced
+                 to application/json).  nil → empty body.
+  :content-type  Override Content-Type.  Wins over the auto-derived
+                 type from a structured :body but loses to a value
+                 already present in :headers.
+  :headers       Alist of extra request headers (string keys).
+  :accept        MIME string added as Accept header (short-hand).
+  :timeout-sec   Override `anvil-http-timeout-sec'.
+  :auth          Plist auth spec — `(:bearer TOKEN)' /
+                 `(:basic (USER . PASS))' / `(:header (NAME . VALUE))',
+                 or a list of such specs.  See
+                 `anvil-http--apply-auth' for details.
+  :body-mode     Same as `anvil-http-get'.  POST responses are not
+                 cached, so cache semantics do not apply.
+  :header-filter Same as `anvil-http-get'.
+  :skip-robots-check  Internal — bypass robots.txt pre-check.
+
+Returns (:status :headers :body :from-cache nil :final-url
+:elapsed-ms).  POSTs are never cached and always retry on the
+retryable status set (5xx / 408 / 429), same as GET.  Robots.txt
+enforcement applies — a Disallow on the target URL raises
+`user-error' before any network round-trip."
+  (anvil-http--check-url url)
+  (when (and anvil-http-respect-robots-txt
+             (not skip-robots-check)
+             (not (anvil-http--is-robots-url-p url)))
+    (anvil-http--robots-check-signal url))
+  (anvil-http--metrics-bump :requests)
+  (let* ((encoded (anvil-http--encode-body body))
+         (data (car encoded))
+         (auto-ct (cdr encoded))
+         (with-auth (anvil-http--apply-auth (or headers nil) auth))
+         (final-headers
+          (let ((h with-auth))
+            ;; Add Accept if requested and not already present.
+            (when (and accept (not (assoc "Accept" h)))
+              (setq h (cons (cons "Accept" accept) h)))
+            ;; Add Content-Type if not already present.
+            (let ((ct (or content-type auto-ct)))
+              (when (and ct (not (assoc "Content-Type" h)))
+                (setq h (cons (cons "Content-Type" ct) h))))
+            h))
+         (timeout (or timeout-sec anvil-http-timeout-sec))
+         (start (float-time))
+         (resp (anvil-http--request-with-retry
+                "POST" url final-headers timeout data))
+         (elapsed-ms (round (* 1000 (- (float-time) start))))
+         (status (plist-get resp :status)))
+    (anvil-http--metrics-log url elapsed-ms status 'post)
+    (cond
+     ((and (integerp status) (>= status 200) (< status 300))
+      (anvil-http--apply-header-filter
+       (anvil-http--apply-body-mode
+        (list :status status
+              :headers (plist-get resp :headers)
+              :body (plist-get resp :body)
+              :from-cache nil
+              :cached-at nil
+              :final-url (plist-get resp :final-url)
+              :elapsed-ms elapsed-ms)
+        body-mode)
+       header-filter))
+     (t
+      (anvil-http--metrics-bump :errors)
+      (signal 'anvil-server-tool-error
+              (list (format "anvil-http: HTTP %s for POST %s"
+                            status url)))))))
 
 ;;;; --- batch fetch (Phase 1d) ---------------------------------------------
 
@@ -1582,6 +1808,70 @@ probes (Content-Type, Content-Length, reachability checks)."
                         (t nil))))
      (anvil-http-head url :timeout-sec timeout))))
 
+(defun anvil-http--tool-post (url &optional body content_type
+                                   bearer_token headers_json
+                                   accept timeout_sec
+                                   body_mode header_filter)
+  "POST to URL through `anvil-http-post' and return the response.
+
+MCP Parameters:
+  url           - Absolute http/https URL to POST to.
+  body          - Request body string (caller pre-encodes JSON / form
+                  data; anvil-http does not parse).  Empty string =
+                  no body.
+  content_type  - Optional Content-Type override (e.g. \"application/json\").
+  bearer_token  - Optional OAuth-style bearer token; sent as
+                  `Authorization: Bearer ...'.
+  headers_json  - Optional JSON object string of extra request headers,
+                  e.g. {\"X-Api-Key\":\"...\",\"X-Trace\":\"42\"}.
+                  Merged with auth-derived headers.
+  accept        - Optional Accept header value.
+  timeout_sec   - Optional request timeout override.
+  body_mode     - Same as `http-fetch' (auto / full / head-only / meta-only).
+  header_filter - Same as `http-fetch' (minimal / all).
+
+Returns (:status :headers :body :from-cache :cached-at :final-url
+:elapsed-ms).  POSTs are never cached.  Retries 5xx / 408 / 429
+with jittered exponential backoff (Retry-After honoured on 429).
+Robots.txt is enforced for the target URL."
+  (anvil-server-with-error-handling
+   (let* ((body* (and (stringp body) (not (string-empty-p body)) body))
+          (ct (and (stringp content_type) (not (string-empty-p content_type))
+                   content_type))
+          (timeout (cond ((null timeout_sec) nil)
+                         ((integerp timeout_sec) timeout_sec)
+                         ((and (stringp timeout_sec)
+                               (string-match-p "\\`[0-9]+\\'" timeout_sec))
+                          (string-to-number timeout_sec))
+                         (t nil)))
+          (accept* (and (stringp accept) (not (string-empty-p accept))
+                        accept))
+          (bm (anvil-http--coerce-symbol-arg body_mode))
+          (hf (anvil-http--coerce-symbol-arg header_filter))
+          (extra-headers
+           (when (and (stringp headers_json)
+                      (not (string-empty-p headers_json)))
+             (let ((parsed (json-parse-string headers_json
+                                              :object-type 'alist
+                                              :null-object nil
+                                              :false-object :false)))
+               (mapcar (lambda (kv)
+                         (cons (format "%s" (car kv))
+                               (format "%s" (cdr kv))))
+                       parsed))))
+          (auth (and (stringp bearer_token)
+                     (not (string-empty-p bearer_token))
+                     (list :bearer bearer_token))))
+     (anvil-http-post url
+                      :body body*
+                      :content-type ct
+                      :headers extra-headers
+                      :accept accept*
+                      :timeout-sec timeout
+                      :auth auth
+                      :body-mode bm
+                      :header-filter hf))))
+
 (defun anvil-http--tool-fetch-batch (urls &optional concurrency timeout_sec
                                            selector json_path
                                            body_mode header_filter
@@ -1774,6 +2064,23 @@ Cheap liveness / metadata probe; responses are never cached."
 removes just that entry; without, flushes every cached response.")
 
   (anvil-server-register-tool
+   #'anvil-http--tool-post
+   :id "http-post"
+   :intent '(http)
+   :layer 'io
+   :server-id anvil-http--server-id
+   :description
+   "POST to an http/https URL.  Body is sent verbatim — caller
+pre-encodes JSON / form data.  Optional `bearer_token' adds an
+`Authorization: Bearer ...' header; `headers_json' is a JSON
+object string of extra headers (merged on top of auth).  Retries
+5xx / 408 / 429 with jittered exponential backoff and honours
+Retry-After on 429.  POSTs are never cached.  Robots.txt is
+enforced (a Disallow on the target raises a user-error before
+the network round-trip)."
+   :read-only nil)
+
+  (anvil-server-register-tool
    #'anvil-http--tool-fetch-batch
    :id "http-fetch-batch"
    :intent '(http)
@@ -1807,7 +2114,7 @@ Fail-open on missing or unreadable robots.txt."
 (defun anvil-http--unregister-tools ()
   "Remove every http-* MCP tool from the shared server."
   (dolist (id '("http-fetch" "http-head" "http-cache-clear"
-                "http-fetch-batch" "http-robots-check"))
+                "http-post" "http-fetch-batch" "http-robots-check"))
     (anvil-server-unregister-tool id anvil-http--server-id)))
 
 ;;;###autoload

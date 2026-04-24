@@ -44,9 +44,10 @@ pull on a robots.txt response the stub has not queued."
          (progn
            (anvil-state-enable)
            (cl-letf (((symbol-function 'anvil-http--request)
-                      (lambda (method url headers timeout)
+                      (lambda (method url headers timeout &optional body)
                         (push (list :method method :url url
-                                    :headers headers :timeout timeout)
+                                    :headers headers :timeout timeout
+                                    :body body)
                               anvil-http-test--calls)
                         (anvil-http-test--pop-response)))
                      ((symbol-function 'sleep-for)
@@ -611,6 +612,86 @@ Binds a fresh `anvil-state' DB and disables robots.txt."
      (anvil-http-get-batch
       '("https://a.test/" "https://b.test/" "https://c.test/"))
      :type 'user-error)))
+
+;;;; --- Phase 1.5: POST + auth + jitter ------------------------------------
+
+(ert-deftest anvil-http-test-phase1-5-post-form-urlencoded ()
+  "Alist body is form-urlencoded with the right Content-Type."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "ok"))
+    (anvil-http-post "https://api.example.com/v1/x"
+                     :body '(("name" . "Alice") ("n" . "42")))
+    (let* ((call (car anvil-http-test--calls))
+           (hdrs (plist-get call :headers))
+           (body (plist-get call :body)))
+      (should (equal "POST" (plist-get call :method)))
+      (should (member '("Content-Type" . "application/x-www-form-urlencoded")
+                      hdrs))
+      (should (equal "name=Alice&n=42" body)))))
+
+(ert-deftest anvil-http-test-phase1-5-post-json-plist ()
+  "Plist body is JSON-serialised; Content-Type set to application/json."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "{}"))
+    (anvil-http-post "https://api.example.com/v1/y"
+                     :body '(:foo "bar" :n 42))
+    (let* ((call (car anvil-http-test--calls))
+           (hdrs (plist-get call :headers))
+           (body (plist-get call :body))
+           (parsed (json-parse-string body :object-type 'alist)))
+      (should (member '("Content-Type" . "application/json") hdrs))
+      (should (equal "bar" (alist-get 'foo parsed nil nil #'equal)))
+      (should (equal 42 (alist-get 'n parsed nil nil #'equal))))))
+
+(ert-deftest anvil-http-test-phase1-5-post-raw-string-explicit-ct ()
+  "String body is passed through and caller-supplied Content-Type wins."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "ok"))
+    (anvil-http-post "https://api.example.com/v1/z"
+                     :body "<xml/>"
+                     :content-type "application/xml")
+    (let* ((call (car anvil-http-test--calls))
+           (hdrs (plist-get call :headers))
+           (body (plist-get call :body)))
+      (should (equal "<xml/>" body))
+      (should (member '("Content-Type" . "application/xml") hdrs)))))
+
+(ert-deftest anvil-http-test-phase1-5-auth-bearer ()
+  "(:bearer TOKEN) sets Authorization: Bearer TOKEN."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "{}"))
+    (anvil-http-post "https://api.example.com/secure"
+                     :body "{}"
+                     :content-type "application/json"
+                     :auth '(:bearer "tok-abc"))
+    (let* ((call (car anvil-http-test--calls))
+           (hdrs (plist-get call :headers)))
+      (should (equal "Bearer tok-abc"
+                     (cdr (assoc "Authorization" hdrs)))))))
+
+(ert-deftest anvil-http-test-phase1-5-auth-basic ()
+  "(:basic (USER . PASS)) base64-encodes USER:PASS into Authorization."
+  (anvil-http-test--with-stub
+      (list (anvil-http-test--response 200 nil "{}"))
+    (anvil-http-post "https://api.example.com/private"
+                     :body ""
+                     :auth '(:basic ("alice" . "s3cret")))
+    (let* ((call (car anvil-http-test--calls))
+           (hdrs (plist-get call :headers))
+           (auth (cdr (assoc "Authorization" hdrs))))
+      (should (string-match "\\`Basic \\(.+\\)" auth))
+      (let* ((b64 (match-string 1 auth))
+             (decoded (base64-decode-string b64)))
+        (should (equal "alice:s3cret" decoded))))))
+
+(ert-deftest anvil-http-test-phase1-5-retry-jitter-bounded ()
+  "`--apply-jitter' stays inside +/-`retry-jitter-ratio' of base."
+  (let ((anvil-http-retry-jitter-ratio 0.25))
+    (cl-loop for _ from 1 to 50 do
+             (let ((j (anvil-http--apply-jitter 1000)))
+               (should (and (>= j 750) (<= j 1250))))))
+  (let ((anvil-http-retry-jitter-ratio 0))
+    (should (= 1000 (anvil-http--apply-jitter 1000)))))
 
 ;;;; --- live smoke test ----------------------------------------------------
 

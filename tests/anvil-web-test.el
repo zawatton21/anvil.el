@@ -52,9 +52,10 @@ pre-check is tested separately in anvil-http-test."
          (progn
            (anvil-state-enable)
            (cl-letf (((symbol-function 'anvil-http--request)
-                      (lambda (method url headers timeout)
+                      (lambda (method url headers timeout &optional body)
                         (push (list :method method :url url
-                                    :headers headers :timeout timeout)
+                                    :headers headers :timeout timeout
+                                    :body body)
                               anvil-web-test--calls)
                         (anvil-web-test--pop-response)))
                      ((symbol-function 'sleep-for)

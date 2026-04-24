@@ -1,7 +1,7 @@
 #+title: HTTP Client — url-retrieve Wrapper with ETag/TTL Cache
 #+date: 2026-04-18
 #+author: zawatton
-#+property: status PHASE-1-SHIPPED
+#+property: status PHASE-1-AND-1.5-SHIPPED
 #+property: scope GENERIC
 
 * STATUS
@@ -64,8 +64,24 @@ release-audit clean。feat branch =feat/doc-09-http-phase1d=。
 
 **Phase 1 完遂** — Doc 09 の 5 sub-phase (1a 基盤 / 1b extract /
 1c overflow + header-filter / 1e robots.txt / 1d batch) 全
-SHIPPED。Phase 1.5+ (POST + auth / offload 経由 / LRU eviction)
-は次期 roadmap へ。Review Questions Q1-Q10 resolved のままキープ。
+SHIPPED。
+
+~Phase 1.5 SHIPPED~ (2026-04-25) — POST + auth + retry jitter。
+=anvil-http-post URL &key body content-type headers auth ...= で
+Elisp API: =:body= は string (verbatim) / alist (form-urlencoded
+auto-encode) / plist (JSON auto-encode) を accept、=:auth= は
+=(:bearer TOKEN)= / =(:basic (USER . PASS))= / =(:header (NAME .
+VALUE))= か list。=http-post= MCP tool は body string + bearer_token
++ headers_json (JSON object 文字列) で auth + 任意 header を表現。
+retry backoff に =anvil-http-retry-jitter-ratio= (既定 0.25) で
+±25% jitter を導入し thunder-herd 対策。POST は never cached、
+robots.txt は target URL に対して enforced。ERT +6 (form / json /
+raw / bearer / basic / jitter bounds)、tests 43 pass / 1 live
+skipped、byte-compile + release-audit clean。feat branch
+=feat/doc-09-http-phase1-5=。
+
+Phase 2+ (=:offload t= / LRU eviction / metrics) は次期 roadmap
+へ。Review Questions Q1-Q10 resolved のままキープ。
 
 * Goal
 
