@@ -752,6 +752,85 @@ Robots check is disabled and a fresh state DB provisioned."
                      :offload t :offload-timeout 1)
      :type 'anvil-server-tool-error)))
 
+;;;; --- Phase 3: cache LRU + size cap + metrics ---------------------------
+
+(defmacro anvil-http-test--with-cache (&rest body)
+  "Run BODY with a fresh anvil-state DB and zeroed cache byte counter."
+  (declare (indent 0))
+  `(let ((anvil-state-db-path
+          (make-temp-file "anvil-http-cache-" nil ".db"))
+         (anvil-state--db nil)
+         (anvil-http--cache-bytes-counter 0)
+         (anvil-http--metrics
+          (list :requests 0 :cache-fresh 0 :cache-revalidated 0
+                :network-200 0 :errors 0 :evictions 0 :log nil)))
+     (unwind-protect
+         (progn (anvil-state-enable) ,@body)
+       (anvil-state-disable)
+       (ignore-errors (delete-file anvil-state-db-path)))))
+
+(ert-deftest anvil-http-test-phase3-cache-put-updates-counter ()
+  "`--cache-put' bumps the running byte counter by body length."
+  (anvil-http-test--with-cache
+    (let ((entry (anvil-http--cache-entry
+                  200 (list :content-type "text/plain")
+                  (make-string 1000 ?a)
+                  (float-time)
+                  "https://example.com/x")))
+      (anvil-http--cache-put "https://example.com/x" entry)
+      (should (= 1000 anvil-http--cache-bytes-counter)))))
+
+(ert-deftest anvil-http-test-phase3-cache-delete-decrements-counter ()
+  "`--cache-delete' subtracts the deleted entry's body length."
+  (anvil-http-test--with-cache
+    (let ((entry (anvil-http--cache-entry
+                  200 (list :content-type "text/plain")
+                  (make-string 500 ?b)
+                  (float-time)
+                  "https://example.com/y")))
+      (anvil-http--cache-put "https://example.com/y" entry)
+      (should (= 500 anvil-http--cache-bytes-counter))
+      (anvil-http--cache-delete "https://example.com/y")
+      (should (= 0 anvil-http--cache-bytes-counter)))))
+
+(ert-deftest anvil-http-test-phase3-eviction-drops-oldest ()
+  "Going over `anvil-http-cache-size-cap-bytes' evicts oldest first."
+  (anvil-http-test--with-cache
+    (let* ((anvil-http-cache-size-cap-bytes 1700)
+           (now (float-time)))
+      ;; Three 800-byte entries → 2400 total; cap=1700 leaves room for
+      ;; two entries → the oldest is evicted on the third put.
+      (dolist (i '(1 2 3))
+        (let ((entry (anvil-http--cache-entry
+                      200 (list :content-type "text/plain")
+                      (make-string 800 ?x)
+                      (+ now i)             ; ascending fetched-at
+                      (format "https://example.com/%d" i))))
+          (anvil-http--cache-put (format "https://example.com/%d" i) entry)))
+      ;; The first entry (oldest) should have been evicted.
+      (should-not (anvil-http--cache-get "https://example.com/1"))
+      (should (anvil-http--cache-get "https://example.com/2"))
+      (should (anvil-http--cache-get "https://example.com/3"))
+      (should (>= (or (plist-get anvil-http--metrics :evictions) 0) 1))
+      (should (<= anvil-http--cache-bytes-counter
+                  anvil-http-cache-size-cap-bytes)))))
+
+(ert-deftest anvil-http-test-phase3-cache-status-payload ()
+  "`http-cache-status' returns size, entries, cap, metrics."
+  (anvil-http-test--with-cache
+    (let ((entry (anvil-http--cache-entry
+                  200 (list :content-type "text/plain")
+                  (make-string 200 ?z)
+                  (float-time)
+                  "https://example.com/s")))
+      (anvil-http--cache-put "https://example.com/s" entry)
+      (let ((p (anvil-http--cache-status-payload)))
+        (should (equal "http" (plist-get p :ns)))
+        (should (= 1 (plist-get p :entries)))
+        (should (= 200 (plist-get p :bytes)))
+        (should (numberp (plist-get p :cap)))
+        (should (= 0 (plist-get p :evictions)))))))
+
 ;;;; --- live smoke test ----------------------------------------------------
 
 (ert-deftest anvil-http-test-live-example-com ()

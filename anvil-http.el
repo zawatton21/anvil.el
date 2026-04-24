@@ -93,6 +93,21 @@
 ;;     many clients retry the same upstream simultaneously.  Set the
 ;;     ratio to 0 to restore deterministic backoff.
 ;;
+;; Phase 3 (LRU eviction + size cap + metrics) is live as of the
+;; release containing this comment:
+;;   * `anvil-http-cache-size-cap-bytes' (default 50 MB) is a soft
+;;     cap on the http cache.  When `--cache-put' would push the
+;;     total over the cap, the oldest entries (by `:fetched-at')
+;;     are evicted until the total falls back under.  Set to 0 to
+;;     disable size-cap eviction (TTL still expires lazily).
+;;   * Running byte counter `anvil-http--cache-bytes-counter' is
+;;     maintained incrementally by put/delete/clear; recomputed
+;;     from SQLite on `anvil-http-enable' so a fresh daemon starts
+;;     from truth.
+;;   * Metrics gain `:evictions' counter; `http-cache-status' MCP
+;;     tool reports entries / bytes / cap / evictions plus the
+;;     existing request-side counters for live observability.
+;;
 ;; Phase 2 (offload) is live as of the release containing this
 ;; comment:
 ;;   * `:offload t' kwarg on `anvil-http-get' / `anvil-http-post'
@@ -320,9 +335,26 @@ Long-running downloads or slow APIs should pass a per-call
   :type 'integer
   :group 'anvil-http)
 
+(defcustom anvil-http-cache-size-cap-bytes 52428800
+  "Soft byte cap on the http response cache.
+When a fresh response would push the cache over this number of
+bytes, the oldest entries (by `:fetched-at') are evicted until the
+total falls back under the cap.  0 disables size-cap eviction (TTL
+expiry still happens lazily).  The cap is approximate — only the
+body size is counted; headers and overhead are ignored."
+  :type 'integer
+  :group 'anvil-http)
+
+(defvar anvil-http--cache-bytes-counter 0
+  "Running approximation of total body bytes in the http cache.
+Maintained incrementally by `--cache-put' / `--cache-delete' /
+`--cache-clear-all'; recomputed on `anvil-http-enable' via
+`--cache-recompute-bytes'.  Soft — external mutations to
+`anvil-state' (e.g. `anvil-state-vacuum') may make this drift.")
+
 (defvar anvil-http--metrics
   (list :requests 0 :cache-fresh 0 :cache-revalidated 0
-        :network-200 0 :errors 0 :log nil)
+        :network-200 0 :errors 0 :evictions 0 :log nil)
   "Rolling counters and recent-request log.
 :log entries are (:url URL :elapsed-ms N :status N :cache SYM :at T).")
 
@@ -361,23 +393,101 @@ Lowercases scheme and host, strips fragment, keeps path+query."
       (anvil-state-get norm-url :ns anvil-http--state-ns)
     (error nil)))
 
-(defun anvil-http--cache-put (norm-url entry)
-  "Store ENTRY under NORM-URL in `anvil-state'."
+(defun anvil-http--cache-entry-size (entry)
+  "Return the body byte size of cache ENTRY, or 0 when unknown.
+Approximate — only the body is counted, headers and SQLite
+overhead are ignored.  Used by the running byte counter and by
+LRU eviction."
+  (let ((body (and entry (plist-get entry :body))))
+    (if (stringp body) (string-bytes body) 0)))
+
+(defun anvil-http--cache-recompute-bytes ()
+  "Walk the cache and reset the running byte counter to truth.
+O(n) over cache entries; called on enable so a fresh daemon
+starts from a correct counter even if SQLite has rows from a
+previous session."
   (condition-case _err
-      (anvil-state-set norm-url entry :ns anvil-http--state-ns)
-    (error nil)))
+      (let ((total 0))
+        (dolist (key (anvil-state-list-keys :ns anvil-http--state-ns))
+          (let ((entry (anvil-state-get key :ns anvil-http--state-ns)))
+            (setq total (+ total (anvil-http--cache-entry-size entry)))))
+        (setq anvil-http--cache-bytes-counter total))
+    (error (setq anvil-http--cache-bytes-counter 0))))
+
+(defun anvil-http--cache-evict-to-cap ()
+  "Drop oldest entries (by `:fetched-at') until size is at or below cap.
+Returns the number of evictions; bumps the `:evictions' metric."
+  (let ((cap anvil-http-cache-size-cap-bytes)
+        (evicted 0))
+    (when (and (numberp cap) (> cap 0)
+               (> anvil-http--cache-bytes-counter cap))
+      (let* ((rows
+              (condition-case _err
+                  (mapcar
+                   (lambda (key)
+                     (cons key (anvil-state-get
+                                key :ns anvil-http--state-ns)))
+                   (anvil-state-list-keys :ns anvil-http--state-ns))
+                (error nil)))
+             (sorted (sort rows
+                           (lambda (a b)
+                             (< (or (plist-get (cdr a) :fetched-at) 0)
+                                (or (plist-get (cdr b) :fetched-at) 0))))))
+        (while (and sorted
+                    (> anvil-http--cache-bytes-counter cap))
+          (let* ((kv (car sorted))
+                 (key (car kv))
+                 (size (anvil-http--cache-entry-size (cdr kv))))
+            (anvil-state-delete key :ns anvil-http--state-ns)
+            (setq anvil-http--cache-bytes-counter
+                  (max 0 (- anvil-http--cache-bytes-counter size)))
+            (cl-incf evicted)
+            (setq sorted (cdr sorted))))))
+    (when (> evicted 0)
+      (anvil-http--metrics-bump :evictions evicted))
+    evicted))
+
+(defun anvil-http--cache-put (norm-url entry)
+  "Store ENTRY under NORM-URL in `anvil-state' and maintain the
+running byte counter.  Triggers `--cache-evict-to-cap' when the
+write pushes the total over `anvil-http-cache-size-cap-bytes'."
+  (let* ((old (condition-case _err
+                  (anvil-state-get norm-url :ns anvil-http--state-ns)
+                (error nil)))
+         (old-size (anvil-http--cache-entry-size old))
+         (new-size (anvil-http--cache-entry-size entry))
+         (delta (- new-size old-size))
+         (result (condition-case _err
+                     (anvil-state-set norm-url entry
+                                      :ns anvil-http--state-ns)
+                   (error nil))))
+    (setq anvil-http--cache-bytes-counter
+          (max 0 (+ anvil-http--cache-bytes-counter delta)))
+    (anvil-http--cache-evict-to-cap)
+    result))
 
 (defun anvil-http--cache-delete (norm-url)
   "Drop NORM-URL from the cache.  Returns t when a row was removed."
-  (condition-case _err
-      (anvil-state-delete norm-url :ns anvil-http--state-ns)
-    (error nil)))
+  (let* ((old (condition-case _err
+                  (anvil-state-get norm-url :ns anvil-http--state-ns)
+                (error nil)))
+         (size (anvil-http--cache-entry-size old))
+         (result (condition-case _err
+                     (anvil-state-delete norm-url
+                                         :ns anvil-http--state-ns)
+                   (error nil))))
+    (when old
+      (setq anvil-http--cache-bytes-counter
+            (max 0 (- anvil-http--cache-bytes-counter size))))
+    result))
 
 (defun anvil-http--cache-clear-all ()
   "Wipe every entry in the http namespace.  Returns deleted row count."
-  (condition-case _err
-      (anvil-state-delete-ns anvil-http--state-ns)
-    (error 0)))
+  (let ((result (condition-case _err
+                    (anvil-state-delete-ns anvil-http--state-ns)
+                  (error 0))))
+    (setq anvil-http--cache-bytes-counter 0)
+    result))
 
 ;;;; --- metrics ------------------------------------------------------------
 
@@ -2121,6 +2231,34 @@ non-200 or failed."
                anvil-http-user-agent)))
      (anvil-http--robots-tool-payload url ua))))
 
+(defun anvil-http--cache-status-payload ()
+  "Return the http-cache-status response plist."
+  (anvil-state-enable)
+  (list :ns anvil-http--state-ns
+        :entries (or (anvil-state-count anvil-http--state-ns) 0)
+        :bytes anvil-http--cache-bytes-counter
+        :cap anvil-http-cache-size-cap-bytes
+        :evictions (or (plist-get anvil-http--metrics :evictions) 0)
+        :requests (or (plist-get anvil-http--metrics :requests) 0)
+        :cache-fresh (or (plist-get anvil-http--metrics :cache-fresh) 0)
+        :cache-revalidated
+        (or (plist-get anvil-http--metrics :cache-revalidated) 0)
+        :network-200 (or (plist-get anvil-http--metrics :network-200) 0)
+        :errors (or (plist-get anvil-http--metrics :errors) 0)))
+
+(defun anvil-http--tool-cache-status ()
+  "Return cache size, entry count, eviction counter, and metrics.
+
+MCP Parameters: (none)
+
+Returns (:ns :entries :bytes :cap :evictions :requests :cache-fresh
+:cache-revalidated :network-200 :errors).  The byte counter is the
+running approximation maintained by `--cache-put' / `--cache-delete';
+call `http-cache-clear' or fully reload the module to force a
+recompute (see `anvil-http--cache-recompute-bytes')."
+  (anvil-server-with-error-handling
+   (anvil-http--cache-status-payload)))
+
 (defun anvil-http--tool-cache-clear (&optional url)
   "Remove cached entries from the http namespace.
 
@@ -2219,6 +2357,19 @@ Cheap liveness / metadata probe; responses are never cached."
 removes just that entry; without, flushes every cached response.")
 
   (anvil-server-register-tool
+   #'anvil-http--tool-cache-status
+   :id "http-cache-status"
+   :intent '(http diagnostics)
+   :layer 'io
+   :server-id anvil-http--server-id
+   :description
+   "Report cache size, entry count, the size cap, the eviction
+counter, and request metrics.  Useful for confirming that LRU
+eviction is firing under load and that the size cap is being
+respected.  Read-only — does not touch the cache."
+   :read-only t)
+
+  (anvil-server-register-tool
    #'anvil-http--tool-post
    :id "http-post"
    :intent '(http)
@@ -2269,22 +2420,28 @@ Fail-open on missing or unreadable robots.txt."
 (defun anvil-http--unregister-tools ()
   "Remove every http-* MCP tool from the shared server."
   (dolist (id '("http-fetch" "http-head" "http-cache-clear"
-                "http-post" "http-fetch-batch" "http-robots-check"))
+                "http-post" "http-fetch-batch" "http-robots-check"
+                "http-cache-status"))
     (anvil-server-unregister-tool id anvil-http--server-id)))
 
 ;;;###autoload
 (defun anvil-http-enable ()
   "Register http-* MCP tools and open the anvil-state backing store.
+Recomputes the cache byte counter from the current SQLite state so
+the LRU eviction starts from truth even after a daemon restart.
 Also logs whether libxml is available so the HTML-selector engine
 is obvious from a daemon startup log — the regex-subset fallback
 handles the same selector subset but without combinators /
 pseudo-classes."
   (interactive)
   (anvil-state-enable)
+  (anvil-http--cache-recompute-bytes)
   (anvil-http--register-tools)
-  (message "anvil-http: enabled; HTML selector engine = %s"
+  (message "anvil-http: enabled; HTML selector engine = %s; cache = %s entries / %s bytes"
            (if (anvil-http--libxml-p) "libxml (primary)"
-             "regex-subset (libxml not built-in)")))
+             "regex-subset (libxml not built-in)")
+           (or (anvil-state-count anvil-http--state-ns) 0)
+           anvil-http--cache-bytes-counter))
 
 (defun anvil-http-disable ()
   "Unregister http-* MCP tools."
