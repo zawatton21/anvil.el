@@ -275,7 +275,8 @@ Cleans up the file (and its parent dir when empty) on exit."
 
 (ert-deftest anvil-session-test-install-settings-creates-all-hooks ()
   "On a settings file with no hooks, install writes all 7 entries
-and the diff reports every action as `add'."
+in Claude Code's matcher-array schema and the diff reports every
+action as `add'."
   (anvil-session-test--with-tmp-settings path
     ;; Seed with an empty JSON object so the parser has something to read.
     (with-temp-file path (insert "{}"))
@@ -291,11 +292,29 @@ and the diff reports every action as `add'."
            (hooks (gethash "hooks" written)))
       (should (plist-get r :applied))
       (should (hash-table-p hooks))
-      (should (equal (gethash "PreCompact" hooks)
+      ;; Each entry must be a vector of matcher-objects whose `hooks'
+      ;; field is itself an array of {type,command} maps.  Assert the
+      ;; schema shape AND the embedded command string.
+      (dolist (key '("PreCompact" "PostCompact" "Stop" "SessionStart"
+                     "PostToolUse" "UserPromptSubmit" "SessionEnd"))
+        (let ((val (gethash key hooks)))
+          (should (vectorp val))
+          (should (= (length val) 1))
+          (let* ((outer (aref val 0))
+                 (inner-vec (gethash "hooks" outer)))
+            (should (hash-table-p outer))
+            (should (equal (gethash "matcher" outer) ""))
+            (should (vectorp inner-vec))
+            (should (= (length inner-vec) 1))
+            (let ((inner (aref inner-vec 0)))
+              (should (hash-table-p inner))
+              (should (equal (gethash "type" inner) "command"))
+              (should (stringp (gethash "command" inner)))))))
+      (should (equal (anvil-session--hook-value-command
+                      (gethash "PreCompact" hooks))
                      "/opt/anvil-hook pre-compact $CLAUDE_SESSION_ID"))
-      (should (equal (gethash "PostCompact" hooks)
-                     "/opt/anvil-hook post-compact $CLAUDE_SESSION_ID"))
-      (should (equal (gethash "Stop" hooks)
+      (should (equal (anvil-session--hook-value-command
+                      (gethash "Stop" hooks))
                      "/opt/anvil-hook stop $CLAUDE_SESSION_ID $CLAUDE_TRANSCRIPT_PATH"))
       (should (= (length (split-string diff "\n")) 7))
       (should (string-match-p "\\+ PreCompact" diff))
@@ -305,7 +324,8 @@ and the diff reports every action as `add'."
 
 (ert-deftest anvil-session-test-install-settings-preserves-unrelated ()
   "Install only touches hooks keys it owns.  Other JSON top-level
-keys and other hook bindings (PreToolUse etc.) survive verbatim."
+keys and other hook bindings (PreToolUse etc.) survive verbatim
+regardless of the surviving hook's value shape."
   (anvil-session-test--with-tmp-settings path
     (with-temp-file path
       (insert "{\"model\":\"sonnet\",\"hooks\":{\"PreToolUse\":\"user-cmd\"}}"))
@@ -320,7 +340,8 @@ keys and other hook bindings (PreToolUse etc.) survive verbatim."
            (hooks (gethash "hooks" written)))
       (should (equal (gethash "model" written) "sonnet"))
       (should (equal (gethash "PreToolUse" hooks) "user-cmd"))
-      (should (equal (gethash "PreCompact" hooks)
+      (should (equal (anvil-session--hook-value-command
+                      (gethash "PreCompact" hooks))
                      "/opt/anvil-hook pre-compact $CLAUDE_SESSION_ID")))))
 
 (ert-deftest anvil-session-test-install-settings-dry-run-no-write ()

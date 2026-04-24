@@ -524,6 +524,49 @@ Claude Code's hooks schema is shell-like."
                               script))
     (_ (error "anvil-session: unknown hook sub-command %S" event-cli))))
 
+(defun anvil-session--claude-hook-entry (command)
+  "Wrap COMMAND shell string in Claude Code's hook-value schema.
+Claude Code rejects plain string hook values; it requires an
+array of matcher objects whose `hooks' field is itself an array
+of `{type:\"command\", command:…}' entries.  Return a 1-element
+vector of hash-tables matching that shape so `json-serialize'
+emits the documented layout."
+  (let ((inner (make-hash-table :test 'equal))
+        (outer (make-hash-table :test 'equal)))
+    (puthash "type" "command" inner)
+    (puthash "command" command inner)
+    (puthash "matcher" "" outer)
+    (puthash "hooks" (vector inner) outer)
+    (vector outer)))
+
+(defun anvil-session--hook-value-command (value)
+  "Return the shell command string embedded in Claude hook VALUE.
+Handles both the current schema (vector-of-matcher hash-tables)
+and legacy plain-string entries written by earlier anvil
+versions, so uninstall diffs stay human-readable after a
+settings-schema upgrade."
+  (cond
+   ((stringp value) value)
+   ((and (vectorp value) (> (length value) 0)
+         (hash-table-p (aref value 0)))
+    (let* ((outer (aref value 0))
+           (inner-vec (gethash "hooks" outer)))
+      (if (and (vectorp inner-vec) (> (length inner-vec) 0)
+               (hash-table-p (aref inner-vec 0)))
+          (or (gethash "command" (aref inner-vec 0))
+              (format "%S" value))
+        (format "%S" value))))
+   (t (format "%S" value))))
+
+(defun anvil-session--hook-value-equal (a b)
+  "Structural equality for Claude hook JSON values.
+`equal' compares hash-tables by identity, so two payloads with
+identical content but different allocations never match.  Encode
+both sides and compare the serialized text instead."
+  (and a b
+       (equal (json-serialize a :false-object :false :null-object :null)
+              (json-serialize b :false-object :false :null-object :null))))
+
 (defun anvil-session--read-settings (path)
   "Return the JSON object at PATH as a hash-table, or an empty one.
 Missing file → empty table so the install path never aborts on a
@@ -568,24 +611,27 @@ printout: ACTION ∈ {`add', `update', `remove', `keep'}."
        (dolist (pair anvil-session--hook-events)
          (let* ((claude-key (car pair))
                 (sub-cmd (cdr pair))
-                (desired (anvil-session--hook-command-for sub-cmd script))
+                (cmd-str (anvil-session--hook-command-for sub-cmd script))
+                (desired (anvil-session--claude-hook-entry cmd-str))
                 (existing (gethash claude-key existing-hooks)))
            (cond
             ((null existing)
              (puthash claude-key desired new)
-             (push (list 'add claude-key desired) diff))
-            ((equal existing desired)
-             (push (list 'keep claude-key desired) diff))
+             (push (list 'add claude-key cmd-str) diff))
+            ((anvil-session--hook-value-equal existing desired)
+             (push (list 'keep claude-key cmd-str) diff))
             (t
              (puthash claude-key desired new)
-             (push (list 'update claude-key desired) diff))))))
+             (push (list 'update claude-key cmd-str) diff))))))
       ('uninstall
        (dolist (pair anvil-session--hook-events)
          (let* ((claude-key (car pair))
                 (existing (gethash claude-key existing-hooks)))
            (when existing
              (remhash claude-key new)
-             (push (list 'remove claude-key existing) diff))))))
+             (push (list 'remove claude-key
+                         (anvil-session--hook-value-command existing))
+                   diff))))))
     (cons new (nreverse diff))))
 
 (defun anvil-session--format-diff (diff)
