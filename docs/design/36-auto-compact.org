@@ -1,17 +1,23 @@
 #+title: anvil-compact — autonomous /compact orchestration
 #+date: 2026-04-24
 #+author: zawatton
-#+property: status PHASE-1-SHIPPED
+#+property: status PHASE-1-2-SHIPPED
 #+property: scope CONVENTION-COUPLED
 
 * STATUS
   :PROPERTIES:
   :ID:       d1c4e0f2-8f44-4f7c-bc1a-auto-compact-36
   :END:
-~Phase 1 SHIPPED~ (2026-04-24) — =anvil-compact.el= + 5 MCP tool
-+ 3 hook entry + 28 ERT。Stop / UserPromptSubmit / SessionStart
-経由の auto-compact cycle が稼働、threshold 45% / cooldown 25%
-デフォルト。Phase 2-3 は DRAFT のまま。
+~Phase 1 + 2 SHIPPED~ (2026-04-24) — =anvil-compact.el= +
+=anvil-session= PreCompact/PostCompact 統合 + 5 MCP tool (stage
+拡張) + 41 ERT。Stop / UserPromptSubmit / SessionStart / PreCompact
+/ PostCompact 5 hook 経由の auto-compact cycle が稼働。snapshot
+は anvil-session recent events を自動埋め込み、PostCompact で
+restore-queue にエンキューされ次ターン (UserPromptSubmit or
+SessionStart) で pop される。threshold 45% / cooldown 25% /
+event-log-limit 10 デフォルト。semantic-summary は defcustom opt-in
+の hook だけ残し、orchestrator 呼び出しは Phase 3 送り。Phase 3
+(observability + stats + auto-tuning) のみ DRAFT。
 
 autonomous Claude Code 運用で context 使用率が aggressive 閾値
 (既定 45%) を越えた時、タスク segment boundary を検出して Claude

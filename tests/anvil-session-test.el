@@ -274,7 +274,7 @@ Cleans up the file (and its parent dir when empty) on exit."
        (ignore-errors (delete-file ,var)))))
 
 (ert-deftest anvil-session-test-install-settings-creates-all-hooks ()
-  "On a settings file with no hooks, install writes all 6 entries
+  "On a settings file with no hooks, install writes all 7 entries
 and the diff reports every action as `add'."
   (anvil-session-test--with-tmp-settings path
     ;; Seed with an empty JSON object so the parser has something to read.
@@ -293,10 +293,13 @@ and the diff reports every action as `add'."
       (should (hash-table-p hooks))
       (should (equal (gethash "PreCompact" hooks)
                      "/opt/anvil-hook pre-compact $CLAUDE_SESSION_ID"))
+      (should (equal (gethash "PostCompact" hooks)
+                     "/opt/anvil-hook post-compact $CLAUDE_SESSION_ID"))
       (should (equal (gethash "Stop" hooks)
                      "/opt/anvil-hook stop $CLAUDE_SESSION_ID $CLAUDE_TRANSCRIPT_PATH"))
-      (should (= (length (split-string diff "\n")) 6))
+      (should (= (length (split-string diff "\n")) 7))
       (should (string-match-p "\\+ PreCompact" diff))
+      (should (string-match-p "\\+ PostCompact" diff))
       (should (string-match-p "\\+ Stop" diff))
       (should (string-match-p "\\+ SessionStart" diff)))))
 

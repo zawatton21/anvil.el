@@ -422,10 +422,18 @@ the shell wrapper does not crash the Claude hook pipeline."
        (let* ((session-id (or (nth 0 args) "unknown"))
               (task-summary (nth 1 args))
               (notes (nth 2 args))
-              (name (anvil-session--auto-snapshot-name session-id)))
-         (anvil-session-snapshot name
-                                 :task-summary task-summary
-                                 :notes notes)))
+              (name (anvil-session--auto-snapshot-name session-id))
+              (snap (anvil-session-snapshot name
+                                            :task-summary task-summary
+                                            :notes notes)))
+         (when (fboundp 'anvil-compact-on-pre-compact)
+           (funcall (intern "anvil-compact-on-pre-compact") session-id))
+         snap))
+      ('post-compact
+       (let* ((session-id (or (nth 0 args) "unknown")))
+         (if (fboundp 'anvil-compact-on-post-compact)
+             (funcall (intern "anvil-compact-on-post-compact") session-id)
+           (list :decision :compact-not-loaded))))
       ('stop
        (let* ((session-id (or (nth 0 args) "unknown"))
               (transcript-path (nth 1 args)))
@@ -477,6 +485,7 @@ the shell wrapper does not crash the Claude hook pipeline."
 
 (defconst anvil-session--hook-events
   '(("PreCompact"       . "pre-compact")
+    ("PostCompact"      . "post-compact")
     ("Stop"             . "stop")
     ("SessionStart"     . "session-start")
     ("PostToolUse"      . "post-tool-use")
@@ -496,6 +505,8 @@ excerpt.  This is a plain string rather than an argv list because
 Claude Code's hooks schema is shell-like."
   (pcase event-cli
     ("pre-compact"    (format "%s pre-compact $CLAUDE_SESSION_ID"
+                              script))
+    ("post-compact"   (format "%s post-compact $CLAUDE_SESSION_ID"
                               script))
     ("stop"           (format
                        "%s stop $CLAUDE_SESSION_ID $CLAUDE_TRANSCRIPT_PATH"

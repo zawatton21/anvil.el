@@ -337,4 +337,174 @@
   (anvil-compact-test--with-fresh-state
     (should (equal "" (anvil-compact--tool-hook "sid" "unknown" "")))))
 
+
+;;;; --- Phase 2: restore-queue --------------------------------------------
+
+(ert-deftest anvil-compact-test-queue-empty-pop-returns-nil ()
+  (anvil-compact-test--with-fresh-state
+    (should (null (anvil-compact--queue-pop "sid")))
+    (should (= 0 (anvil-compact--queue-length "sid")))))
+
+(ert-deftest anvil-compact-test-queue-fifo ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact--queue-push "sid" 'first)
+    (anvil-compact--queue-push "sid" 'second)
+    (should (= 2 (anvil-compact--queue-length "sid")))
+    (should (eq 'first  (anvil-compact--queue-pop "sid")))
+    (should (eq 'second (anvil-compact--queue-pop "sid")))
+    (should (null (anvil-compact--queue-pop "sid")))))
+
+
+;;;; --- Phase 2: on-pre-compact ------------------------------------------
+
+(ert-deftest anvil-compact-test-on-pre-compact-no-snapshot-returns-nil ()
+  (anvil-compact-test--with-fresh-state
+    (should (null (anvil-compact-on-pre-compact "sid")))))
+
+(ert-deftest anvil-compact-test-on-pre-compact-refreshes-existing ()
+  "PreCompact should re-stamp the snapshot so captured-at advances."
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid"
+                                    :task-summary "t"
+                                    :branch "main"
+                                    :percent 50)
+    (let ((before (plist-get (anvil-compact-snapshot-get "sid") :captured-at)))
+      (sleep-for 1.0)  ; ensure timestamp second bucket advances
+      (anvil-compact-on-pre-compact "sid")
+      (let ((after (plist-get (anvil-compact-snapshot-get "sid") :captured-at)))
+        (should (stringp before))
+        (should (stringp after))
+        (should-not (equal before after))))))
+
+
+;;;; --- Phase 2: on-post-compact ------------------------------------------
+
+(ert-deftest anvil-compact-test-on-post-compact-enqueues-and-stamps ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid"
+                                    :task-summary "post-compact target"
+                                    :percent 50)
+    (let ((r (anvil-compact-on-post-compact "sid")))
+      (should r)
+      (should (= 1 (anvil-compact--queue-length "sid")))
+      (should (= 50 (anvil-compact--state-get
+                     "sid" "last-compact-percent"))))))
+
+(ert-deftest anvil-compact-test-on-post-compact-no-snapshot-nop ()
+  (anvil-compact-test--with-fresh-state
+    (should (null (anvil-compact-on-post-compact "sid")))
+    (should (= 0 (anvil-compact--queue-length "sid")))))
+
+
+;;;; --- Phase 2: queue consumption by on-session-start / on-user-prompt --
+
+(ert-deftest anvil-compact-test-session-start-prefers-queue ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid"
+                                    :task-summary "latest snapshot"
+                                    :percent 30)
+    (anvil-compact--queue-push "sid"
+                               (list :captured-at "2026-04-24T00:00:00+0900"
+                                     :percent 50
+                                     :task-summary "queued restore"
+                                     :branch ""
+                                     :files nil
+                                     :todos nil))
+    (let* ((out (anvil-compact-on-session-start "sid"))
+           (parsed (json-parse-string out :object-type 'alist
+                                          :array-type 'list
+                                          :null-object nil
+                                          :false-object nil)))
+      (let* ((hso (alist-get 'hookSpecificOutput parsed))
+             (ctx (alist-get 'additionalContext hso)))
+        (should (string-match-p "queued restore" ctx))
+        ;; Queue was popped, next call falls through to latest snapshot
+        (let* ((out2 (anvil-compact-on-session-start "sid"))
+               (parsed2 (json-parse-string out2 :object-type 'alist
+                                                :array-type 'list
+                                                :null-object nil
+                                                :false-object nil)))
+          (should (string-match-p "latest snapshot"
+                                  (alist-get 'additionalContext
+                                             (alist-get 'hookSpecificOutput
+                                                        parsed2)))))))))
+
+(ert-deftest anvil-compact-test-user-prompt-falls-back-to-queue ()
+  "When no pending-nudge flag, UserPromptSubmit should pop a queued
+restore (PostCompact path)."
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact--queue-push "sid"
+                               (list :captured-at "2026-04-24T00:00:00+0900"
+                                     :percent 50
+                                     :task-summary "queued via post-compact"
+                                     :branch ""
+                                     :files nil
+                                     :todos nil))
+    (let* ((out (anvil-compact-on-user-prompt "sid"))
+           (parsed (json-parse-string out :object-type 'alist
+                                          :array-type 'list
+                                          :null-object nil
+                                          :false-object nil)))
+      (let ((ctx (alist-get 'additionalContext
+                            (alist-get 'hookSpecificOutput parsed))))
+        (should (string-match-p "queued via post-compact" ctx))))))
+
+
+;;;; --- Phase 2: event log embedding -------------------------------------
+
+(ert-deftest anvil-compact-test-snapshot-embeds-explicit-events ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture
+     "sid"
+     :task-summary "x"
+     :percent 50
+     :events (list (list :kind "tool-use" :summary "file-read")
+                   (list :kind "tool-use" :summary "elisp-ert-run")))
+    (let* ((snap (anvil-compact-snapshot-get "sid"))
+           (events (plist-get snap :events)))
+      (should (= 2 (length events)))
+      (should (equal "file-read" (plist-get (nth 0 events) :summary))))))
+
+(ert-deftest anvil-compact-test-snapshot-format-renders-events ()
+  (let* ((snap (list :captured-at "2026-04-24T00:00:00+0900"
+                     :percent 50
+                     :task-summary "x"
+                     :branch ""
+                     :files nil
+                     :todos nil
+                     :events (list (list :kind "tool-use"
+                                         :summary "file-read")
+                                   (list :kind "user-prompt"
+                                         :summary "next step"))))
+         (text (anvil-compact-snapshot-format snap)))
+    (should (string-match-p "recent events (2)" text))
+    (should (string-match-p "tool-use: file-read" text))
+    (should (string-match-p "user-prompt: next step" text))))
+
+(ert-deftest anvil-compact-test-include-event-log-nil-drops-events ()
+  (anvil-compact-test--with-fresh-state
+    (let ((anvil-compact-include-event-log nil))
+      (anvil-compact-snapshot-capture
+       "sid" :task-summary "x" :percent 50
+       :events (list (list :kind "tool-use" :summary "should-be-dropped"))))
+    (let ((snap (anvil-compact-snapshot-get "sid")))
+      (should (null (plist-get snap :events))))))
+
+
+;;;; --- Phase 2: MCP compact-hook new stages -----------------------------
+
+(ert-deftest anvil-compact-test-tool-hook-pre-compact-roundtrip ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid" :task-summary "t" :percent 50)
+    (let ((out (anvil-compact--tool-hook "sid" "pre-compact" "")))
+      (should (stringp out))
+      ;; Return is `prin1-to-string' of the refreshed snapshot plist
+      (should (string-match-p ":task-summary" out)))))
+
+(ert-deftest anvil-compact-test-tool-hook-post-compact-enqueues ()
+  (anvil-compact-test--with-fresh-state
+    (anvil-compact-snapshot-capture "sid" :task-summary "t" :percent 50)
+    (anvil-compact--tool-hook "sid" "post-compact" "")
+    (should (= 1 (anvil-compact--queue-length "sid")))))
+
 ;;; anvil-compact-test.el ends here

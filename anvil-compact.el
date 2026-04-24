@@ -107,6 +107,32 @@ list summary in the snapshot."
   :type 'boolean
   :group 'anvil-compact)
 
+(defcustom anvil-compact-include-event-log t
+  "When non-nil, snapshots embed the most recent anvil-session
+events for the session (loads only when `anvil-session' is
+available — falls back to nil otherwise, non-fatal).  Recent
+events help Claude reconstruct `what tools I just ran' context
+after /compact wipes the detailed history."
+  :type 'boolean
+  :group 'anvil-compact)
+
+(defcustom anvil-compact-event-log-limit 10
+  "Maximum number of recent events to embed in a snapshot."
+  :type 'integer
+  :group 'anvil-compact)
+
+(defcustom anvil-compact-semantic-summary-enabled nil
+  "When non-nil, snapshots also embed an LLM-generated 1-2
+paragraph summary of the session via
+`anvil-orchestrator-submit-and-collect'.  Opt-in because each
+summary costs an orchestrator round-trip; leave nil until the
+plain-text snapshot proves insufficient in practice.  Doc 36
+Phase 2 ships the defcustom + hook points but the actual
+orchestrator call is reserved for a follow-up so Phase 2 stays
+self-contained."
+  :type 'boolean
+  :group 'anvil-compact)
+
 (defconst anvil-compact--server-id "emacs-eval"
   "Server ID for the compact-* MCP tools.")
 
@@ -144,6 +170,34 @@ structures (plists / alists / strings) round-trip cleanly."
   "Clear the pending-nudge flag for SESSION-ID (idempotent)."
   (anvil-state-delete (anvil-compact--state-key session-id "pending-nudge")
                       :ns anvil-compact--state-ns))
+
+(defun anvil-compact--queue-push (session-id value)
+  "Append VALUE to the restore-queue for SESSION-ID.
+The queue is FIFO — `--queue-pop' returns the oldest item first.
+Idempotent with respect to existing queue contents."
+  (let ((q (anvil-compact--state-get session-id "restore-queue" '())))
+    (anvil-compact--state-put session-id "restore-queue"
+                              (append q (list value)))))
+
+(defun anvil-compact--queue-pop (session-id)
+  "Pop and return the oldest value from the restore-queue for
+SESSION-ID, or nil when the queue is empty / absent.  Deletes the
+queue key when the last element is removed."
+  (let ((q (anvil-compact--state-get session-id "restore-queue")))
+    (when (and q (listp q) (not (null q)))
+      (let ((head (car q))
+            (rest (cdr q)))
+        (if rest
+            (anvil-compact--state-put session-id "restore-queue" rest)
+          (anvil-state-delete
+           (anvil-compact--state-key session-id "restore-queue")
+           :ns anvil-compact--state-ns))
+        head))))
+
+(defun anvil-compact--queue-length (session-id)
+  "Return the current restore-queue length for SESSION-ID."
+  (let ((q (anvil-compact--state-get session-id "restore-queue" '())))
+    (if (listp q) (length q) 0)))
 
 
 ;;;; --- token / percent estimation ------------------------------------------
@@ -243,13 +297,33 @@ decision and log REASON for observability."
 
 ;;;; --- snapshot ------------------------------------------------------------
 
+(defun anvil-compact--collect-events (session-id explicit)
+  "Return the event list to embed in a snapshot for SESSION-ID.
+EXPLICIT, when non-nil, is used verbatim (caller supplied).
+Otherwise, when `anvil-compact-include-event-log' is non-nil and
+`anvil-session-events-recent' is available, the most recent
+events (up to `anvil-compact-event-log-limit') are returned.
+Degrades to nil whenever anvil-session is absent — the caller
+treats nil as `no event log' without raising."
+  (cond
+   (explicit explicit)
+   ((and anvil-compact-include-event-log
+         (fboundp 'anvil-session-events-recent))
+    (condition-case nil
+        (funcall (intern "anvil-session-events-recent")
+                 :session-id session-id
+                 :limit anvil-compact-event-log-limit)
+      (error nil)))
+   (t nil)))
+
 (cl-defun anvil-compact-snapshot-capture (session-id
                                           &key
                                           task-summary
                                           files
                                           todos
                                           branch
-                                          percent)
+                                          percent
+                                          events)
   "Capture a snapshot plist for SESSION-ID and store it in state.
 TASK-SUMMARY is a short free-text string summarising the current
 logical work unit — this is what the post-compact continuation
@@ -258,21 +332,28 @@ FILES is a list of file-path strings touched recently.
 TODOS is a free-form string or list describing pending tasks.
 BRANCH is the current git branch.
 PERCENT is the measured context percent at snapshot time.
+EVENTS, when supplied, is the explicit event list to embed.
+When nil, Phase 2 auto-collects the latest anvil-session events
+if `anvil-compact-include-event-log' is on and the session
+module is loaded.
 
 Respects `anvil-compact-snapshot-include-files' and
 `anvil-compact-snapshot-include-todos' — when those are nil the
 corresponding fields are dropped to minimise snapshot size.
 
 Returns the stored snapshot plist."
-  (let ((snap
-         (list :captured-at (format-time-string "%Y-%m-%dT%H:%M:%S%z")
-               :percent      (or percent 0)
-               :task-summary (or task-summary "")
-               :branch       (or branch "")
-               :files        (when anvil-compact-snapshot-include-files
-                               (or files '()))
-               :todos        (when anvil-compact-snapshot-include-todos
-                               (or todos "")))))
+  (let* ((collected (anvil-compact--collect-events session-id events))
+         (snap
+          (list :captured-at (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                :percent      (or percent 0)
+                :task-summary (or task-summary "")
+                :branch       (or branch "")
+                :files        (when anvil-compact-snapshot-include-files
+                                (or files '()))
+                :todos        (when anvil-compact-snapshot-include-todos
+                                (or todos ""))
+                :events       (when anvil-compact-include-event-log
+                                collected))))
     (anvil-compact--state-put session-id "snapshot" snap)
     snap))
 
@@ -314,6 +395,16 @@ blank labels."
                           (mapconcat (lambda (x) (format "%s" x)) todos "; ")
                         todos))
               parts))
+      (let ((events (plist-get snap :events)))
+        (when (and events (listp events))
+          (push (format "  recent events (%d):" (length events)) parts)
+          (dolist (e events)
+            (let ((kind (and (listp e) (plist-get e :kind)))
+                  (summary (and (listp e) (plist-get e :summary))))
+              (push (format "    - %s: %s"
+                            (or kind "?")
+                            (or summary ""))
+                    parts)))))
       (mapconcat #'identity (nreverse parts) "\n"))))
 
 
@@ -333,6 +424,40 @@ Code 2026-04's hook-output contract."
 
 
 ;;;; --- hook entries --------------------------------------------------------
+
+(defun anvil-compact-on-pre-compact (session-id &rest _args)
+  "PreCompact-hook entry point — refresh the parked snapshot.
+Runs just before the harness executes `/compact'.  Re-times the
+existing Stop-time snapshot so the post-compact restore carries
+the most recent captured-at + any event-log updates since Stop.
+Returns the refreshed snapshot plist or nil when no snapshot is
+parked."
+  (let ((existing (anvil-compact-snapshot-get session-id)))
+    (when existing
+      (anvil-compact-snapshot-capture
+       session-id
+       :task-summary (plist-get existing :task-summary)
+       :branch (plist-get existing :branch)
+       :files (plist-get existing :files)
+       :todos (plist-get existing :todos)
+       :percent (plist-get existing :percent)))))
+
+(defun anvil-compact-on-post-compact (session-id)
+  "PostCompact-hook entry point — enqueue snapshot for next turn.
+Also records `last-compact-percent' and `last-compact-time' so
+`anvil-compact-should-trigger' can honour cooldown against the
+just-completed compact cycle.  Returns the enqueued snapshot or
+nil when no snapshot was parked (which would be unusual but not
+an error — e.g. the harness auto-compact ran without a prior
+anvil-compact trigger)."
+  (let ((snap (anvil-compact-snapshot-get session-id)))
+    (when snap
+      (anvil-compact--queue-push session-id snap)
+      (anvil-compact--state-put session-id "last-compact-percent"
+                                (or (plist-get snap :percent) 0))
+      (anvil-compact--state-put session-id "last-compact-time"
+                                (float-time))
+      snap)))
 
 (cl-defun anvil-compact-on-stop (session-id
                                  &key
@@ -372,16 +497,19 @@ the Stop hook itself does not need to emit additional context."
           :percent  pct)))
 
 (defun anvil-compact-on-user-prompt (session-id)
-  "UserPromptSubmit-hook entry point — emit /compact nudge.
-If the `pending-nudge' flag is set for SESSION-ID, returns a JSON
-string suitable for Claude Code's hook stdout that instructs the
-model to invoke `/compact' with a continuation hint drawn from
-the parked snapshot.  Clears the flag (idempotent).  Returns an
-empty string when no nudge is pending so the caller can always
-forward stdout unconditionally."
+  "UserPromptSubmit-hook entry point — emit nudge or queued restore.
+Priority (highest first):
+
+1. If the `pending-nudge' flag is set, emit the /compact nudge
+   (Phase 1 behaviour): cleared idempotently, JSON additionalContext
+   tells the model to invoke `/compact'.
+2. Else if the restore-queue has a pending item (PostCompact put it
+   there), pop it and emit as restore preamble so the model sees
+   the pre-compact state even though /compact wiped history.
+3. Else return empty string (hook caller forwards verbatim)."
   (let ((flag (anvil-compact--state-get session-id "pending-nudge")))
-    (if (not flag)
-        ""
+    (cond
+     (flag
       (anvil-compact--state-clear-flag session-id)
       (let* ((snap (anvil-compact-snapshot-get session-id))
              (preamble (or (anvil-compact-snapshot-format snap)
@@ -400,22 +528,32 @@ forward stdout unconditionally."
                           "現タスク"))))
         (anvil-compact--json-additional-context
          "UserPromptSubmit"
-         (concat preamble "\n\n" body))))))
+         (concat preamble "\n\n" body))))
+     (t
+      (let ((queued (anvil-compact--queue-pop session-id)))
+        (if (not queued)
+            ""
+          (let ((preamble (or (anvil-compact-snapshot-format queued)
+                              "[anvil-compact restore]")))
+            (if (string-empty-p preamble)
+                ""
+              (anvil-compact--json-additional-context
+               "UserPromptSubmit" preamble)))))))))
 
 (defun anvil-compact-on-session-start (session-id)
   "SessionStart-hook entry point — emit parked snapshot as preamble.
-Returns the snapshot as JSON additionalContext so the new session
-starts pre-loaded with the cross-compact continuation hint.  When
-no snapshot exists returns an empty string."
-  (let ((snap (anvil-compact-snapshot-get session-id)))
+Prefers a queued restore (PostCompact-enqueued) over the plain
+latest snapshot so cross-compact continuation wins when both are
+present.  Returns JSON additionalContext or an empty string."
+  (let* ((queued (anvil-compact--queue-pop session-id))
+         (snap   (or queued (anvil-compact-snapshot-get session-id))))
     (if (not snap)
         ""
       (let ((preamble (anvil-compact-snapshot-format snap)))
         (if (or (null preamble) (string-empty-p preamble))
             ""
           (anvil-compact--json-additional-context
-           "SessionStart"
-           preamble))))))
+           "SessionStart" preamble))))))
 
 
 ;;;; --- MCP tools -----------------------------------------------------------
@@ -483,7 +621,8 @@ MCP Parameters:
 MCP Parameters:
   session_id      - Claude Code session identifier
   stage           - one of \"stop\", \"user-prompt\",
-                    \"session-start\".  Other values return the
+                    \"session-start\", \"pre-compact\",
+                    \"post-compact\".  Other values return the
                     empty string.
   transcript_path - absolute path to the JSONL transcript (only
                     consulted for stage=\"stop\"; ignored
@@ -496,6 +635,10 @@ MCP Parameters:
                           :transcript-path transcript_path)))
       ("user-prompt"    (anvil-compact-on-user-prompt session_id))
       ("session-start"  (anvil-compact-on-session-start session_id))
+      ("pre-compact"    (prin1-to-string
+                         (anvil-compact-on-pre-compact session_id)))
+      ("post-compact"   (prin1-to-string
+                         (anvil-compact-on-post-compact session_id)))
       (_ ""))))
 
 
