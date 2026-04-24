@@ -181,7 +181,7 @@ capabilities directly.  Highlights:
 | Capability | What it does |
 |------------+--------------|
 | =anvil-orchestrator= | Fan out one prompt to up to five AI CLIs (=claude= / =aider= / =gemini= / =ollama= / =codex=) in parallel. Jaccard consensus + meta-LLM judge + DAG dependencies + =anvil-cron= integration for nightly PDCA loops |
-| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness across all =~/.claude/projects/*/memory/*.md= |
+| =anvil-memory= (v0.4.0) | Auto-memory engine with Bayesian TTL + FTS5 full-text search.  16 MCP tools: memory-scan / -audit / -search / -duplicates / -promote, etc.  Surfaces stale rows, detects contradictions, tracks URL liveness.  Multi-provider: auto-detects =~/.claude/projects/*/memory/=, =~/.codex/memories/=, =~/.gemini/memories/=, Continue / Aider / Cline / Cursor — one SQLite DB shared across every AI CLI the user has installed |
 | =anvil-tools-by-intent= + =anvil-manifest= (v0.4.0) | Intent-based tool discovery plus =ANVIL_PROFILE= filter.  Tools tagged with =:intent / :layer / :stability= are discoverable via runtime query; =agent= / =edit= / =ultra= profiles shrink =tools/list= ~3-7× for orchestrator child sessions (full ~20k → ultra ~2.7k tokens of manifest) |
 | =anvil-sexp= / =sexp-cst= / =py= / =ts= / =js= (v0.4.0) | Language-aware structural edits.  Reader-based Elisp edits, tree-sitter CST for Python / TypeScript / TSX / JavaScript — AST-level refactors without touching whole files |
 | =anvil-session= + Claude Code hooks (v0.4.0) | Session snapshot / resume + 5 lifecycle hooks (PreCompact / SessionStart / PostToolUse / UserPromptSubmit / SessionEnd).  Captures branch + task summary with 14-day TTL so session restarts don't re-cold |
@@ -789,6 +789,81 @@ Phase 2 adds:
   worker-vs-main-daemon trade-off.
 
 Requires Emacs 29+ (via =anvil-state=).
+
+** Memory module (optional) — indexing auto-memory across AI CLIs
+
+The =memory= module is an opt-in, provider-agnostic index over
+every =.md= auto-memory file on disk, so any MCP client (Claude
+Code, Codex CLI, Gemini CLI, Continue, Aider, Cline, Cursor, …)
+can share the same long-term context.
+
+Enable it:
+
+#+begin_src emacs-lisp
+(add-to-list 'anvil-optional-modules 'memory)
+(anvil-enable)   ; reload the module set
+#+end_src
+
+Then index everything currently on disk:
+
+#+begin_src text
+;; From Emacs:
+M-x anvil-memory-scan
+
+;; From an MCP client:
+call the `memory-scan' tool (no args)
+#+end_src
+
+=memory-scan= walks every directory matched by
+=anvil-memory-provider-paths= (default below), inserts one row per
+=.md= (=MEMORY.md= index files are skipped), and refreshes the FTS5
+body index.  It is idempotent — existing =access_count= /
+=validity_prior= rows are preserved on conflict, so you can rerun
+it anytime.
+
+Default provider map (edit to add your own):
+
+#+begin_src emacs-lisp
+(setq anvil-memory-provider-paths
+      '((claude   . "~/.claude/projects/*/memory")
+        (codex    . "~/.codex/memories")
+        (gemini   . "~/.gemini/memories")
+        (continue . "~/.continue/memories")
+        (aider    . "~/.aider/memories")
+        (cline    . "~/.cline/memories")
+        (cursor   . "~/.cursor/memories")
+        (windsurf . "~/.windsurf/memories")
+        (zed      . "~/.config/zed/memories")))
+#+end_src
+
+Patterns may contain =*= globs.  Non-existent expansions are
+dropped silently, so adding a provider you have not installed
+costs nothing.  Set =anvil-memory-roots= to a fixed list when you
+want to override auto-detection entirely (tests / sandboxes use
+this).
+
+Once indexed, all of the normal tools operate across providers in
+a single SQLite DB (=~/.emacs.d/anvil-memory-index.db=):
+
+- =memory-search QUERY= — FTS5 full-text across every provider's
+  memory body (=:limit=, =:type= keyword filters supported).
+- =memory-audit= — TTL check; =:with_urls t= pings reference
+  URLs via =anvil-http-head=.
+- =memory-list= — all rows with optional =:with-decay t
+  :sort 'decay= ranking.
+- =memory-save-check SUBJECT BODY= — Jaccard top-N duplicate
+  candidates before you write a new memory (provider-agnostic).
+- =memory-duplicates= — cross-provider near-duplicate pairs.
+- =memory-promote OLD NEW-TYPE= — rename + re-index, useful
+  when a row that started as =project_= matures into =user_=.
+- =memory-regenerate-index= — emit a fresh =MEMORY.md= body
+  sorted by decay-score (read-only output; the caller decides
+  whether to write).
+
+Non-Claude clients reach these by connecting to the same anvil
+MCP server; the module never writes into =.md= files (promote is
+the only file operation, and that is a rename), so it is safe to
+point at memory directories managed by other tools.
 
 ** Git helpers
 

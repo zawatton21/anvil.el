@@ -8,14 +8,15 @@
   :PROPERTIES:
   :ID:       c6f05c1e-72a6-4e3b-87a6-d0a6a3b7c004
   :END:
-~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3 (a/b/c) SHIPPED~ (2026-04-22、
-9 stacked feat branches) — Week-3 Ship 4、競合 token-savior の
-"memory engine" を anvil + Claude Code auto-memory に統合する完成
-実装。非 destructive (metadata layer のみ SQLite、memory =.md=
-files の rename 以外は不変) で foundation + 検出 + ranking &
-lifecycle + tokenizer swap + LLM verdict + MDL distillation +
-static HTML viewer + live TCP server + contradiction store & graph
-を全カバー。Phase 4 (cross-project) のみ optional / 未着手。
+~Phase 1a + 1b + 2a + 2b (i/ii/iii) + 3 (a/b/c) + 4a SHIPPED~
+(2026-04-22 / 4a: 2026-04-24、10 stacked feat branches) — Week-3
+Ship 4、競合 token-savior の "memory engine" を anvil + Claude
+Code auto-memory に統合する完成実装。非 destructive (metadata
+layer のみ SQLite、memory =.md= files の rename 以外は不変) で
+foundation + 検出 + ranking & lifecycle + tokenizer swap + LLM
+verdict + MDL distillation + static HTML viewer + live TCP server
++ contradiction store & graph + multi-provider scan を全カバー。
+Phase 4b (global user-layer promote) のみ optional / 未着手。
 
 *Phase 1a (feat/doc-29-memory-engine-phase1a):* =anvil-memory.el=
 metadata 索引 + scan + per-type TTL audit + access tracker + 4
@@ -549,10 +550,44 @@ duplicate 蓄積を防ぐ最短 pattern。
 
 commit: =dd83c36= (test-lock、13 ERT) → =cf6cbae= (impl、+262 行)。
 
-** Phase 4 — cross-project memory
+** Phase 4 — cross-project / cross-provider memory
+
+*** Phase 4a — multi-provider roots (SHIPPED, 2026-04-24)
+
+Provider-agnostic scan。=anvil-memory-provider-paths= defcustom
+で auto-detect 対象を拡張し、Claude Code 以外の AI CLI
+(=~/.codex/memories/=、=~/.gemini/memories/=、
+=~/.continue/memories/=、=~/.aider/memories/=、
+=~/.cline/memories/=、=~/.cursor/memories/=、=~/.windsurf/memories/=、
+=~/.config/zed/memories/=) を同一 SQLite DB に統合索引。
+
+- 実装: =anvil-memory--expand-provider-pattern PATTERN= 新規
+  helper で glob 展開 + 存在確認 (非存在は silent skip)。
+- 旧 =anvil-memory--effective-roots= は alist を loop して集約、
+  deduplicate (symlink / 冗長 entry で 1 枚に寄せる)、order は
+  alist 並びを保存。
+- =anvil-memory-roots= (explicit list) が非 nil の場合の override
+  挙動は不変 (テスト / sandbox 互換)。
+- schema 変更なし。将来 provider column を加える場合は Phase 4b。
+- MCP tool は既存のまま (=memory-scan= が複数 root を walk する
+  だけ)。他プロバイダの MCP クライアントからも =memory-search=
+  等を同じ DB に対して呼べる = AI 間での記憶継承が 1 テーブルで
+  実現。
+- ERT 5 test (expand-glob / expand-missing / multi-provider /
+  dedupe / explicit-roots-overrides)。total 120/120 pass。
+
+commit 予定: test-lock → impl → doc。
+
+*** Phase 4b — global user-layer promote (deferred)
 
 現状 memory は project 単位 (=~/.claude/projects/<proj-hash>/=)。
-共通 memory (user 型) を promote して global layer に移す機能。
+共通 memory (user 型) を promote して global layer
+(例: =~/.anvil-memory/global/=) に移す機能。
+Phase 4a で multi-provider の scan は解決したので、cross-project
+集約は Phase 4b として独立。
+設計ポイント: (1) global DB vs global dir + existing DB 全部
+index のどちらにするか、(2) 同一 subject の重複 merge、(3)
+provider-specific convention の統一。未着手。
 
 * Testing strategy
 
