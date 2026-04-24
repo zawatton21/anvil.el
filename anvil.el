@@ -97,10 +97,24 @@ These are not loaded by default.  Available modules:
                 + task-summary + notes into anvil-state ns=session
                 (TTL 14d) and returns a `preamble-suggested' resume
                 block; `session-resume' / -list / -delete round out
-                the primitive set.  Phase 3 hooks (PreCompact,
+                the primitive set.  Phase 3 hooks (PreCompact, Stop,
                 SessionStart, PostToolUse, UserPromptSubmit,
                 SessionEnd) and the anvil-hook install command ship
                 under the same module (Doc 17, requires `state')
+- `compact'   — Autonomous /compact orchestration (Doc 36 Phase 1).
+                Aggressive auto-compact layer: Stop hook triggers a
+                segment-boundary snapshot + nudge when transcript
+                crosses a configurable threshold (default 45%,
+                cooldown 25%); UserPromptSubmit emits a JSON
+                additionalContext telling the model to invoke
+                /compact on the next turn; SessionStart restores
+                the parked snapshot as preamble.  Complements
+                Claude Code's hardcoded ~83.5% auto-compact with a
+                user-tunable earlier trigger for long autonomous
+                sessions.  Requires `state' and integrates with
+                `session' (Stop event).  Five MCP tools: compact-
+                estimate / -should-trigger / -snapshot / -restore /
+                -hook.
 - `http'      — HTTP client via `url-retrieve-synchronously' with a
                 state-backed ETag/TTL cache (Doc 09 Phase 1a)
 - `orchestrator' — Parallel AI CLI dispatcher (claude today, more

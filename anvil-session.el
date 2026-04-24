@@ -426,12 +426,28 @@ the shell wrapper does not crash the Claude hook pipeline."
          (anvil-session-snapshot name
                                  :task-summary task-summary
                                  :notes notes)))
+      ('stop
+       (let* ((session-id (or (nth 0 args) "unknown"))
+              (transcript-path (nth 1 args)))
+         (if (fboundp 'anvil-compact-on-stop)
+             (funcall (intern "anvil-compact-on-stop")
+                      session-id
+                      :transcript-path transcript-path)
+           (list :decision :compact-not-loaded))))
       ('session-start
        (let* ((session-id (or (nth 0 args) "unknown"))
-              (snap (anvil-session--most-recent-auto-snapshot session-id)))
-         (if snap
-             (or (plist-get snap :preamble-suggested) "")
-           "")))
+              (snap (anvil-session--most-recent-auto-snapshot session-id))
+              (session-preamble (if snap
+                                    (or (plist-get snap :preamble-suggested) "")
+                                  ""))
+              (compact-preamble
+               (when (fboundp 'anvil-compact-on-session-start)
+                 (funcall (intern "anvil-compact-on-session-start")
+                          session-id))))
+         (if (and (stringp compact-preamble)
+                  (not (string-empty-p compact-preamble)))
+             compact-preamble
+           session-preamble)))
       ('post-tool-use
        (let* ((session-id (or (nth 0 args) "unknown"))
               (tool (nth 1 args))
@@ -442,7 +458,12 @@ the shell wrapper does not crash the Claude hook pipeline."
        (let* ((session-id (or (nth 0 args) "unknown"))
               (prompt (nth 1 args)))
          (anvil-session-log-event session-id 'user-prompt
-                                  :summary prompt)))
+                                  :summary prompt)
+         (let ((nudge (when (fboundp 'anvil-compact-on-user-prompt)
+                        (funcall (intern "anvil-compact-on-user-prompt")
+                                 session-id))))
+           (when (and (stringp nudge) (not (string-empty-p nudge)))
+             nudge))))
       ('session-end
        (let ((session-id (or (nth 0 args) "unknown")))
          (anvil-session-log-event session-id 'session-end
@@ -456,6 +477,7 @@ the shell wrapper does not crash the Claude hook pipeline."
 
 (defconst anvil-session--hook-events
   '(("PreCompact"       . "pre-compact")
+    ("Stop"             . "stop")
     ("SessionStart"     . "session-start")
     ("PostToolUse"      . "post-tool-use")
     ("UserPromptSubmit" . "user-prompt")
@@ -475,6 +497,9 @@ Claude Code's hooks schema is shell-like."
   (pcase event-cli
     ("pre-compact"    (format "%s pre-compact $CLAUDE_SESSION_ID"
                               script))
+    ("stop"           (format
+                       "%s stop $CLAUDE_SESSION_ID $CLAUDE_TRANSCRIPT_PATH"
+                       script))
     ("session-start"  (format "%s session-start $CLAUDE_SESSION_ID"
                               script))
     ("post-tool-use"  (format
