@@ -42,6 +42,15 @@
 (require 'subr-x)
 (require 'anvil-server)
 
+;; Architecture α (2026-04-25 user signoff): anvil-XXX delegates pure
+;; helpers / heavy logic to nelisp-XXX low-level libraries so the
+;; substrate investment (Doc 25 Phase 6.5 全 phase) is reused.
+;; nelisp src/ must be on `load-path' (anvil dev daemon adds it via
+;; Phase 5-E setup; Stage D launcher bundles nelisp src/ alongside
+;; anvil.el).  Soft load — defer to require so byte-compile works in
+;; both anvil-only and anvil+nelisp environments.
+(require 'nelisp-defs-index nil 'noerror)
+
 ;; anvil-sexp is required lazily (inside functions that use its
 ;; reader helpers) because anvil-sexp also optionally requires us
 ;; back to pick up the Phase 2b fast path, and a top-level require
@@ -271,52 +280,66 @@ level of `anvil-defs' does not depend on `anvil-sexp' loading
   (require 'anvil-sexp)
   anvil-sexp--function-defining-forms)
 
+;; Phase 6.5 (Doc 25) で nelisp-defs-index に同名 helper が port 済。
+;; 本実装は nelisp-defs-index が load-path にあれば nelisp 版へ delegate、
+;; なければ自前 fallback (anvil 単体動作保証)。下記 5 helpers は purely
+;; functional、cache / I/O 状態を持たないので backward compat 100%。
+
 (defun anvil-defs--first-line (s)
-  "Return the first line of S, trimmed and clipped to 160 chars."
-  (when (and s (stringp s))
-    (let* ((nl (string-search "\n" s))
-           (first (if nl (substring s 0 nl) s))
-           (trim (string-trim first)))
-      (if (> (length trim) 160) (substring trim 0 160) trim))))
+  "Return the first line of S, trimmed and clipped to 160 chars.
+Delegates to `nelisp-defs-index--first-line' when available."
+  (if (fboundp 'nelisp-defs-index--first-line)
+      (nelisp-defs-index--first-line s)
+    (when (and s (stringp s))
+      (let* ((nl (string-search "\n" s))
+             (first (if nl (substring s 0 nl) s))
+             (trim (string-trim first)))
+        (if (> (length trim) 160) (substring trim 0 160) trim)))))
 
 (defun anvil-defs--extract-docstring (sexp)
   "Return the docstring of SEXP, or nil.
-Looks at the third element for defun-likes, fourth for defvar-likes."
-  (when (consp sexp)
-    (let ((op (car sexp))
-          (rest (cddr sexp)))
-      (cond
-       ((memq op '(defun defmacro defsubst cl-defun cl-defmacro
-                    cl-defgeneric cl-defmethod
-                    define-minor-mode define-derived-mode))
-        ;; (OP NAME ARGLIST [DOC] BODY...)
-        (when (and (consp rest) (stringp (cadr rest)))
-          (cadr rest)))
-       ((memq op '(defvar defvar-local defcustom defconst))
-        ;; (OP NAME [INIT] [DOC] ...)
-        (when (and (consp rest) (consp (cdr rest)) (stringp (cadr rest)))
-          (cadr rest)))))))
+Looks at the third element for defun-likes, fourth for defvar-likes.
+Delegates to `nelisp-defs-index--extract-docstring' when available."
+  (if (fboundp 'nelisp-defs-index--extract-docstring)
+      (nelisp-defs-index--extract-docstring sexp)
+    (when (consp sexp)
+      (let ((op (car sexp))
+            (rest (cddr sexp)))
+        (cond
+         ((memq op '(defun defmacro defsubst cl-defun cl-defmacro
+                      cl-defgeneric cl-defmethod
+                      define-minor-mode define-derived-mode))
+          ;; (OP NAME ARGLIST [DOC] BODY...)
+          (when (and (consp rest) (stringp (cadr rest)))
+            (cadr rest)))
+         ((memq op '(defvar defvar-local defcustom defconst))
+          ;; (OP NAME [INIT] [DOC] ...)
+          (when (and (consp rest) (consp (cdr rest)) (stringp (cadr rest)))
+            (cadr rest))))))))
 
 (defun anvil-defs--extract-arity (arglist)
   "Return (MIN . MAX) arity for ARGLIST.  MAX is nil when &rest present.
 Also treats &body as &rest.  &key turns the call variadic for this
-purpose (we cannot statically bound keyword call arity)."
-  (let ((min 0) (max 0) (stage 'req) (ret nil))
-    (catch 'done
-      (dolist (a arglist)
-        (cond
-         ((eq a '&optional) (setq stage 'opt))
-         ((memq a '(&rest &body &key))
-          (setq ret (cons min nil))
-          (throw 'done nil))
-         ;; Skip modifier keywords that do not count as arguments.
-         ((memq a '(&allow-other-keys &aux)) nil)
-         ;; Specializer lists in cl-defmethod look like `(x integer)' —
-         ;; treat them as one positional arg, matching call arity.
-         ((eq stage 'req) (cl-incf min) (cl-incf max))
-         ((eq stage 'opt) (cl-incf max))))
-      (setq ret (cons min max)))
-    ret))
+purpose (we cannot statically bound keyword call arity).
+Delegates to `nelisp-defs-index--extract-arity' when available."
+  (if (fboundp 'nelisp-defs-index--extract-arity)
+      (nelisp-defs-index--extract-arity arglist)
+    (let ((min 0) (max 0) (stage 'req) (ret nil))
+      (catch 'done
+        (dolist (a arglist)
+          (cond
+           ((eq a '&optional) (setq stage 'opt))
+           ((memq a '(&rest &body &key))
+            (setq ret (cons min nil))
+            (throw 'done nil))
+           ;; Skip modifier keywords that do not count as arguments.
+           ((memq a '(&allow-other-keys &aux)) nil)
+           ;; Specializer lists in cl-defmethod look like `(x integer)' —
+           ;; treat them as one positional arg, matching call arity.
+           ((eq stage 'req) (cl-incf min) (cl-incf max))
+           ((eq stage 'opt) (cl-incf max))))
+        (setq ret (cons min max)))
+      ret)))
 
 (defun anvil-defs--obsolete-p (_sexp)
   "Return non-nil when _SEXP is marked obsolete.
@@ -363,11 +386,14 @@ Handles shapes the naive (caddr sexp) form misses:
 `dolist' signals on the dotted tail; callers walking arbitrary
 reader output (including literal alists like `(:title . \"x\")')
 must not rely on the proper-list invariant.  FN receives each
-`car' and, if XS ends in a non-nil atom, that atom itself."
-  (while (consp xs)
-    (funcall fn (car xs))
-    (setq xs (cdr xs)))
-  (when xs (funcall fn xs)))
+`car' and, if XS ends in a non-nil atom, that atom itself.
+Delegates to `nelisp-defs-index--walk-each' when available."
+  (if (fboundp 'nelisp-defs-index--walk-each)
+      (nelisp-defs-index--walk-each xs fn)
+    (while (consp xs)
+      (funcall fn (car xs))
+      (setq xs (cdr xs)))
+    (when xs (funcall fn xs))))
 
 (defconst anvil-defs--walker-skip-symbols
   '(nil t)
@@ -376,10 +402,15 @@ Keeping them out of the index reduces `refs' row count without
 losing query value — no project ever asks \"who calls nil?\".")
 
 (defun anvil-defs--walker-ignored-p (sym)
-  "Return non-nil when SYM should not appear in the refs table."
-  (or (null sym)
-      (keywordp sym)
-      (memq sym anvil-defs--walker-skip-symbols)))
+  "Return non-nil when SYM should not appear in the refs table.
+Delegates to `nelisp-defs-index--walker-ignored-p' when available;
+both implementations consult an equivalent `(nil t)' skip-list, so
+the delegation is semantically transparent."
+  (if (fboundp 'nelisp-defs-index--walker-ignored-p)
+      (nelisp-defs-index--walker-ignored-p sym)
+    (or (null sym)
+        (keywordp sym)
+        (memq sym anvil-defs--walker-skip-symbols))))
 
 (defun anvil-defs--walk-form-refs (sexp context line emit)
   "Walk SEXP recursively, calling EMIT for each reference / feature edge.
