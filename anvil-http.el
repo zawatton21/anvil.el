@@ -743,26 +743,34 @@ a cache entry plist (or nil).  ACCEPT is a short-hand MIME string."
   "Return non-nil when this Emacs build bundles libxml2.
 libxml is bundled with most Linux / macOS builds; a handful of
 Windows builds ship without it.  The selector pipeline falls back
-to the regex subset when this returns nil."
-  (fboundp 'libxml-parse-html-region))
+to the regex subset when this returns nil.
+
+Delegates to `nelisp-http--libxml-p' when available."
+  (if (fboundp 'nelisp-http--libxml-p)
+      (nelisp-http--libxml-p)
+    (fboundp 'libxml-parse-html-region)))
 
 (defun anvil-http--extract-target-from-content-type (ct)
   "Classify Content-Type string CT as `html', `json', `xml', or nil.
 Matches the MIME type case-insensitively and ignores parameters
 after a semicolon (e.g. charset=utf-8).  XHTML is treated as HTML
 so libxml's HTML parser handles it; pure text/xml and
-application/xml use the XML parser when libxml is available."
-  (cond
-   ((not (stringp ct)) nil)
-   ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:text/html\\|application/xhtml\\+xml\\)\\b"
-                    (downcase ct))
-    'html)
-   ((string-match-p "\\`\\(?:[[:space:]]*\\)application/json\\b" (downcase ct))
-    'json)
-   ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:application/xml\\|text/xml\\)\\b"
-                    (downcase ct))
-    'xml)
-   (t nil)))
+application/xml use the XML parser when libxml is available.
+
+Delegates to `nelisp-http--extract-target-from-content-type' when available."
+  (if (fboundp 'nelisp-http--extract-target-from-content-type)
+      (nelisp-http--extract-target-from-content-type ct)
+    (cond
+     ((not (stringp ct)) nil)
+     ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:text/html\\|application/xhtml\\+xml\\)\\b"
+                      (downcase ct))
+      'html)
+     ((string-match-p "\\`\\(?:[[:space:]]*\\)application/json\\b" (downcase ct))
+      'json)
+     ((string-match-p "\\`\\(?:[[:space:]]*\\)\\(?:application/xml\\|text/xml\\)\\b"
+                      (downcase ct))
+      'xml)
+     (t nil))))
 
 (defun anvil-http--parse-selector (s)
   "Parse CSS-subset selector S into an internal form.
@@ -776,37 +784,45 @@ Returns one of:
 
 or nil for anything outside the subset (combinators, pseudo
 classes, attribute selectors).  Both libxml and fallback engines
-share the same subset so test expectations stay backend-agnostic."
-  (let ((s (and (stringp s) (string-trim s))))
-    (cond
-     ((or (null s) (string-empty-p s)) nil)
-     ((string-match "\\`#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
-      (list :id (match-string 1 s)))
-     ((string-match "\\`\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
-      (list :class (match-string 1 s)))
-     ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
-      (list :tag-id (intern (downcase (match-string 1 s))) (match-string 2 s)))
-     ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
-      (list :tag-class (intern (downcase (match-string 1 s))) (match-string 2 s)))
-     ((string-match "\\`[A-Za-z][A-Za-z0-9]*\\'" s)
-      (list :tag (intern (downcase s))))
-     (t nil))))
+share the same subset so test expectations stay backend-agnostic.
+
+Delegates to `nelisp-http--parse-selector' when available."
+  (if (fboundp 'nelisp-http--parse-selector)
+      (nelisp-http--parse-selector s)
+    (let ((s (and (stringp s) (string-trim s))))
+      (cond
+       ((or (null s) (string-empty-p s)) nil)
+       ((string-match "\\`#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+        (list :id (match-string 1 s)))
+       ((string-match "\\`\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+        (list :class (match-string 1 s)))
+       ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)#\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+        (list :tag-id (intern (downcase (match-string 1 s))) (match-string 2 s)))
+       ((string-match "\\`\\([A-Za-z][A-Za-z0-9]*\\)\\.\\([A-Za-z][A-Za-z0-9_-]*\\)\\'" s)
+        (list :tag-class (intern (downcase (match-string 1 s))) (match-string 2 s)))
+       ((string-match "\\`[A-Za-z][A-Za-z0-9]*\\'" s)
+        (list :tag (intern (downcase s))))
+       (t nil)))))
 
 (defun anvil-http--dom-select (dom parts)
   "Return DOM nodes matching selector PARTS (from `--parse-selector').
 Uses dom.el primitives; `dom-by-class' / `dom-by-id' take regex
-strings, so `\\\\b' word-boundary anchors match the class/id exactly."
-  (pcase parts
-    (`(:tag ,tag) (dom-by-tag dom tag))
-    (`(:class ,cls) (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls))))
-    (`(:id ,id) (dom-by-id dom (format "\\`%s\\'" (regexp-quote id))))
-    (`(:tag-class ,tag ,cls)
-     (seq-filter (lambda (el) (eq (dom-tag el) tag))
-                 (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls)))))
-    (`(:tag-id ,tag ,id)
-     (seq-filter (lambda (el) (eq (dom-tag el) tag))
-                 (dom-by-id dom (format "\\`%s\\'" (regexp-quote id)))))
-    (_ nil)))
+strings, so `\\\\b' word-boundary anchors match the class/id exactly.
+
+Delegates to `nelisp-http--dom-select' when available."
+  (if (fboundp 'nelisp-http--dom-select)
+      (nelisp-http--dom-select dom parts)
+    (pcase parts
+      (`(:tag ,tag) (dom-by-tag dom tag))
+      (`(:class ,cls) (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls))))
+      (`(:id ,id) (dom-by-id dom (format "\\`%s\\'" (regexp-quote id))))
+      (`(:tag-class ,tag ,cls)
+       (seq-filter (lambda (el) (eq (dom-tag el) tag))
+                   (dom-by-class dom (format "\\b%s\\b" (regexp-quote cls)))))
+      (`(:tag-id ,tag ,id)
+       (seq-filter (lambda (el) (eq (dom-tag el) tag))
+                   (dom-by-id dom (format "\\`%s\\'" (regexp-quote id)))))
+      (_ nil))))
 
 (defun anvil-http--select-html-libxml (html selector)
   "Return text from HTML matching SELECTOR via libxml + dom.el.
