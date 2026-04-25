@@ -908,88 +908,104 @@ Delegates to `nelisp-http--select-html-fallback' when available."
   "Tokenize dotted-path PATH.
 Segments are (:key STRING), (:index INT), or (:wildcard).  Supports
 forms like `items[0].title', `data.results[*].id', and plain
-`users.0.name' where digits following a dot become an index."
-  (let ((i 0) (n (length path)) (tokens nil))
-    (while (< i n)
-      (let ((ch (aref path i)))
-        (cond
-         ((eq ch ?.) (cl-incf i))
-         ((eq ch ?\[)
-          (let* ((end (string-match "\\]" path i))
-                 (inner (and end (substring path (1+ i) end))))
-            (unless end
-              (error "anvil-http: unterminated [] in json-path %S" path))
-            (push (cond
-                   ((equal inner "*") (list :wildcard))
-                   ((string-match-p "\\`-?[0-9]+\\'" inner)
-                    (list :index (string-to-number inner)))
-                   (t (list :key inner)))
-                  tokens)
-            (setq i (1+ end))))
-         (t
-          (let* ((end (or (string-match "[.[]" path i) n))
-                 (seg (substring path i end)))
-            (push (if (string-match-p "\\`-?[0-9]+\\'" seg)
-                      (list :index (string-to-number seg))
-                    (list :key seg))
-                  tokens)
-            (setq i end))))))
-    (nreverse tokens)))
+`users.0.name' where digits following a dot become an index.
+
+Delegates to `nelisp-http--split-json-path' when available."
+  (if (fboundp 'nelisp-http--split-json-path)
+      (nelisp-http--split-json-path path)
+    (let ((i 0) (n (length path)) (tokens nil))
+      (while (< i n)
+        (let ((ch (aref path i)))
+          (cond
+           ((eq ch ?.) (cl-incf i))
+           ((eq ch ?\[)
+            (let* ((end (string-match "\\]" path i))
+                   (inner (and end (substring path (1+ i) end))))
+              (unless end
+                (error "anvil-http: unterminated [] in json-path %S" path))
+              (push (cond
+                     ((equal inner "*") (list :wildcard))
+                     ((string-match-p "\\`-?[0-9]+\\'" inner)
+                      (list :index (string-to-number inner)))
+                     (t (list :key inner)))
+                    tokens)
+              (setq i (1+ end))))
+           (t
+            (let* ((end (or (string-match "[.[]" path i) n))
+                   (seg (substring path i end)))
+              (push (if (string-match-p "\\`-?[0-9]+\\'" seg)
+                        (list :index (string-to-number seg))
+                      (list :key seg))
+                    tokens)
+              (setq i end))))))
+      (nreverse tokens))))
 
 (defun anvil-http--json-walk (node segments)
   "Walk NODE by SEGMENTS produced by `--split-json-path'.
 NODE uses hash-tables for objects and vectors for arrays.  Returns
 the located sub-tree, or nil on a miss.  `(:wildcard)' flattens an
-array; following segments are mapped over its elements."
-  (cond
-   ((null segments) node)
-   ((null node) nil)
-   (t
-    (pcase (car segments)
-      (`(:key ,k)
-       (when (hash-table-p node)
-         (let ((val (gethash k node)))
-           (anvil-http--json-walk val (cdr segments)))))
-      (`(:index ,idx)
-       (when (and (vectorp node)
-                  (>= idx 0) (< idx (length node)))
-         (anvil-http--json-walk (aref node idx) (cdr segments))))
-      (`(:wildcard)
-       (when (vectorp node)
-         (let ((results
-                (delq nil
-                      (mapcar (lambda (el)
-                                (anvil-http--json-walk el (cdr segments)))
-                              (append node nil)))))
-           (vconcat results))))
-      (_ nil)))))
+array; following segments are mapped over its elements.
+
+Delegates to `nelisp-http--json-walk' when available."
+  (if (fboundp 'nelisp-http--json-walk)
+      (nelisp-http--json-walk node segments)
+    (cond
+     ((null segments) node)
+     ((null node) nil)
+     (t
+      (pcase (car segments)
+        (`(:key ,k)
+         (when (hash-table-p node)
+           (let ((val (gethash k node)))
+             (anvil-http--json-walk val (cdr segments)))))
+        (`(:index ,idx)
+         (when (and (vectorp node)
+                    (>= idx 0) (< idx (length node)))
+           (anvil-http--json-walk (aref node idx) (cdr segments))))
+        (`(:wildcard)
+         (when (vectorp node)
+           (let ((results
+                  (delq nil
+                        (mapcar (lambda (el)
+                                  (anvil-http--json-walk el (cdr segments)))
+                                (append node nil)))))
+             (vconcat results))))
+        (_ nil))))))
 
 (defun anvil-http--select-json-dotted (json-string path)
   "Parse JSON-STRING and walk dotted PATH.
 Returns the located sub-tree serialized back to JSON (so Claude
-sees the same format it sent), or nil on parse error / miss."
-  (condition-case _
-      (let* ((node (json-parse-string
-                    json-string
-                    :object-type 'hash-table
-                    :array-type 'array
-                    :null-object :null
-                    :false-object :false))
-             (segments (anvil-http--split-json-path path))
-             (result (and segments (anvil-http--json-walk node segments))))
-        (when result
-          (json-serialize result
-                          :null-object :null
-                          :false-object :false)))
-    (error nil)))
+sees the same format it sent), or nil on parse error / miss.
+
+Delegates to `nelisp-http--select-json-dotted' when available."
+  (if (fboundp 'nelisp-http--select-json-dotted)
+      (nelisp-http--select-json-dotted json-string path)
+    (condition-case _
+        (let* ((node (json-parse-string
+                      json-string
+                      :object-type 'hash-table
+                      :array-type 'array
+                      :null-object :null
+                      :false-object :false))
+               (segments (anvil-http--split-json-path path))
+               (result (and segments (anvil-http--json-walk node segments))))
+          (when result
+            (json-serialize result
+                            :null-object :null
+                            :false-object :false)))
+      (error nil))))
 
 (defun anvil-http--plist-put! (plist &rest kvs)
-  "Return PLIST with KVS (flat key/value list) applied via `plist-put'."
-  (let ((p (copy-sequence plist)))
-    (while kvs
-      (setq p (plist-put p (car kvs) (cadr kvs)))
-      (setq kvs (cddr kvs)))
-    p))
+  "Return PLIST with KVS (flat key/value list) applied via `plist-put'.
+
+Delegates to `nelisp-http--plist-put!' when available."
+  (if (fboundp 'nelisp-http--plist-put!)
+      (apply #'nelisp-http--plist-put! plist kvs)
+    (let ((p (copy-sequence plist)))
+      (while kvs
+        (setq p (plist-put p (car kvs) (cadr kvs)))
+        (setq kvs (cddr kvs)))
+      p)))
 
 (defun anvil-http--apply-extract (response selector json-path)
   "Post-process RESPONSE with SELECTOR / JSON-PATH when supplied.
