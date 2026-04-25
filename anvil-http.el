@@ -1162,113 +1162,129 @@ Each RULES element is `(DIRECTIVE . PATTERN)' where DIRECTIVE is
 whitespace-only lines, and unknown directives (Sitemap, Host, etc.)
 are ignored.  Consecutive User-agent lines accumulate into one
 group until a rule follows; the next User-agent after a rule
-starts a new group — matching RFC 9309 group definition."
-  (let ((groups nil)
-        (current-uas nil)
-        (current-rules nil)
-        (in-rules nil))
-    (dolist (raw (split-string (or text "") "\n"))
-      (let* ((stripped (replace-regexp-in-string "#.*\\'" "" raw))
-             (line (string-trim stripped)))
-        (unless (string-empty-p line)
-          (when (string-match "\\`\\([A-Za-z-]+\\)[ \t]*:[ \t]*\\(.*\\)\\'"
-                              line)
-            (let ((key (downcase (match-string 1 line)))
-                  (val (string-trim (match-string 2 line))))
-              (pcase key
-                ("user-agent"
-                 (when in-rules
-                   (push (cons (nreverse current-uas)
-                               (nreverse current-rules))
-                         groups)
-                   (setq current-uas nil
-                         current-rules nil
-                         in-rules nil))
-                 (push val current-uas))
-                ("allow"
-                 (when current-uas
-                   (push (cons 'allow val) current-rules)
-                   (setq in-rules t)))
-                ("disallow"
-                 (when current-uas
-                   (push (cons 'disallow val) current-rules)
-                   (setq in-rules t)))
-                (_ nil)))))))
-    (when current-uas
-      (push (cons (nreverse current-uas)
-                  (nreverse current-rules))
-            groups))
-    (nreverse groups)))
+starts a new group — matching RFC 9309 group definition.
+
+Delegates to `nelisp-http--robots-parse' when available."
+  (if (fboundp 'nelisp-http--robots-parse)
+      (nelisp-http--robots-parse text)
+    (let ((groups nil)
+          (current-uas nil)
+          (current-rules nil)
+          (in-rules nil))
+      (dolist (raw (split-string (or text "") "\n"))
+        (let* ((stripped (replace-regexp-in-string "#.*\\'" "" raw))
+               (line (string-trim stripped)))
+          (unless (string-empty-p line)
+            (when (string-match "\\`\\([A-Za-z-]+\\)[ \t]*:[ \t]*\\(.*\\)\\'"
+                                line)
+              (let ((key (downcase (match-string 1 line)))
+                    (val (string-trim (match-string 2 line))))
+                (pcase key
+                  ("user-agent"
+                   (when in-rules
+                     (push (cons (nreverse current-uas)
+                                 (nreverse current-rules))
+                           groups)
+                     (setq current-uas nil
+                           current-rules nil
+                           in-rules nil))
+                   (push val current-uas))
+                  ("allow"
+                   (when current-uas
+                     (push (cons 'allow val) current-rules)
+                     (setq in-rules t)))
+                  ("disallow"
+                   (when current-uas
+                     (push (cons 'disallow val) current-rules)
+                     (setq in-rules t)))
+                  (_ nil)))))))
+      (when current-uas
+        (push (cons (nreverse current-uas)
+                    (nreverse current-rules))
+              groups))
+      (nreverse groups))))
 
 (defun anvil-http--robots-pick-group (groups ua)
   "Return rules for the group best matching UA string.
 UA is compared case-insensitively against each group's user-agent
 tokens (substring match); the longest matching token wins.  Falls
 back to the `*' group when no specific token matches.  Returns nil
-when neither a matching nor `*' group exists."
-  (let ((ua-lc (downcase (or ua "")))
-        (best-rules nil)
-        (best-len -1)
-        (star-rules nil))
-    (dolist (group groups)
-      (let ((uas (car group))
-            (rules (cdr group)))
-        (dolist (u uas)
-          (let ((u-lc (downcase u)))
-            (cond
-             ((equal u-lc "*")
-              (unless star-rules (setq star-rules rules)))
-             ((and (not (string-empty-p u-lc))
-                   (string-match-p (regexp-quote u-lc) ua-lc)
-                   (> (length u-lc) best-len))
-              (setq best-rules rules
-                    best-len (length u-lc))))))))
-    (or best-rules star-rules)))
+when neither a matching nor `*' group exists.
+
+Delegates to `nelisp-http--robots-pick-group' when available."
+  (if (fboundp 'nelisp-http--robots-pick-group)
+      (nelisp-http--robots-pick-group groups ua)
+    (let ((ua-lc (downcase (or ua "")))
+          (best-rules nil)
+          (best-len -1)
+          (star-rules nil))
+      (dolist (group groups)
+        (let ((uas (car group))
+              (rules (cdr group)))
+          (dolist (u uas)
+            (let ((u-lc (downcase u)))
+              (cond
+               ((equal u-lc "*")
+                (unless star-rules (setq star-rules rules)))
+               ((and (not (string-empty-p u-lc))
+                     (string-match-p (regexp-quote u-lc) ua-lc)
+                     (> (length u-lc) best-len))
+                (setq best-rules rules
+                      best-len (length u-lc))))))))
+      (or best-rules star-rules))))
 
 (defun anvil-http--robots-pattern-to-regex (pattern)
   "Convert a robots.txt PATTERN to an Emacs regex.
 Empty or nil patterns return nil (no match, per RFC 9309 §2.2.2).
 `*' expands to `.*', trailing `$' anchors to end-of-URL, and every
 other character is regex-quoted.  All other special sequences are
-literal."
-  (when (and pattern (not (string-empty-p pattern)))
-    (let ((end-anchor nil)
-          (p pattern))
-      (when (string-suffix-p "$" p)
-        (setq end-anchor t)
-        (setq p (substring p 0 (1- (length p)))))
-      (let ((chunks (mapcar
-                     (lambda (ch)
-                       (cond
-                        ((eq ch ?*) ".*")
-                        (t (regexp-quote (char-to-string ch)))))
-                     (string-to-list p))))
-        (concat "\\`"
-                (mapconcat #'identity chunks "")
-                (if end-anchor "\\'" ""))))))
+literal.
+
+Delegates to `nelisp-http--robots-pattern-to-regex' when available."
+  (if (fboundp 'nelisp-http--robots-pattern-to-regex)
+      (nelisp-http--robots-pattern-to-regex pattern)
+    (when (and pattern (not (string-empty-p pattern)))
+      (let ((end-anchor nil)
+            (p pattern))
+        (when (string-suffix-p "$" p)
+          (setq end-anchor t)
+          (setq p (substring p 0 (1- (length p)))))
+        (let ((chunks (mapcar
+                       (lambda (ch)
+                         (cond
+                          ((eq ch ?*) ".*")
+                          (t (regexp-quote (char-to-string ch)))))
+                       (string-to-list p))))
+          (concat "\\`"
+                  (mapconcat #'identity chunks "")
+                  (if end-anchor "\\'" "")))))))
 
 (defun anvil-http--robots-match (rules path)
   "Return the winning rule for PATH against RULES, or nil.
 Winning rule follows RFC 9309: longest pattern wins; on a tie
 Allow beats Disallow.  Return value is (ALLOW-P . PATTERN-LENGTH)
 so callers can use the boolean AND surface the specificity for
-observability."
-  (let ((best nil))
-    (dolist (rule rules)
-      (let* ((dir (car rule))
-             (pat (cdr rule))
-             (rx (anvil-http--robots-pattern-to-regex pat)))
-        (when (and rx (string-match-p rx path))
-          (let* ((len (length pat))
-                 (allow-p (eq dir 'allow))
-                 (current (cons allow-p len)))
-            (cond
-             ((null best) (setq best current))
-             ((> len (cdr best)) (setq best current))
-             ((and (= len (cdr best))
-                   allow-p)
-              (setq best current)))))))
-    best))
+observability.
+
+Delegates to `nelisp-http--robots-match' when available."
+  (if (fboundp 'nelisp-http--robots-match)
+      (nelisp-http--robots-match rules path)
+    (let ((best nil))
+      (dolist (rule rules)
+        (let* ((dir (car rule))
+               (pat (cdr rule))
+               (rx (anvil-http--robots-pattern-to-regex pat)))
+          (when (and rx (string-match-p rx path))
+            (let* ((len (length pat))
+                   (allow-p (eq dir 'allow))
+                   (current (cons allow-p len)))
+              (cond
+               ((null best) (setq best current))
+               ((> len (cdr best)) (setq best current))
+               ((and (= len (cdr best))
+                     allow-p)
+                (setq best current)))))))
+      best)))
 
 (defun anvil-http--robots-fetch (origin)
   "Fetch ORIGIN/robots.txt and cache it for `anvil-http-robots-ttl-sec'.
