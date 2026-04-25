@@ -1,7 +1,6 @@
 ;;; anvil-discovery.el --- Intent-based MCP tool discovery  -*- lexical-binding: t; -*-
 
 ;; Author: zawatton
-;; Package-Requires: ((emacs "29.1") (anvil-server "0.1"))
 ;; Keywords: tools, mcp
 
 ;;; Commentary:

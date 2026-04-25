@@ -153,8 +153,9 @@ Returns nil if no matches found (does not error)."
 ;;;; --- file: write --------------------------------------------------------
 
 (defun anvil-file-replace-regexp (path pattern replacement &optional max-count)
-  "In PATH, replace occurrences of PATTERN (regexp) with REPLACEMENT.
+  "In PATH, replace occurrences of PATTERN (Emacs regexp) with REPLACEMENT.
 If MAX-COUNT is non-nil, stop after that many replacements.
+PATTERN capture groups use Emacs regexp syntax `\\(...\\)'.
 REPLACEMENT may use \\1 \\2 etc. for capture groups.
 Returns (:replaced N :file PATH :warnings LIST).  Errors if 0
 replacements were made.  :warnings surfaces pre-write divergence
@@ -238,8 +239,9 @@ Returns (:deleted N :file PATH :warnings LIST)."
     (list :deleted deleted :file abs :warnings warnings)))
 
 (defun anvil-file-append (path content)
-  "Append CONTENT to end of PATH.
-A leading newline is added if file does not end with one.
+  "Append CONTENT to the end of existing PATH.
+A leading newline is added if PATH does not end with one.
+Signals an error if PATH does not already exist as a regular file.
 Returns (:appended-bytes N :file PATH :warnings LIST)."
   (let* ((abs (anvil--prepare-path path))
          (warnings (anvil-file-warn-if-diverged abs))
@@ -1154,7 +1156,16 @@ Returns (:ok t :operations N :file PATH :warnings LIST) on success.
     (with-temp-buffer
       (anvil--insert-file abs)
       (dolist (op operations)
-        (let ((type (anvil-file--batch-get op 'op)))
+        (let* ((type (anvil-file--batch-get op 'op))
+               (legacy-type (anvil-file--batch-get op 'type)))
+          (when (null type)
+            (if legacy-type
+                (error
+                 "batch: operation objects use 'op', not 'type': %S"
+                 op)
+              (error
+               "batch: missing required field 'op' in operation: %S"
+               op)))
           (pcase type
             ("replace"
              (let ((old (anvil-file--batch-get op 'old))
@@ -1206,7 +1217,9 @@ Returns (:ok t :operations N :file PATH :warnings LIST) on success.
              (let ((c (anvil-file--batch-get op 'content)))
                (insert (if (string-suffix-p "\n" c) c (concat c "\n")))))
             (_
-             (error "batch: unknown op: %s" type))))
+             (error
+              "batch: unknown op %S (supported: replace, replace-regexp, insert-at-line, delete-lines, append, prepend)"
+              type))))
         (cl-incf op-count))
       (anvil--write-current-buffer-to abs))
     (list :ok t :operations op-count :file abs :warnings warnings)))
@@ -1559,8 +1572,9 @@ without modifying the file.
 PATH is the absolute path to the file.
 
 SPEC is a plist:
-  :block-start    REGEXP — Required.  Marks the start of each block.
-                  If group 1 is present, its capture becomes the block's :id.
+  :block-start    REGEXP — Required.  Emacs regexp marking the start of
+                  each block.  If group 1 is present, its capture becomes
+                  the block's :id.
   :block-end      One of:
                     `next-block-start' (default) — block ends right before
                       the next `:block-start' match (or EOF).
@@ -1570,7 +1584,8 @@ SPEC is a plist:
                       regexp match after `:block-start'.
   :fields         List of field plists.  Each plist:
                     :name STRING   — output key (required)
-                    :regexp REGEXP — must capture value in group 1 (required)
+                    :regexp REGEXP — Emacs regexp; must capture value in
+                                     group 1 (required)
                     :required BOOL — when t, missing field skips the block
                                      (or errors, per :on-missing-required)
   :max-blocks     NUMBER — stop after returning this many records (optional)
@@ -2081,14 +2096,16 @@ MCP Parameters:
 
 SPEC-JSON is a JSON object describing the extraction.  Keys mirror the
 elisp `anvil-code-extract-pattern' SPEC plist (kebab-case in elisp,
-snake_case or kebab-case accepted in JSON):
+snake_case or kebab-case accepted in JSON).  Regexp values use Emacs
+regexp syntax, so capture groups must be written as `\\(...\\)'.
+`fields' must be a JSON array of objects:
 
   {
-    \"block-start\":  \"if \\\\(.*\\\\) \\\\{\",
+    \"block-start\":  \"^ITEM \\\\([0-9]+\\\\)\",
     \"block-end\":    \"brace-balance\",
     \"fields\": [
-      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"(.*)\\\"\"},
-      {\"name\": \"price\", \"regexp\": \"price *= *(\\\\d+)\", \"required\": true}
+      {\"name\": \"name\",  \"regexp\": \"name *= *\\\"\\\\([^\\\"]*\\\\)\\\"\"},
+      {\"name\": \"price\", \"regexp\": \"price *= *\\\\([0-9]+\\\\)\", \"required\": true}
     ],
     \"max-blocks\": 100,
     \"on-missing-required\": \"skip-block\"
@@ -2122,6 +2139,8 @@ MCP Parameters:
                           block-end-raw))))
           (fields-raw (funcall get "fields"))
           (fields
+           ;; A non-array `fields' value currently bubbles up as a less clear
+           ;; low-level type error here; tightening that message is follow-up.
            (mapcar
             (lambda (f)
               (let ((name (or (alist-get 'name f)
@@ -2302,8 +2321,9 @@ Pass max-count \"1\" to assert exactly one match."
    :intent '(file-edit)
    :layer 'core
    :description
-   "Replace regexp matches in a file.  The replacement string may use
-\\\\1 \\\\2 for capture groups.  Errors if no match found.
+   "Replace Emacs regexp matches in a file.  Patterns use Emacs regexp
+syntax, including `\\(...\\)' capture groups; the replacement string may
+use \\\\1 \\\\2 for capture groups.  Errors if no match found.
 Safe for files over 1.2MB."
    :server-id anvil-file--server-id)
 
@@ -2346,12 +2366,13 @@ read specific sections."
 
   (anvil-server-register-tool
    #'anvil-file--tool-append
-   :id "file-append"
-   :intent '(file-edit)
-   :layer 'core
-   :description
-   "Append text to the end of a file.  A leading newline is added
-if the file does not end with one.  Safe for files over 1.2MB."
+  :id "file-append"
+  :intent '(file-edit)
+  :layer 'core
+  :description
+   "Append text to the end of an existing file.  A leading newline is
+added if the file does not end with one.  Errors if the target file
+does not already exist.  Safe for files over 1.2MB."
    :server-id anvil-file--server-id)
 
   (anvil-server-register-tool
@@ -2445,7 +2466,9 @@ runs each `fields' regexp inside the body and captures group 1 as the
 field's value.  Read-only — the file is never modified.  Returns plist
 with :matches (each :id :start-line :end-line :fields) :total :returned
 :skipped.  Targets legacy code migration / data extraction where reading
-the entire file would be wasteful.  Brace-balance skips strings."
+the entire file would be wasteful.  Regexp values use Emacs regexp
+syntax, and `fields' must be a JSON array of {name, regexp, required?}
+objects.  Brace-balance skips strings."
    :read-only t
    :offload t
    :server-id anvil-file--server-id)

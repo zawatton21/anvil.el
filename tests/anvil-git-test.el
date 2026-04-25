@@ -56,6 +56,14 @@ then delete the repo."
         (should-not (anvil-git-repo-root tmp))
       (delete-directory tmp t))))
 
+(ert-deftest anvil-git-test-repo-root-errors-on-file-path ()
+  (anvil-git-test--with-repo repo
+    (let ((file (expand-file-name "tracked.txt" repo)))
+      (with-temp-file file
+        (insert "hello\n"))
+      (should-error (anvil-git-repo-root file)
+                    :type 'user-error))))
+
 ;;;; --- head-sha / branch --------------------------------------------------
 
 (ert-deftest anvil-git-test-head-sha-returns-40-hex ()

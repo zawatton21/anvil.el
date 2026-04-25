@@ -315,6 +315,31 @@
       (let ((elc (concat tmp "c")))
         (when (file-exists-p elc) (delete-file elc))))))
 
+(ert-deftest anvil-sexp-test-verify-captures-byte-compile-errors ()
+  "A malformed file surfaces a byte-compile error diagnostic."
+  (let ((tmp (make-temp-file "anvil-sexp-bad-" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert ";;; bad.el --- bad -*- lexical-binding: t; -*-\n"
+                    ";;; Commentary:\n;; bad.\n;;; Code:\n"
+                    "(defun anvil-sexp-test-broken (\n"
+                    "(provide 'bad)\n"
+                    ";;; bad.el ends here\n"))
+          (let ((r (anvil-sexp--tool-verify tmp nil "nil")))
+            (should-not (plist-get r :passed))
+            (should (cl-find-if
+                     (lambda (d)
+                       (and (eq (plist-get d :kind) 'error)
+                            (eq (plist-get d :source) 'byte-compile)
+                            (string-match-p
+                             "End of file during parsing"
+                             (plist-get d :message))))
+                     (plist-get r :diagnostics)))))
+      (when (file-exists-p tmp) (delete-file tmp))
+      (let ((elc (concat tmp "c")))
+        (when (file-exists-p elc) (delete-file elc))))))
+
 
 ;;;; --- ship criterion: stub + verify + restore round-trip ----------------
 

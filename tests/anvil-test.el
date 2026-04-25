@@ -158,6 +158,64 @@ MCP Parameters:
             (should (equal "ok-empty" text)))))
     (anvil-server-unregister-tool "anvil-test-underscore" "anvil-test")))
 
+(ert-deftest anvil-test-dispatch-converts-quit-to-tool-error ()
+  "A wrapped tool must turn `quit' into an MCP tool error result."
+  (defun anvil-test--tool-quit (_args)
+    "Signal quit through the helper wrapper.
+
+MCP Parameters:
+  (none)"
+    (anvil-server-with-error-handling
+      (signal 'quit '(minibuffer-quit))))
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-test--tool-quit
+         :id "anvil-test-tool-quit"
+         :description "test"
+         :server-id "anvil-test")
+          (let* ((params '((name . "anvil-test-tool-quit")
+                         (arguments . ())))
+               (resp (anvil-server--handle-tools-call
+                      "t-quit" params
+                      (make-anvil-server-metrics) "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (result (alist-get 'result decoded))
+               (text (alist-get 'text
+                                (aref (alist-get 'content result) 0))))
+          (should (eq t (alist-get 'isError result)))
+          (should (string-match-p "Quit: .*minibuffer-quit" text))))
+    (anvil-server-unregister-tool "anvil-test-tool-quit" "anvil-test")))
+
+(ert-deftest anvil-test-process-jsonrpc-catches-raw-quit ()
+  "Top-level JSON-RPC dispatch must serialize uncaught `quit' as JSON."
+  (defun anvil-test--raw-quit (_args)
+    "Signal quit without wrapping.
+
+MCP Parameters:
+  (none)"
+    (signal 'quit '(minibuffer-quit)))
+  (unwind-protect
+      (progn
+        (anvil-server-register-tool
+         #'anvil-test--raw-quit
+         :id "anvil-test-raw-quit"
+         :description "test"
+         :server-id "anvil-test")
+        (let* ((anvil-server--running t)
+               (request
+                (anvil-server-create-tools-call-request
+                 "anvil-test-raw-quit" 77 nil))
+               (resp (anvil-server-process-jsonrpc request "anvil-test"))
+               (decoded (json-read-from-string resp))
+               (rpc-error (alist-get 'error decoded)))
+          (should rpc-error)
+          (should (= anvil-server-jsonrpc-error-internal
+                     (alist-get 'code rpc-error)))
+          (should (string-match-p "Quit"
+                                  (alist-get 'message rpc-error)))))
+    (anvil-server-unregister-tool "anvil-test-raw-quit" "anvil-test")))
+
 (ert-deftest anvil-test-schema-includes-real-params ()
   "JSON schema must still include non-underscore args."
   (defun anvil-test--tool-with-arg (task_id)

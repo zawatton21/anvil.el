@@ -25,7 +25,10 @@
                (write-region ,content nil ,file-var nil 'silent))
              (setq ,buf-var (find-file-noselect ,file-var))
              ,@body)
-         (when (buffer-live-p ,buf-var) (kill-buffer ,buf-var))
+         (when (buffer-live-p ,buf-var)
+           (with-current-buffer ,buf-var
+             (set-buffer-modified-p nil))
+           (kill-buffer ,buf-var))
          (ignore-errors (delete-file ,file-var))))))
 
 (defun anvil-buffer-test--bump-disk-mtime (file)

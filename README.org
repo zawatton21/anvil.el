@@ -871,8 +871,8 @@ The =git= module is part of the default =anvil-modules= list.  It
 exposes read-only git inspection tools under the shared
 =emacs-eval= server id:
 
-- =git-repo-root= — top-level directory for a path, nil outside
-  a repo.
+- =git-repo-root= — top-level directory for a directory path, nil
+  outside a repo.
 - =git-head-sha= — full or abbreviated HEAD commit.
 - =git-branch-current= — current branch name, nil for detached.
 - =git-log= — recent commits as =(hash, date, author, subject)=

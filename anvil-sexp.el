@@ -428,9 +428,9 @@ form with NAME is found."
        (anvil-sexp--maybe-apply plan apply)))))
 
 (defun anvil-sexp--sexp-bounds-at (point)
-  "Return (BEG . END) of the sexp surrounding POINT in the current buffer.
-Uses `bounds-of-thing-at-point' and falls back to `up-list' when
-POINT lies directly on whitespace between forms."
+  "Return (BEG . END) of the innermost sexp at POINT in the current buffer.
+Uses `bounds-of-thing-at-point' and falls back to the enclosing list
+when POINT lies directly on whitespace between forms."
   (save-excursion
     (goto-char point)
     (or (bounds-of-thing-at-point 'sexp)
@@ -442,11 +442,12 @@ POINT lies directly on whitespace between forms."
               (cons beg (point))))))))
 
 (defun anvil-sexp--tool-wrap-form (file point wrapper &optional apply)
-  "Wrap the sexp at POINT in FILE with WRAPPER.
+  "Wrap the innermost sexp at POINT in FILE with WRAPPER.
+When POINT lies on inter-form whitespace, fall back to the enclosing list.
 
 MCP Parameters:
   file    - Absolute path to an .el source file.
-  point   - Buffer point (1-based) inside the sexp to wrap.
+  point   - Buffer point (1-based) at or inside the sexp to wrap.
   wrapper - Elisp source text containing the placeholder token
             `|anvil-sexp-hole|'.  Example:
               \"(when cond |anvil-sexp-hole|)\"
@@ -998,19 +999,35 @@ leak in."
     (with-temp-buffer
       (insert log-text)
       (goto-char (point-min))
-      (while (re-search-forward
-              "^\\(.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
-              nil t)
-        (let ((path (match-string 1))
-              (line (string-to-number (match-string 2)))
-              (col  (string-to-number (match-string 3)))
-              (kind-str (match-string 4))
-              (msg (match-string 5)))
-          (when (string-equal (file-name-nondirectory path) base)
-            (push (list :kind (if (equal kind-str "Error") 'error 'warning)
-                        :source 'byte-compile
-                        :line line :column col :message msg)
-                  diags)))))
+      (while (not (eobp))
+        (let ((line-text (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match
+             "^\\(.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((path (match-string 1 line-text))
+                  (line (string-to-number (match-string 2 line-text)))
+                  (col  (string-to-number (match-string 3 line-text)))
+                  (kind-str (match-string 4 line-text))
+                  (msg (match-string 5 line-text)))
+              (when (string-equal (file-name-nondirectory path) base)
+                (push (list :kind (if (equal kind-str "Error") 'error 'warning)
+                            :source 'byte-compile
+                            :line line :column col :message msg)
+                      diags))))
+           ((string-match
+             "^\\(.*?\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((path (match-string 1 line-text))
+                  (kind-str (match-string 2 line-text))
+                  (msg (match-string 3 line-text)))
+              (when (string-equal (file-name-nondirectory path) base)
+                (push (list :kind (if (equal kind-str "Error") 'error 'warning)
+                            :source 'byte-compile
+                            :line 0 :column 0 :message msg)
+                      diags)))))
+        (forward-line 1))))
     (nreverse diags)))
 
 (defun anvil-sexp--run-byte-compile (file)
@@ -1140,7 +1157,8 @@ tool; defaults to preview unless APPLY is non-nil."
   (anvil-sexp--tool-replace-defun file name new-form (when apply "t")))
 
 (cl-defun anvil-sexp-wrap-form (file point wrapper &key apply)
-  "Wrap the sexp surrounding POINT in FILE with WRAPPER.
+  "Wrap the innermost sexp at POINT in FILE with WRAPPER.
+When POINT lies on inter-form whitespace, fall back to the enclosing list.
 WRAPPER is source text containing `|anvil-sexp-hole|'.  See
 `sexp-wrap-form' MCP tool."
   (anvil-sexp--tool-wrap-form file point wrapper (when apply "t")))
@@ -1264,10 +1282,11 @@ does not parse or when no form matches the given name.")
    :layer 'core
    :server-id anvil-sexp--server-id
    :description
-   "Wrap the sexp surrounding POINT in FILE with WRAPPER source text.
-WRAPPER must contain the placeholder token `|anvil-sexp-hole|';
-the original sexp replaces the placeholder.  Preview by default;
-apply=t writes to disk.")
+   "Wrap the innermost sexp at POINT in FILE with WRAPPER source text.
+When POINT lies on inter-form whitespace, the tool falls back to the
+enclosing list.  WRAPPER must contain the placeholder token
+`|anvil-sexp-hole|'; the original sexp replaces the placeholder.
+Preview by default; apply=t writes to disk.")
 
   (anvil-server-register-tool
    (anvil-server-encode-handler #'anvil-sexp--tool-rename-symbol)

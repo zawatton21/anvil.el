@@ -40,6 +40,22 @@
       (should (anvil-future-await future 30))
       (should (equal "藤澤電気" (anvil-future-value future))))))
 
+(ert-deftest anvil-offload-test-unreadable-stdout-chatter-does-not-poison-reply ()
+  "Unreadable stdout chatter is skipped until the framed reply arrives."
+  (anvil-offload-test--with-clean-repl
+    (let ((future (anvil-offload '(progn (princ ".") 42))))
+      (should (anvil-future-await future 30))
+      (should (eq 'done (anvil-future-status future)))
+      (should (= 42 (anvil-future-value future))))))
+
+(ert-deftest anvil-offload-test-line-stdout-chatter-does-not-poison-reply ()
+  "Plain stdout lines emitted before the reply do not break framing."
+  (anvil-offload-test--with-clean-repl
+    (let ((future (anvil-offload '(progn (princ "hello\n") 42))))
+      (should (anvil-future-await future 30))
+      (should (eq 'done (anvil-future-status future)))
+      (should (= 42 (anvil-future-value future))))))
+
 (ert-deftest anvil-offload-test-error-propagation ()
   "Remote errors settle the future into the `error' state."
   (anvil-offload-test--with-clean-repl
@@ -234,6 +250,25 @@ until the checkpoint arrives (non-settling), then kills the future."
         (should (eq 'c3    (plist-get cp :cursor))))
       (anvil-future-kill future))))
 
+(ert-deftest anvil-offload-test-checkpoint-survives-stdout-chatter ()
+  "Stdout chatter before a checkpoint does not poison the framed transport."
+  (anvil-offload-test--with-clean-repl
+    (let* ((form '(progn (princ ".")
+                         (anvil-preempt-checkpoint 'ok 'cursor)
+                         (sleep-for 30)))
+           (future (anvil-offload form)))
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (null (anvil-future-checkpoint future))
+                    (eq 'pending (anvil-future-status future))
+                    (< (float-time) deadline))
+          (accept-process-output (anvil-future--process future) 0.05)))
+      (let ((cp (anvil-future-checkpoint future)))
+        (should cp)
+        (should (eq 'ok (plist-get cp :value)))
+        (should (eq 'cursor (plist-get cp :cursor))))
+      (anvil-future-kill future)
+      (should (eq 'killed (anvil-future-status future))))))
+
 (ert-deftest anvil-offload-test-load-path-extra ()
   "`:load-path' prepends directories so (require 'X) can find them."
   (anvil-offload-test--with-clean-repl
@@ -244,11 +279,35 @@ until the checkpoint arrives (non-settling), then kills the future."
       (unwind-protect
           (progn
             (with-temp-file stub-file
-              (insert (format ";;; %s.el\n" stub-feat))
+              (insert (format ";;; %s.el -*- lexical-binding: t; -*-\n"
+                              stub-feat))
               (insert (format "(defun %s-mul (x y) (* x y))\n" stub-feat))
               (insert (format "(provide '%s)\n" stub-feat)))
             (let ((future (anvil-offload
                            `(,(intern (format "%s-mul" stub-feat)) 6 7)
+                           :require stub-feat
+                           :load-path (list tmp))))
+              (should (anvil-future-await future 30))
+              (should (= 42 (anvil-future-value future)))))
+        (delete-directory tmp t)))))
+
+(ert-deftest anvil-offload-test-require-load-chatter-does-not-poison-reply ()
+  "Top-level stdout chatter during `require' does not break the protocol."
+  (anvil-offload-test--with-clean-repl
+    (let* ((tmp (make-temp-file "anvil-offload-noisy-" t))
+           (stub-feat (intern (format "anvil-offload-noisy-%s"
+                                      (format-time-string "%s%N"))))
+           (stub-file (expand-file-name (format "%s.el" stub-feat) tmp)))
+      (unwind-protect
+          (progn
+            (with-temp-file stub-file
+              (insert (format ";;; %s.el -*- lexical-binding: t; -*-\n"
+                              stub-feat))
+              (insert "(princ \".\")\n")
+              (insert (format "(defun %s-value () 42)\n" stub-feat))
+              (insert (format "(provide '%s)\n" stub-feat)))
+            (let ((future (anvil-offload
+                           `(,(intern (format "%s-value" stub-feat)))
                            :require stub-feat
                            :load-path (list tmp))))
               (should (anvil-future-await future 30))

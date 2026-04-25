@@ -618,6 +618,60 @@ not a create (use `py-add-import' for that)."
       (should-error (anvil-py-rename-import f '(:kind from :from "openpyxl"))
                     :type 'user-error))))
 
+;;;; --- MCP wrappers -------------------------------------------------------
+
+(ert-deftest anvil-py-test-tool-add-import-accepts-quoted-kind-string ()
+  "The MCP wrapper should accept the legacy quoted Lisp kind syntax."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py--tool-add-import
+       f "(:kind 'import :module \"subprocess\")" "t")
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^import subprocess$" text))))))
+
+(ert-deftest anvil-py-test-tool-add-import-accepts-json-spec ()
+  "The MCP wrapper should accept JSON specs and coerce names arrays."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py--tool-add-import
+       f "{\"kind\":\"from\",\"from\":\"json\",\"names\":[\"loads\",\"dumps\"]}"
+       "t")
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^from json import loads, dumps$" text))
+        (should (string-match-p "from typing import" text))))))
+
+(ert-deftest anvil-py-test-tool-add-import-invalid-kind-errors ()
+  "Invalid kinds should fail loudly instead of silently returning nil."
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (let ((err (should-error
+                  (anvil-py--tool-add-import
+                   f "(:kind bogus :module \"json\")" nil)
+                  :type 'anvil-server-tool-error)))
+        (should (string-match-p "unsupported :kind"
+                                (error-message-string err)))))))
+
+(ert-deftest anvil-py-test-tool-remove-import-accepts-quoted-kind-string ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py--tool-remove-import
+       f "(:kind 'import :module \"os\")" "t")
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should-not (string-match-p "^import os$" text))))))
+
+(ert-deftest anvil-py-test-tool-rename-import-accepts-quoted-kind-string ()
+  (anvil-py-test--requires-grammar
+    (anvil-py-test--with-edit-copy f
+      (anvil-py--tool-rename-import
+       f "(:kind 'import :module \"sys\" :new-alias \"sy\")" "t")
+      (let ((text (with-temp-buffer
+                    (insert-file-contents f) (buffer-string))))
+        (should (string-match-p "^import sys as sy$" text))
+        (should-not (string-match-p "^import sys as system$" text))))))
+
 ;;;; --- wrap-expr (Phase 2c) -----------------------------------------------
 
 (ert-deftest anvil-py-test-wrap-expr-wraps-integer-literal ()

@@ -692,6 +692,11 @@ METHOD-METRICS is used to track errors."
      (let ((code (car (cdr err)))
            (message (cadr (cdr err))))
        (anvil-server--jsonrpc-error id code message)))
+    (quit
+     (cl-incf (anvil-server-metrics-errors method-metrics))
+     (anvil-server--jsonrpc-error
+      id anvil-server-jsonrpc-error-internal
+      (format "Resource handler quit for %s: %S" uri err)))
     ;; Handle any other error from the handler
     (error
      (cl-incf (anvil-server-metrics-errors method-metrics))
@@ -1115,6 +1120,12 @@ virtual server-ids share the same handler pool."
                       (isError . t))))
                (anvil-server--respond-with-result
                 context formatted-error)))
+            (quit
+             (anvil-server-metrics--track-tool-call tool-name t)
+             (cl-incf (anvil-server-metrics-errors method-metrics))
+             (anvil-server--jsonrpc-error
+              id anvil-server-jsonrpc-error-internal
+              (format "Tool handler quit: %S" err)))
             ;; Keep existing handling for all other errors
             (error
              (anvil-server-metrics--track-tool-call tool-name t)
@@ -1240,6 +1251,8 @@ See also: `anvil-server-tool-throw'"
   `(condition-case err
        (progn
          ,@body)
+     (quit
+      (anvil-server-tool-throw (format "Quit: %S" err)))
      (error
       (anvil-server-tool-throw (format "Error: %S" err)))))
 
@@ -1289,6 +1302,8 @@ See also: `anvil-server-process-jsonrpc-parsed'"
           (setq response
                 (anvil-server--validate-and-dispatch-request
                  json-object server-id))
+        (quit
+         (setq response (anvil-server--handle-error err)))
         (error
          (setq response (anvil-server--handle-error err)))))
 

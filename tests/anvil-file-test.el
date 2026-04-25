@@ -27,6 +27,13 @@
       (insert-file-contents path))
     (buffer-string)))
 
+(defun anvil-file-test--discard-buffer (buf)
+  "Kill visited temp BUF without interactive modified-buffer prompts."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (set-buffer-modified-p nil))
+    (kill-buffer buf)))
+
 ;;;; --- json-object-add ------------------------------------------------------
 
 (ert-deftest anvil-file-test-json-add-empty-object ()
@@ -254,7 +261,7 @@
                (should (string-match-p "buffer-newer" (car ws)))
                ;; Disk content unchanged.
                (should (equal "hello\n" (plist-get res :content)))))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-replace-string-warnings-empty ()
   "anvil-file-replace-string returns :warnings nil when no buffer visits."
@@ -283,7 +290,7 @@
                (should (string-match-p "buffer-newer" (car ws)))
                (should (equal "alpha BETA gamma\n"
                               (anvil-file-test--read path)))))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 ;;;; --- Phase 2 full: :warnings embedded in all mutating tools --------------
 
@@ -303,7 +310,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-replace-regexp path "b+" "BBB")))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-insert-at-line-warnings ()
   (anvil-file-test--with-tmp
@@ -315,7 +322,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-insert-at-line path 2 "inserted")))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-delete-lines-warnings ()
   (anvil-file-test--with-tmp
@@ -327,7 +334,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-delete-lines path 2 3)))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-append-warnings ()
   (anvil-file-test--with-tmp
@@ -339,7 +346,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-append path "tail\n")))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-prepend-warnings ()
   (anvil-file-test--with-tmp
@@ -351,7 +358,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-prepend path "head\n")))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-batch-warnings ()
   (anvil-file-test--with-tmp
@@ -365,7 +372,7 @@
               (anvil-file-batch
                path
                '(((op . "replace") (old . "foo") (new . "FOO"))))))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-ensure-import-warnings-insert-path ()
   "ensure-import's insertion branch carries a divergence :warning."
@@ -378,7 +385,7 @@
              (with-current-buffer buf (insert "UNSAVED"))
              (anvil-file-test--expect-warning
               (anvil-file-ensure-import path "import c")))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 (ert-deftest anvil-file-test-phase2-ensure-import-warnings-already-present ()
   "ensure-import's already-present branch still surfaces :warnings.
@@ -396,7 +403,7 @@ Uses a fixture whose target line is already on disk so no write fires."
                (should (string-match-p
                         "buffer-newer\\|both-modified"
                         (car (plist-get res :warnings))))))
-         (when (buffer-live-p buf) (kill-buffer buf)))))))
+         (anvil-file-test--discard-buffer buf))))))
 
 ;;;; --- code-add-field-by-map ----------------------------------------------
 

@@ -100,6 +100,18 @@ never inject terminal escapes into captured stdout."
       (error "anvil-git: %s failed (exit %s): %s"
              context exit (string-trim (plist-get res :stderr))))))
 
+(defun anvil-git--require-directory (path context)
+  "Return PATH expanded, or signal when PATH is not an existing directory.
+Nil PATH is returned as nil so callers can still default to
+`default-directory'.  CONTEXT names the public helper for error text."
+  (cond
+   ((null path) nil)
+   ((file-directory-p path) (expand-file-name path))
+   ((file-exists-p path)
+    (user-error "%s: PATH must be a directory: %s" context path))
+   (t
+    (user-error "%s: directory does not exist: %s" context path))))
+
 ;;;; --- anvil-git-status ---------------------------------------------------
 
 (defun anvil-git--parse-branch-line (line)
@@ -353,9 +365,10 @@ OPTS plist:
   "Return the absolute top-level directory of the git repo for DIR.
 Cheap probe; every worktree / orchestrator helper calls this
 first.  Never signals — returns nil when DIR is not in a repo.
-Behaves identically to `anvil-git-toplevel'; the `repo-root' name
-matches the orchestrator / other-module naming convention."
-  (anvil-git-toplevel dir))
+DIR, when non-nil, must name an existing directory.  Behaves
+identically to `anvil-git-toplevel'; the `repo-root' name matches
+the orchestrator / other-module naming convention."
+  (anvil-git-toplevel (anvil-git--require-directory dir "anvil-git-repo-root")))
 
 ;;;; --- anvil-git-head-sha -------------------------------------------------
 
@@ -464,7 +477,7 @@ Keys: :ref (commit-ish to check out, default \"HEAD\"),
   "Return the git repo top-level dir for PATH, or nil.
 
 MCP Parameters:
-  path - Directory or file path inside the repo."
+  path - Directory inside the repo."
   (anvil-server-with-error-handling
    (or (anvil-git-repo-root path) "null")))
 
@@ -552,7 +565,7 @@ MCP Parameters:
    :server-id anvil-git--server-id
    :description
    "Return the git top-level directory for PATH, or nil when PATH is
-not inside a repository."
+not inside a repository.  PATH must be a directory."
    :read-only t)
 
   (anvil-server-register-tool

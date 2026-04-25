@@ -84,6 +84,105 @@
 
 ;;; xref tools
 
+(defun anvil-ide--normalize-path (path)
+  "Return PATH as an absolute canonical path when possible."
+  (when (stringp path)
+    (let ((expanded (expand-file-name path)))
+      (if (file-exists-p expanded)
+          (file-truename expanded)
+        expanded))))
+
+(defun anvil-ide--normalize-directory (path)
+  "Return PATH as an absolute canonical directory name when possible."
+  (let ((normalized (anvil-ide--normalize-path path)))
+    (when normalized
+      (file-name-as-directory normalized))))
+
+(defun anvil-ide--xref-scope-root (buffer file-path)
+  "Return the directory root used to scope xref results for FILE-PATH.
+Prefer BUFFER's project root.  Fall back to the directory containing
+FILE-PATH when no project is available."
+  (or (when-let* ((proj (anvil-ide--project-for-buffer buffer))
+                  (root (project-root proj)))
+        (anvil-ide--normalize-directory root))
+      (let ((dir (file-name-directory (expand-file-name file-path))))
+        (when dir
+          (anvil-ide--normalize-directory dir)))))
+
+(defun anvil-ide--xref-location-file (location)
+  "Return LOCATION's backing file path, or nil."
+  (let ((marker (ignore-errors (xref-location-marker location))))
+    (or (and (markerp marker)
+             (let ((buffer (marker-buffer marker)))
+               (and (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (buffer-file-name)))))
+        (let ((group (xref-location-group location)))
+          (and (stringp group) group)))))
+
+(defun anvil-ide--xref-item-in-scope-p (item scope-root)
+  "Return non-nil when xref ITEM belongs to SCOPE-ROOT."
+  (if (not scope-root)
+      t
+    (when-let* ((file (anvil-ide--xref-location-file
+                       (xref-item-location item)))
+                (normalized-file (anvil-ide--normalize-path file)))
+      (file-in-directory-p normalized-file scope-root))))
+
+(defun anvil-ide--xref-filter-items (items scope-root)
+  "Return xref ITEMS filtered to SCOPE-ROOT."
+  (if (not scope-root)
+      items
+    (cl-remove-if-not
+     (lambda (item)
+       (anvil-ide--xref-item-in-scope-p item scope-root))
+     items)))
+
+(defun anvil-ide--xref-format-item (item)
+  "Format xref ITEM as a single `file:line: summary' string."
+  (let* ((location (xref-item-location item))
+         (file (or (anvil-ide--xref-location-file location)
+                   (xref-location-group location)))
+         (marker (ignore-errors (xref-location-marker location)))
+         (line (if (markerp marker)
+                   (with-current-buffer (marker-buffer marker)
+                     (save-excursion
+                       (goto-char marker)
+                       (line-number-at-pos)))
+                 0))
+         (summary (xref-item-summary item)))
+    (format "%s:%d: %s" file line summary)))
+
+(defun anvil-ide--xref-format-items (items scope-root empty-message)
+  "Format xref ITEMS filtered to SCOPE-ROOT, or return EMPTY-MESSAGE."
+  (let ((filtered (anvil-ide--xref-filter-items items scope-root)))
+    (if filtered
+        (mapconcat #'anvil-ide--xref-format-item filtered "\n")
+      empty-message)))
+
+(defun anvil-ide--xref-elisp-apropos-scope-message
+    (pattern items scope-root)
+  "Explain Elisp apropos PATTERN hits in ITEMS being filtered by SCOPE-ROOT."
+  (let ((loaded-file
+         (cl-loop for item in items
+                  thereis
+                  (anvil-ide--normalize-path
+                   (anvil-ide--xref-location-file
+                    (xref-item-location item))))))
+    (mapconcat
+     #'identity
+     (delq nil
+           (list
+            (format "No project-local symbols found matching '%s'."
+                    pattern)
+            "The Emacs Lisp xref backend returned only matches outside the current project scope."
+            (when loaded-file
+              (format "Loaded checkout hit: %s" loaded-file))
+            (when scope-root
+              (format "Current project scope: %s" scope-root))
+            "This usually means Emacs loaded a different checkout; try reloading the dev tree or running anvil-self-sync-check."))
+     "\n")))
+
 (defun anvil-ide--xref-find-references (identifier file-path)
   "Find references to IDENTIFIER using FILE-PATH as context.
 
@@ -94,23 +193,26 @@ MCP Parameters:
    (let ((target-buffer (or (find-buffer-visiting file-path)
                             (find-file-noselect file-path))))
      (with-current-buffer target-buffer
-       (let ((backend (xref-find-backend)))
+       (let* ((backend (xref-find-backend))
+              (project (anvil-ide--project-for-buffer target-buffer))
+              (scope-root (anvil-ide--xref-scope-root
+                           target-buffer file-path)))
          (if (not backend)
              (format "No xref backend available for %s" file-path)
-           (let ((xref-items (xref-backend-references backend identifier)))
+           (let ((xref-items
+                  ;; The generic Elisp xref reference search falls back to
+                  ;; `project-current t', which can prompt on non-project
+                  ;; files and raise `minibuffer-quit' in MCP contexts.
+                  (if (and (eq backend 'elisp)
+                           (not project)
+                           scope-root)
+                      (xref-references-in-directory identifier scope-root)
+                    (xref-backend-references backend identifier))))
              (if xref-items
-                 (mapconcat
-                  (lambda (item)
-                    (let* ((location (xref-item-location item))
-                           (file (xref-location-group location))
-                           (marker (xref-location-marker location))
-                           (line (with-current-buffer (marker-buffer marker)
-                                   (save-excursion
-                                     (goto-char marker)
-                                     (line-number-at-pos))))
-                           (summary (xref-item-summary item)))
-                      (format "%s:%d: %s" file line summary)))
-                  xref-items "\n")
+                 (anvil-ide--xref-format-items
+                  xref-items
+                  scope-root
+                  (format "No references found for '%s'" identifier))
                (format "No references found for '%s'" identifier)))))))))
 
 (defun anvil-ide--xref-find-apropos (pattern file-path)
@@ -123,7 +225,9 @@ MCP Parameters:
    (let ((target-buffer (or (find-buffer-visiting file-path)
                             (find-file-noselect file-path))))
      (with-current-buffer target-buffer
-       (let ((backend (xref-find-backend)))
+       (let ((backend (xref-find-backend))
+             (scope-root (anvil-ide--xref-scope-root
+                          target-buffer file-path)))
          (cond
           ((not backend)
            (format "No xref backend available for %s" file-path))
@@ -136,28 +240,46 @@ MCP Parameters:
           (t
            (let ((xref-items (xref-backend-apropos backend pattern)))
              (if xref-items
-                 (mapconcat
-                  (lambda (item)
-                    (let* ((location (xref-item-location item))
-                           (file (xref-location-group location))
-                           (marker (xref-location-marker location))
-                           (line (with-current-buffer (marker-buffer marker)
-                                   (save-excursion
-                                     (goto-char marker)
-                                     (line-number-at-pos))))
-                           (summary (xref-item-summary item)))
-                      (format "%s:%d: %s" file line summary)))
-                  xref-items "\n")
+                 (let ((filtered
+                        (anvil-ide--xref-filter-items
+                         xref-items scope-root)))
+                   (if filtered
+                       (mapconcat
+                        #'anvil-ide--xref-format-item filtered "\n")
+                     (if (eq backend 'elisp)
+                         (anvil-ide--xref-elisp-apropos-scope-message
+                          pattern xref-items scope-root)
+                       (format "No symbols found matching '%s'"
+                               pattern))))
                (format "No symbols found matching '%s'" pattern))))))))))
 
 ;;; Project info
+
+(defun anvil-ide--project-for-buffer (buffer)
+  "Return the project object for BUFFER, or nil."
+  (when (and (featurep 'project)
+             (buffer-live-p buffer))
+    (with-current-buffer buffer
+      (when (and (stringp default-directory)
+                 (file-directory-p default-directory))
+        (ignore-errors (project-current nil))))))
+
+(defun anvil-ide--current-project ()
+  "Return the most relevant current project, or nil."
+  (or (anvil-ide--project-for-buffer
+       (window-buffer (selected-window)))
+      (anvil-ide--project-for-buffer (current-buffer))
+      (cl-loop for buffer in (buffer-list)
+               when (or (buffer-file-name buffer)
+                        (buffer-local-value 'default-directory buffer))
+               thereis (anvil-ide--project-for-buffer buffer))))
 
 (defun anvil-ide--project-info ()
   "Get information about the current project.
 
 MCP Parameters: (none)"
   (anvil-server-with-error-handling
-   (if-let* ((proj (project-current)))
+   (if-let* ((proj (anvil-ide--current-project)))
        (let ((root (project-root proj)))
          (format "Project: %s\nFiles: %d"
                  root
@@ -395,7 +517,9 @@ MCP Parameters:
          (results '()))
      (if (and file-path (not (string-empty-p file-path)))
          ;; Single file
-         (when-let ((buffer (get-file-buffer (expand-file-name file-path))))
+         (when-let ((buffer (or (get-file-buffer (expand-file-name file-path))
+                                (find-file-noselect
+                                 (expand-file-name file-path)))))
            (when (eq backend 'auto)
              (setq backend (cond
                             ((and (featurep 'flycheck)

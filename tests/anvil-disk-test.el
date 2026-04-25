@@ -33,7 +33,10 @@ is killed and the file deleted on exit."
                  `((setq ,buf-var (find-file-noselect ,file-var))))
              ,@body)
          ,@(when buf-var
-             `((when (buffer-live-p ,buf-var) (kill-buffer ,buf-var))))
+             `((when (buffer-live-p ,buf-var)
+                 (with-current-buffer ,buf-var
+                   (set-buffer-modified-p nil))
+                 (kill-buffer ,buf-var))))
          (ignore-errors (delete-file ,file-var))))))
 
 (defun anvil-disk-test--bump-disk-mtime (file)

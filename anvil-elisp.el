@@ -100,16 +100,19 @@ Restores the original mode state after BODY completes."
 ;;; JSON Response Helpers
 
 (defun anvil-elisp--json-encode-source-location
-    (source file-path start-line end-line)
+    (source file-path start-line end-line &optional extra-fields)
   "Encode a source location response as JSON.
 SOURCE is the source code string.
 FILE-PATH is the absolute path to the source file.
-START-LINE and END-LINE are 1-based line numbers."
+START-LINE and END-LINE are 1-based line numbers.
+EXTRA-FIELDS, when non-nil, is an alist appended to the response."
   (json-encode
-   `((source . ,source)
-     (file-path . ,file-path)
-     (start-line . ,start-line)
-     (end-line . ,end-line))))
+   (append
+    `((source . ,source)
+      (file-path . ,file-path)
+      (start-line . ,start-line)
+      (end-line . ,end-line))
+    extra-fields)))
 
 (defun anvil-elisp--json-encode-not-found (symbol message)
   "Encode a not-found response as JSON.
@@ -276,6 +279,46 @@ BODY is the list of body expressions."
               (list doc))
             ,@body)))
     (pp-to-string defun-form)))
+
+(defun anvil-elisp--strip-runtime-signature (doc)
+  "Return DOC without a trailing runtime-added \"(fn ...)\" signature."
+  (if (and (stringp doc)
+           (string-match "\\`\\(.+?\\)\\(?:\n\n(fn [^)]+)\\)?\\'" doc))
+      (match-string 1 doc)
+    doc))
+
+(defun anvil-elisp--get-function-definition-native-no-source
+    (fn-name sym)
+  "Return a synthetic definition for native-compiled FN-NAME without source.
+SYM is the function symbol.  This path is used when runtime metadata
+confirms native compilation but there is no recoverable source file."
+  (let* ((args (or (help-function-arglist sym t) '(&rest args)))
+         (doc (anvil-elisp--strip-runtime-signature
+               (or (documentation sym t) "")))
+         (message
+          (format
+           "Original body unavailable: `%s' is native-compiled and no source file is recorded."
+           fn-name))
+         (defun-form
+          `(defun ,sym ,args
+             ,@(when (anvil-elisp--non-empty-docstring-p doc)
+                 (list doc))
+             (error ,message)))
+         (source
+          (concat
+           (format
+            ";; Synthetic stub: `%s' is native-compiled and has no recoverable source file.\n"
+            fn-name)
+           (pp-to-string defun-form)))
+         (end-line (max 1 (length (string-lines source)))))
+    (anvil-elisp--json-encode-source-location
+     source
+     "<native-compiled>"
+     1
+     end-line
+     `((source-unavailable . t)
+       (reason . "native-compiled-no-source")
+       (message . ,message)))))
 
 (defun anvil-elisp--get-function-definition-interactive
     (fn-name sym fn)
@@ -491,20 +534,30 @@ SYM is the function symbol.
 FN-INFO is the result from `anvil-elisp--extract-function-info`."
   (let ((fn (nth 0 fn-info))
         (is-alias (nth 1 fn-info))
-        (aliased-to (nth 2 fn-info)))
+        (aliased-to (nth 2 fn-info))
+        ;; Native-compiled Elisp functions also satisfy `subrp', so prefer
+        ;; the recorded source file when one exists before classifying a
+        ;; function as C-implemented.
+        (func-file (find-lisp-object-file-name sym 'defun)))
     (cond
-     ;; C-implemented function
-     ((subrp fn)
-      (anvil-elisp--get-function-definition-c-function function))
-
      ;; Has source file
-     ((find-lisp-object-file-name sym 'defun)
+     (func-file
       (anvil-elisp--get-function-definition-from-file
        function
        sym
-       (find-lisp-object-file-name sym 'defun)
+       func-file
        is-alias
        aliased-to))
+
+     ;; Native-compiled Elisp function without a recoverable source file.
+     ((and (fboundp 'native-comp-function-p)
+           (native-comp-function-p fn))
+      (anvil-elisp--get-function-definition-native-no-source
+       function sym))
+
+     ;; C-implemented function
+     ((subrp fn)
+      (anvil-elisp--get-function-definition-c-function function))
 
      ;; Interactive alias
      (is-alias
@@ -858,6 +911,7 @@ from the test file persist after the call.  Intended for tight
 feedback loops during development — use a batch subprocess when
 isolation matters."
   (let* ((path (expand-file-name file))
+         (path-dir (file-name-directory path))
          (sel  (cond
                 ((null selector) t)
                 ((and (stringp selector) (string-empty-p selector)) t)
@@ -886,7 +940,11 @@ isolation matters."
          (passed 0) (failed 0) (skipped 0)
          (failures nil)
          (before (anvil-elisp--ert-registered-names)))
-    (load path nil t)
+    (let ((load-path (if (and path-dir
+                              (not (member path-dir load-path)))
+                         (cons path-dir load-path)
+                       load-path)))
+      (load path nil t))
     (let* ((after   (anvil-elisp--ert-registered-names))
            (added   (cl-remove-if (lambda (n) (memq n before)) after))
            (tests
@@ -961,14 +1019,27 @@ caller does not have to scan it."
       (error (push (error-message-string err) errors)))
     (with-current-buffer log-buf
       (goto-char (point-min))
-      (while (re-search-forward
-              "^\\(?:.*?:\\)?\\(?:[0-9]+:[0-9]+: ?\\)?\\(Warning\\|Error\\): \\(.*\\)$"
-              nil t)
-        (let ((kind (match-string 1))
-              (msg  (match-string 2)))
-          (if (equal kind "Warning")
-              (push msg warnings)
-            (push msg errors)))))
+      (while (not (eobp))
+        (let ((line-text (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match
+             "^\\(?:.*?\\):\\([0-9]+\\):\\([0-9]+\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((kind (match-string 3 line-text))
+                  (msg  (match-string 4 line-text)))
+              (if (equal kind "Warning")
+                  (push msg warnings)
+                (push msg errors))))
+           ((string-match
+             "^\\(?:.*?\\):\\s-*\\(Warning\\|Error\\):\\s-*\\(.*\\)$"
+             line-text)
+            (let ((kind (match-string 1 line-text))
+                  (msg  (match-string 2 line-text)))
+              (if (equal kind "Warning")
+                  (push msg warnings)
+                (push msg errors)))))
+        (forward-line 1))))
     (format "%S" (list :ok (and result (null errors))
                        :output (concat (file-name-sans-extension path) ".elc")
                        :warnings (nreverse warnings)

@@ -2201,9 +2201,9 @@ returned body to disk after human review."
      "Rebuild the memory_body_fts virtual table with a chosen tokenizer.
 Phase 2b-i: `trigram' (SQLite 3.34+) is CJK-friendly — Japanese
 substring queries (3+ chars) that miss under `unicode61' start
-matching.  Omit tokenizer to use `anvil-memory-fts-tokenizer'
-(defaults to `auto', which picks trigram when available).  Returns
-:tokenizer / :rebuilt.")
+matching.  Omit tokenizer to use `anvil-memory-fts-tokenizer'.
+Default is `auto': use `trigram' when available, otherwise fall
+back to `unicode61'.  Returns :tokenizer / :rebuilt.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-mdl-distill)
      :id "memory-mdl-distill"
