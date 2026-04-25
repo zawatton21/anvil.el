@@ -159,6 +159,14 @@
 (require 'dom)
 (require 'anvil-server)
 (require 'anvil-state)
+;; Architecture (2026-04-25 user signoff): anvil-XXX delegates pure
+;; helpers / heavy logic to nelisp-XXX low-level libraries so the
+;; substrate investment (Doc 24 Phase 6.2 全 9 sub-phase) is reused.
+;; nelisp src/ must be on `load-path' (anvil dev daemon adds it via
+;; Phase 5-E setup; Stage D launcher bundles nelisp src/ alongside
+;; anvil.el).  Soft load — defer to require so byte-compile works in
+;; both anvil-only and anvil+nelisp environments.
+(require 'nelisp-http nil 'noerror)
 
 ;; `anvil-version' is defined in anvil.el; we only read it in the
 ;; User-Agent default so soft-require it to avoid a load-order dep.
@@ -1395,43 +1403,49 @@ handling still works."
 
 ;;;; --- POST / auth helpers (Phase 1.5) ------------------------------------
 
+;; Phase 6.2 (Doc 24) で nelisp-http に同名 helper が port 済。本実装
+;; は nelisp-http が load-path にあれば nelisp 版へ delegate、なければ
+;; 自前 fallback (anvil 単体動作保証)。3 helpers は purely functional、
+;; cache / I/O 状態を持たないので backward compat 100%。
+
 (defun anvil-http--url-encode-form (alist)
   "Return ALIST encoded as application/x-www-form-urlencoded.
-Keys and values are coerced to strings via `format' before
-hexification, so symbols and numbers work transparently."
-  (mapconcat
-   (lambda (pair)
-     (format "%s=%s"
-             (url-hexify-string (format "%s" (car pair)))
-             (url-hexify-string (format "%s" (cdr pair)))))
-   alist
-   "&"))
+Delegates to `nelisp-http--url-encode-form' when available."
+  (if (fboundp 'nelisp-http--url-encode-form)
+      (nelisp-http--url-encode-form alist)
+    (mapconcat
+     (lambda (pair)
+       (format "%s=%s"
+               (url-hexify-string (format "%s" (car pair)))
+               (url-hexify-string (format "%s" (cdr pair)))))
+     alist
+     "&")))
 
 (defun anvil-http--plist-to-hash (plist)
   "Return PLIST as a JSON-friendly hash table.
-Keyword keys lose their leading colon; non-keyword keys are
-formatted via `format'.  Used by `--encode-body' to feed
-`json-serialize'."
-  (let ((h (make-hash-table :test 'equal)))
-    (while plist
-      (let ((k (car plist))
-            (v (cadr plist)))
-        (puthash (cond ((keywordp k) (substring (symbol-name k) 1))
-                       ((symbolp k) (symbol-name k))
-                       (t (format "%s" k)))
-                 v h))
-      (setq plist (cddr plist)))
-    h))
+Delegates to `nelisp-http--plist-to-hash' when available."
+  (if (fboundp 'nelisp-http--plist-to-hash)
+      (nelisp-http--plist-to-hash plist)
+    (let ((h (make-hash-table :test 'equal)))
+      (while plist
+        (let ((k (car plist))
+              (v (cadr plist)))
+          (puthash (cond ((keywordp k) (substring (symbol-name k) 1))
+                         ((symbolp k) (symbol-name k))
+                         (t (format "%s" k)))
+                   v h))
+        (setq plist (cddr plist)))
+      h)))
 
 (defun anvil-http--alist-of-string-pairs-p (x)
   "Non-nil when X looks like an alist of (KEY . VAL) pairs.
-Used to disambiguate alist-form bodies from plist-form bodies in
-`anvil-http--encode-body' — alists have cons-pair elements, plists
-start with a keyword."
-  (and (consp x)
-       (not (keywordp (car x)))
-       (consp (car x))
-       (not (consp (cdr (car x))))))
+Delegates to `nelisp-http--alist-of-string-pairs-p' when available."
+  (if (fboundp 'nelisp-http--alist-of-string-pairs-p)
+      (nelisp-http--alist-of-string-pairs-p x)
+    (and (consp x)
+         (not (keywordp (car x)))
+         (consp (car x))
+         (not (consp (cdr (car x)))))))
 
 (defun anvil-http--encode-body (body)
   "Encode BODY into (DATA . CONTENT-TYPE).
