@@ -1469,21 +1469,33 @@ Delegates to `nelisp-http--alist-of-string-pairs-p' when available."
 - string → (BODY . nil) — caller specifies Content-Type via headers.
 - alist of (KEY . VAL) → (form-urlencoded-string .
                          \"application/x-www-form-urlencoded\")
-- plist (starts with keyword) → (json-string . \"application/json\")"
-  (cond
-   ((null body) (cons nil nil))
-   ((stringp body) (cons body nil))
-   ((anvil-http--alist-of-string-pairs-p body)
-    (cons (anvil-http--url-encode-form body)
-          "application/x-www-form-urlencoded"))
-   ((and (listp body) (keywordp (car body)))
-    (cons (json-serialize (anvil-http--plist-to-hash body)
-                          :null-object :null
-                          :false-object :false)
-          "application/json"))
-   (t (signal 'anvil-server-tool-error
-              (list (format "anvil-http: cannot encode body of type %S"
-                            (type-of body)))))))
+- plist (starts with keyword) → (json-string . \"application/json\")
+
+Delegates to `nelisp-http--encode-body' when available.  nelisp's
+generic `error' is translated to `anvil-server-tool-error' so callers
+keep observing anvil's existing signal type."
+  (if (fboundp 'nelisp-http--encode-body)
+      (condition-case err
+          (nelisp-http--encode-body body)
+        (error
+         (signal 'anvil-server-tool-error
+                 (list (or (cadr err)
+                           (format "anvil-http: cannot encode body of type %S"
+                                   (type-of body)))))))
+    (cond
+     ((null body) (cons nil nil))
+     ((stringp body) (cons body nil))
+     ((anvil-http--alist-of-string-pairs-p body)
+      (cons (anvil-http--url-encode-form body)
+            "application/x-www-form-urlencoded"))
+     ((and (listp body) (keywordp (car body)))
+      (cons (json-serialize (anvil-http--plist-to-hash body)
+                            :null-object :null
+                            :false-object :false)
+            "application/json"))
+     (t (signal 'anvil-server-tool-error
+                (list (format "anvil-http: cannot encode body of type %S"
+                              (type-of body))))))))
 
 (defun anvil-http--apply-auth (headers auth)
   "Augment HEADERS alist with credentials from AUTH plist.
@@ -1494,34 +1506,38 @@ AUTH forms (only one keyword recognised at a time):
   (:header (NAME . VALUE))    → custom request header
 
 A list of these forms is also accepted; each is applied in order.
-Existing Authorization in HEADERS is overwritten by Bearer/Basic."
-  (cond
-   ((null auth) headers)
-   ;; multi-spec list: ((:bearer ...) (:header ...) ...)
-   ((and (consp auth) (consp (car auth)) (keywordp (caar auth)))
-    (cl-reduce (lambda (h spec) (anvil-http--apply-auth h spec))
-               auth :initial-value headers))
-   (t
-    (pcase (car-safe auth)
-      (:bearer
-       (cons (cons "Authorization"
-                   (format "Bearer %s" (cadr auth)))
-             (assq-delete-all "Authorization" (copy-sequence headers))))
-      (:basic
-       (let* ((tail (cdr auth))
-              (user (if (consp (car tail)) (caar tail) (car tail)))
-              (pass (if (consp (car tail)) (cdar tail) (cadr tail)))
-              (encoded (base64-encode-string
-                        (encode-coding-string
-                         (format "%s:%s" user pass) 'utf-8)
-                        t)))
-         (cons (cons "Authorization" (format "Basic %s" encoded))
-               (assq-delete-all "Authorization"
-                                (copy-sequence headers)))))
-      (:header
-       (let ((pair (cadr auth)))
-         (cons (cons (car pair) (cdr pair)) headers)))
-      (_ headers)))))
+Existing Authorization in HEADERS is overwritten by Bearer/Basic.
+
+Delegates to `nelisp-http--apply-auth' when available."
+  (if (fboundp 'nelisp-http--apply-auth)
+      (nelisp-http--apply-auth headers auth)
+    (cond
+     ((null auth) headers)
+     ;; multi-spec list: ((:bearer ...) (:header ...) ...)
+     ((and (consp auth) (consp (car auth)) (keywordp (caar auth)))
+      (cl-reduce (lambda (h spec) (anvil-http--apply-auth h spec))
+                 auth :initial-value headers))
+     (t
+      (pcase (car-safe auth)
+        (:bearer
+         (cons (cons "Authorization"
+                     (format "Bearer %s" (cadr auth)))
+               (assq-delete-all "Authorization" (copy-sequence headers))))
+        (:basic
+         (let* ((tail (cdr auth))
+                (user (if (consp (car tail)) (caar tail) (car tail)))
+                (pass (if (consp (car tail)) (cdar tail) (cadr tail)))
+                (encoded (base64-encode-string
+                          (encode-coding-string
+                           (format "%s:%s" user pass) 'utf-8)
+                          t)))
+           (cons (cons "Authorization" (format "Basic %s" encoded))
+                 (assq-delete-all "Authorization"
+                                  (copy-sequence headers)))))
+        (:header
+         (let ((pair (cadr auth)))
+           (cons (cons (car pair) (cdr pair)) headers)))
+        (_ headers))))))
 
 ;;;; --- public Elisp API ---------------------------------------------------
 
