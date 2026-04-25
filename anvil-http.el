@@ -827,70 +827,82 @@ Delegates to `nelisp-http--dom-select' when available."
 (defun anvil-http--select-html-libxml (html selector)
   "Return text from HTML matching SELECTOR via libxml + dom.el.
 Matches are joined with a blank-line separator.  Returns nil if the
-selector is outside the supported subset or nothing matched."
-  (let ((parts (anvil-http--parse-selector selector)))
-    (when (and parts (fboundp 'libxml-parse-html-region))
-      (let* ((dom (with-temp-buffer
-                    (insert html)
-                    (libxml-parse-html-region (point-min) (point-max))))
-             (nodes (and dom (anvil-http--dom-select dom parts))))
-        (when nodes
-          (let ((texts (delq nil
-                             (mapcar (lambda (n)
-                                       (let ((s (string-trim (or (dom-text n) ""))))
-                                         (and (not (string-empty-p s)) s)))
-                                     nodes))))
-            (when texts (mapconcat #'identity texts "\n\n"))))))))
+selector is outside the supported subset or nothing matched.
+
+Delegates to `nelisp-http--select-html-libxml' when available."
+  (if (fboundp 'nelisp-http--select-html-libxml)
+      (nelisp-http--select-html-libxml html selector)
+    (let ((parts (anvil-http--parse-selector selector)))
+      (when (and parts (fboundp 'libxml-parse-html-region))
+        (let* ((dom (with-temp-buffer
+                      (insert html)
+                      (libxml-parse-html-region (point-min) (point-max))))
+               (nodes (and dom (anvil-http--dom-select dom parts))))
+          (when nodes
+            (let ((texts (delq nil
+                               (mapcar (lambda (n)
+                                         (let ((s (string-trim (or (dom-text n) ""))))
+                                           (and (not (string-empty-p s)) s)))
+                                       nodes))))
+              (when texts (mapconcat #'identity texts "\n\n")))))))))
 
 (defun anvil-http--strip-tags (html)
   "Return HTML with tags removed and whitespace collapsed.
 Enough for the regex-subset fallback; not a substitute for a real
-HTML-to-text renderer (no entity decoding beyond amp/lt/gt/quot)."
-  (let* ((s (replace-regexp-in-string "<[^>]+>" "" html))
-         (s (replace-regexp-in-string "&amp;" "&" s))
-         (s (replace-regexp-in-string "&lt;" "<" s))
-         (s (replace-regexp-in-string "&gt;" ">" s))
-         (s (replace-regexp-in-string "&quot;" "\"" s))
-         (s (replace-regexp-in-string "[ \t]+" " " s))
-         (s (replace-regexp-in-string "\n[ \t]*\n[ \t\n]*" "\n\n" s)))
-    (string-trim s)))
+HTML-to-text renderer (no entity decoding beyond amp/lt/gt/quot).
+
+Delegates to `nelisp-http--strip-tags' when available."
+  (if (fboundp 'nelisp-http--strip-tags)
+      (nelisp-http--strip-tags html)
+    (let* ((s (replace-regexp-in-string "<[^>]+>" "" html))
+           (s (replace-regexp-in-string "&amp;" "&" s))
+           (s (replace-regexp-in-string "&lt;" "<" s))
+           (s (replace-regexp-in-string "&gt;" ">" s))
+           (s (replace-regexp-in-string "&quot;" "\"" s))
+           (s (replace-regexp-in-string "[ \t]+" " " s))
+           (s (replace-regexp-in-string "\n[ \t]*\n[ \t\n]*" "\n\n" s)))
+      (string-trim s))))
 
 (defun anvil-http--select-html-fallback (html selector)
   "Regex-subset selector for builds without libxml.
 Supports the same subset as `--parse-selector' but without
 combinators.  Nested tags of the same name can trip the lazy
-match; libxml is the recommended path when available."
-  (let* ((parts (anvil-http--parse-selector selector))
-         (case-fold-search t)
-         (rx nil)
-         (group 1))
-    (pcase parts
-      (`(:tag ,tag)
-       (setq rx (format "<%s\\b[^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
-                        (symbol-name tag) (symbol-name tag))))
-      (`(:id ,id)
-       (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
-                        (regexp-quote id)))
-       (setq group 2))
-      (`(:class ,cls)
-       (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
-                        (regexp-quote cls)))
-       (setq group 2))
-      (`(:tag-class ,tag ,cls)
-       (setq rx (format "<%s\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
-                        (symbol-name tag) (regexp-quote cls) (symbol-name tag))))
-      (`(:tag-id ,tag ,id)
-       (setq rx (format "<%s\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
-                        (symbol-name tag) (regexp-quote id) (symbol-name tag)))))
-    (when rx
-      (let ((pos 0) (acc nil))
-        (while (string-match rx html pos)
-          (let* ((content (match-string group html))
-                 (text (and content (anvil-http--strip-tags content))))
-            (when (and text (not (string-empty-p text)))
-              (push text acc)))
-          (setq pos (match-end 0)))
-        (when acc (mapconcat #'identity (nreverse acc) "\n\n"))))))
+match; libxml is the recommended path when available.
+
+Delegates to `nelisp-http--select-html-fallback' when available."
+  (if (fboundp 'nelisp-http--select-html-fallback)
+      (nelisp-http--select-html-fallback html selector)
+    (let* ((parts (anvil-http--parse-selector selector))
+           (case-fold-search t)
+           (rx nil)
+           (group 1))
+      (pcase parts
+        (`(:tag ,tag)
+         (setq rx (format "<%s\\b[^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                          (symbol-name tag) (symbol-name tag))))
+        (`(:id ,id)
+         (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
+                          (regexp-quote id)))
+         (setq group 2))
+        (`(:class ,cls)
+         (setq rx (format "<\\([A-Za-z][A-Za-z0-9]*\\)\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</\\1>"
+                          (regexp-quote cls)))
+         (setq group 2))
+        (`(:tag-class ,tag ,cls)
+         (setq rx (format "<%s\\b[^>]*\\bclass=[\"'][^\"']*\\b%s\\b[^\"']*[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                          (symbol-name tag) (regexp-quote cls) (symbol-name tag))))
+        (`(:tag-id ,tag ,id)
+         (setq rx (format "<%s\\b[^>]*\\bid=[\"']%s[\"'][^>]*>\\(\\(?:.\\|\n\\)*?\\)</%s>"
+                          (symbol-name tag) (regexp-quote id) (symbol-name tag)))))
+      (when rx
+        (let ((pos 0) (acc nil))
+          (while (string-match rx html pos)
+            (let* ((content (match-string group html))
+                   (text (and content (anvil-http--strip-tags content))))
+              (when (and text (not (string-empty-p text)))
+                (push text acc)))
+            (setq pos (match-end 0)))
+          (when acc (mapconcat #'identity (nreverse acc) "\n\n")))))))
 
 (defun anvil-http--split-json-path (path)
   "Tokenize dotted-path PATH.
