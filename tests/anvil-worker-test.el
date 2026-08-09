@@ -277,6 +277,25 @@ Disable health timer + spawning so no real subprocesses start."
           (should (eq worker second))
           (should (equal '("anvil-worker-read-2") spawned)))))))
 
+(ert-deftest anvil-worker-test-pick-all-dead-bounds-total-spawn-wait ()
+  "An all-dead pool spends one shared spawn-wait budget, not one per worker."
+  (anvil-worker-test--with-pool '(:read 3) nil
+    (let ((anvil-worker-spawn-wait 5)
+          (clock 0)
+          spawned)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time)
+                   (prog1 clock
+                     (setq clock (1+ clock)))))
+                ((symbol-function 'sit-for)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)
+                   nil)))
+        (should-not (anvil-worker--pick-worker :read))
+        (should (equal '("anvil-worker-read-1") spawned))))))
+
 ;;;; --- arg parsing -------------------------------------------------------
 
 (ert-deftest anvil-worker-test-parse-call-args-empty ()

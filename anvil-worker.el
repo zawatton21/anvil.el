@@ -994,13 +994,16 @@ Return non-nil only after PROC is confirmed dead."
 
 ;;; Dispatch — pick a worker
 
-(defun anvil-worker--pick-in-lane (lane)
+(defun anvil-worker--pick-in-lane (lane &optional deadline)
   "Pick the next available worker in LANE, or nil if nothing alive.
 Round-robin within LANE, preferring non-busy.  Falls back to a
-busy-but-alive worker when every lane member is occupied."
+busy-but-alive worker when every lane member is occupied.
+DEADLINE is the absolute time shared by all spawn attempts."
   (let* ((vec (anvil-worker--lane-pool lane))
          (size (and vec (length vec)))
          (start (or (plist-get anvil-worker--dispatch-index lane) 0))
+         (deadline (or deadline
+                       (+ (float-time) anvil-worker-spawn-wait)))
          (chosen nil))
     (when (and vec (> size 0))
       ;; Prefer non-busy + alive.
@@ -1020,8 +1023,10 @@ busy-but-alive worker when every lane member is occupied."
           (let* ((idx (% (+ start off) size))
                  (worker (aref vec idx)))
             (when (and (not chosen)
-                       (not (plist-get worker :busy)))
-              (setq chosen (anvil-worker--demand-worker worker))))))
+                       (not (plist-get worker :busy))
+                       (< (float-time) deadline))
+              (setq chosen
+                    (anvil-worker--demand-worker worker deadline))))))
       ;; Fallback: any alive worker (even busy).
       (unless chosen
         (dotimes (off size)
@@ -1037,20 +1042,25 @@ busy-but-alive worker when every lane member is occupied."
                          (% (1+ (plist-get chosen :index)) size)))))
     chosen))
 
-(defun anvil-worker--demand-worker (worker)
-  "Mark WORKER demanded, spawn it, and return it once reachable."
+(defun anvil-worker--demand-worker (worker &optional deadline)
+  "Mark WORKER demanded, spawn it, and return it once reachable.
+DEADLINE is an absolute time; when nil, wait for
+`anvil-worker-spawn-wait' seconds from now."
   (when worker
     (plist-put worker :demanded t)
     (anvil-worker--spawn-worker worker)
-    (let ((deadline (+ (float-time) anvil-worker-spawn-wait)))
+    (let ((deadline (or deadline
+                        (+ (float-time) anvil-worker-spawn-wait))))
       (while (and (not (anvil-worker--worker-alive-p worker))
                   (< (float-time) deadline))
         (sit-for 0.1)))
     (and (anvil-worker--worker-alive-p worker) worker)))
 
-(defun anvil-worker--pick-fallback-in-lane (lane)
-  "Demand the first worker in LANE, returning it once reachable."
-  (anvil-worker--demand-worker (anvil-worker--worker lane 0)))
+(defun anvil-worker--pick-fallback-in-lane (lane &optional deadline)
+  "Demand the first worker in LANE, returning it once reachable.
+Do not start another worker after the absolute DEADLINE."
+  (when (or (null deadline) (< (float-time) deadline))
+    (anvil-worker--demand-worker (anvil-worker--worker lane 0) deadline)))
 
 (defun anvil-worker--pick-worker (&optional kind expression)
   "Pick a worker for a tool call.
@@ -1064,11 +1074,16 @@ lane is tried first and the remaining lanes act as fallbacks."
          (effective (if (eq kind :auto)
                         (anvil-worker--classify expression)
                       kind))
+         (deadline (+ (float-time) anvil-worker-spawn-wait))
          ;; Try effective lane first, then the rest in canonical order.
          (try-order (cons effective
                           (cl-remove effective anvil-worker--lanes))))
-    (or (cl-some #'anvil-worker--pick-in-lane try-order)
-        (cl-some #'anvil-worker--pick-fallback-in-lane try-order))))
+    (or (cl-some (lambda (lane)
+                   (anvil-worker--pick-in-lane lane deadline))
+                 try-order)
+        (cl-some (lambda (lane)
+                   (anvil-worker--pick-fallback-in-lane lane deadline))
+                 try-order))))
 
 ;;; Heavy-op detection
 
