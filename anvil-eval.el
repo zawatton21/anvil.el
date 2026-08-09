@@ -776,9 +776,14 @@ connection is still open), synthesise an `-error' reply and tear
 the connection down so emacsclient can exit cleanly.  When
 `dontkill' is non-nil — `-window-system' / `-tty' / `-resume' /
 `-suspend' clients — we leave the connection alone, matching
-upstream `server-execute' behaviour."
-  (let ((proc (nth 0 args))
-        (dontkill (nth 4 args)))
+upstream `server-execute' behaviour.
+
+`dontkill' sits at a different ARGS index depending on the Emacs
+version: Emacs 30 inserted `evalexprs' ahead of it (Bug#65902,
+commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
+  (let* ((proc (nth 0 args))
+         (dontkill-index (if (>= emacs-major-version 30) 5 4))
+         (dontkill (nth dontkill-index args)))
     (unwind-protect
         (apply orig-fn args)
       (when (and (null dontkill)

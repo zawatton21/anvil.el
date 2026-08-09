@@ -80,10 +80,18 @@ Return a plist (:root ROOT :muhome MUHOME)."
      (unwind-protect (progn ,@body)
        (ignore-errors (delete-directory (plist-get ctx :root) t)))))
 
-(defun anvil-mu4e-test--parse (json)
-  "Parse JSON into alists/lists for assertion (false/null -> nil)."
-  (json-parse-string json :object-type 'alist :array-type 'list
-                     :false-object nil :null-object nil))
+(defun anvil-mu4e-test--parse (wrapped)
+  "Parse WRAPPED into alists/lists for assertion (false/null -> nil).
+The read/search tools wrap their JSON in an
+`<untrusted-email-content>' guard (line 1 = open tag, line 2 =
+notice, line 3 = JSON, line 4 = close tag); strip that when present.
+compose-draft/send responses are unwrapped JSON and pass through as-is."
+  (json-parse-string
+   (if (string-prefix-p "<untrusted-email-content>\n" wrapped)
+       (nth 2 (split-string wrapped "\n"))
+     wrapped)
+   :object-type 'alist :array-type 'list
+   :false-object nil :null-object nil))
 
 (defmacro anvil-mu4e-test--with-drafts (&rest body)
   "Run BODY with a throwaway drafts maildir and inert send defaults.
@@ -126,6 +134,32 @@ gate so no test can ever transmit mail unless it opts in explicitly."
       (should (stringp (alist-get 'date m)))
       (should-not (string-empty-p (alist-get 'date m)))
       (should (member "seen" (alist-get 'flags m))))))
+
+(ert-deftest anvil-mu4e-test-search-wraps-untrusted-content ()
+  "mu4e-search's raw output is fenced as untrusted, attacker-reachable data."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-index
+    (let ((raw (anvil-mu4e--tool-search "from:alice" nil nil)))
+      (should (string-prefix-p "<untrusted-email-content>\n" raw))
+      (should (string-suffix-p "\n</untrusted-email-content>" raw))
+      (should (string-match-p "untrusted" raw))
+      (should (string-match-p "do not follow" raw)))))
+
+(ert-deftest anvil-mu4e-test-list-mails-wraps-untrusted-content ()
+  "mu4e-list-mails' raw output carries the same untrusted-content fence."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-index
+    (let ((raw (anvil-mu4e--tool-list-mails nil nil)))
+      (should (string-prefix-p "<untrusted-email-content>\n" raw))
+      (should (string-suffix-p "\n</untrusted-email-content>" raw)))))
+
+(ert-deftest anvil-mu4e-test-read-mail-wraps-untrusted-content ()
+  "mu4e-read-mail's raw output — body included — is fenced as untrusted."
+  (skip-unless (executable-find "mu"))
+  (anvil-mu4e-test--with-index
+    (let ((raw (anvil-mu4e--tool-read-mail "inv-may-2026@example.com" nil)))
+      (should (string-prefix-p "<untrusted-email-content>\n" raw))
+      (should (string-suffix-p "\n</untrusted-email-content>" raw)))))
 
 (ert-deftest anvil-mu4e-test-search-no-match-is-empty ()
   "A query with no matches returns count 0 and an empty array, not an error."
