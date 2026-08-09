@@ -29,6 +29,7 @@
            (should (eq 0 (call-process "git" nil nil nil "init" "-q" repo)))
            (should (eq 0 (call-process "git" nil nil nil "-C" repo "config" "user.name" "Test User")))
            (should (eq 0 (call-process "git" nil nil nil "-C" repo "config" "user.email" "test@example.com")))
+           (should (eq 0 (call-process "git" nil nil nil "-C" repo "config" "commit.gpgsign" "false")))
            (with-temp-file (expand-file-name "base.txt" repo)
              (insert "old\n"))
            (should (eq 0 (call-process "git" nil nil nil "-C" repo "add" "base.txt")))

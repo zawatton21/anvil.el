@@ -861,7 +861,12 @@ single-element list."
 
 (defun anvil-elisp--ert-distilled-command (files load-path-dirs selector)
   "Build an `emacs --batch -Q' command for FILES, LOAD-PATH-DIRS, and SELECTOR."
-  (let ((command (list invocation-name "--batch" "-Q")))
+  (let* ((emacs-bin
+          (if (and (stringp invocation-name)
+                   (stringp invocation-directory))
+              (expand-file-name invocation-name invocation-directory)
+            invocation-name))
+         (command (list emacs-bin "--batch" "-Q")))
     (dolist (dir load-path-dirs)
       (setq command (append command (list "-L" dir))))
     (setq command (append command (list "-l" "ert")))

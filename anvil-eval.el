@@ -23,7 +23,11 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'anvil-server)
+(require 'anvil-offload)
+
+(declare-function org-agenda-files "org")
 
 ;;; Customization
 
@@ -67,7 +71,12 @@ calls remain available in NeLisp's own global/function tables."
 ;;; Tool timeout
 
 (defun anvil-eval--timeout-advice (orig-fn &rest args)
-  "Wrap MCP tool call dispatch with `with-timeout' as a safety net."
+  "Wrap MCP dispatch in a cooperative `with-timeout' safety net.
+Emacs timers run only when Lisp reaches an event-loop yield point, so this
+cannot preempt a non-yielding synchronous form.  `emacs-eval' deliberately
+retains root-Emacs semantics for live buffers and loaded state; deployments
+that require hard containment must run a dedicated daemon behind an external
+bridge watchdog."
   (with-timeout
       (anvil-eval-timeout
        (anvil-server-tool-throw
@@ -132,8 +141,11 @@ Only available in Emacs with thread support.")
 (defun anvil-eval--sync (expression)
   "Evaluate EXPRESSION as Emacs Lisp and return the result as string.
 
-  Synchronous evaluation with timeout protection.
-  For long-running operations, use emacs-eval-async instead.
+  Synchronous evaluation preserves live root-Emacs buffers,
+  definitions, and loaded state.  Its timeout is cooperative and therefore
+  cannot interrupt non-yielding Lisp.  For isolated or long-running work,
+  use emacs-eval-async; hard containment of this live-state tool requires a
+  dedicated daemon with an external bridge watchdog.
 
   MCP Parameters:
     expression - Emacs Lisp expression to evaluate (string, required)
@@ -253,75 +265,418 @@ globals/functions or when recovering from a bad exploratory session."
 (defvar anvil-eval--async-jobs (make-hash-table :test 'equal)
   "Hash table mapping job-id to async job plists.
 Each job records :status, :result, :expression and :start-time.
-Once the timer starts evaluating the form, :run-start-time is set;
+Once its isolated child starts evaluating, :run-start-time is set;
 completed jobs also carry :finish-time, :queue-wait-sec and
 :runtime-sec.")
 
 (defvar anvil-eval--async-counter 0
   "Counter for generating unique job IDs.")
 
-(defun anvil-eval--async (expression)
-  "Evaluate EXPRESSION asynchronously via run-with-timer.
-Returns a job ID immediately.  The expression runs in the next
-event loop iteration, so Emacs remains responsive.
-Use emacs-eval-result to retrieve the result.
+(defcustom anvil-eval-async-max-active 4
+  "Maximum number of isolated async evaluation children."
+  :type 'integer
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-max-queued 32
+  "Maximum number of accepted async jobs waiting for a child."
+  :type 'integer
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-timeout 300
+  "Default wall-clock timeout in seconds for an async job."
+  :type 'number
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-max-timeout 3600
+  "Largest per-job timeout accepted by `emacs-eval-async'."
+  :type 'number
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-retention-seconds 600
+  "Seconds to retain a terminal async job for result polling."
+  :type 'number
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-max-expression-bytes (* 1024 1024)
+  "Maximum UTF-8 byte size accepted for an async expression."
+  :type 'integer
+  :group 'anvil-eval)
+
+(defcustom anvil-eval-async-max-result-bytes (* 1024 1024)
+  "Maximum UTF-8 byte size returned by an async expression.
+Formatting and truncation happen in the isolated child."
+  :type 'integer
+  :group 'anvil-eval)
+
+(defvar anvil-eval--async-queue nil
+  "FIFO of async job IDs waiting for isolated children.")
+
+(defvar anvil-eval--async-active-count 0
+  "Number of async jobs that currently own isolated children.")
+
+(defvar anvil-eval--async-pump-timer nil
+  "Zero-delay timer scheduled to drain `anvil-eval--async-queue'.")
+
+(defvar anvil-eval--async-shutting-down nil
+  "Non-nil while async jobs are being cancelled during disable.")
+
+(defun anvil-eval--async-context ()
+  "Capture request-local execution context for an isolated child."
+  (list :process-environment (copy-sequence process-environment)
+        :exec-path (copy-sequence exec-path)
+        :default-directory default-directory
+        :shell-file-name shell-file-name
+        :shell-command-switch shell-command-switch
+        :load-path (copy-sequence load-path)))
+
+(defun anvil-eval--async-child-form (expression)
+  "Return a child-side form that reads and evaluates EXPRESSION safely."
+  `(let* ((print-circle t)
+          (print-gensym t)
+          (read-result (read-from-string ,expression))
+          (value (eval (car read-result) t))
+          (text (format "%S" value))
+          (limit ,anvil-eval-async-max-result-bytes)
+          (frame-limit ,anvil-offload-max-frame-bytes)
+          (marker "\n... [truncated by emacs-eval-async]")
+          (fits
+           (lambda (candidate)
+             (and
+              (<= (string-bytes candidate) limit)
+              (<=
+               (string-bytes
+                (concat
+                 anvil-offload--frame-prefix
+                 (base64-encode-string
+                  (encode-coding-string
+                   (prin1-to-string
+                    (list :id anvil-offload--repl-current-id
+                          :ok candidate))
+                   'utf-8-unix)
+                  t)
+                 "\n"))
+               frame-limit)))))
+     (if (funcall fits text)
+         text
+       ;; First retain as much of the truncation marker as both public and
+       ;; wire limits permit, then fill the remaining frame with result text.
+       ;; Measuring the complete emitted frame is necessary because Lisp
+       ;; string escaping and base64 can expand escape-heavy results by more
+       ;; than the public result cap alone predicts.
+       (let ((suffix marker)
+             (low 0)
+             (high (length marker)))
+         (unless (funcall fits suffix)
+           (while (< low high)
+             (let ((middle (/ (+ low high 1) 2)))
+               (if (funcall fits (substring marker 0 middle))
+                   (setq low middle)
+                 (setq high (1- middle)))))
+           (setq suffix (substring marker 0 low)))
+         (setq low 0
+               high (length text))
+         (while (< low high)
+           (let ((middle (/ (+ low high 1) 2)))
+             (if (funcall fits
+                          (concat (substring text 0 middle) suffix))
+                 (setq low middle)
+               (setq high (1- middle)))))
+         (concat (substring text 0 low) suffix)))))
+
+(defun anvil-eval--async-terminal-p (job)
+  "Return non-nil when JOB has a public terminal status."
+  (memq (plist-get job :status) '(done error)))
+
+(defun anvil-eval--async-remove-from-queue (job-id)
+  "Remove JOB-ID from the pending FIFO."
+  (setq anvil-eval--async-queue
+        (delete job-id anvil-eval--async-queue)))
+
+(defun anvil-eval--async-cleanup-job (job-id)
+  "Remove terminal JOB-ID and release its cleanup timer."
+  (let ((job (gethash job-id anvil-eval--async-jobs)))
+    (when (and job (anvil-eval--async-terminal-p job))
+      (remhash job-id anvil-eval--async-jobs))))
+
+(defun anvil-eval--async-schedule-pump ()
+  "Schedule one event-loop turn that starts queued jobs."
+  (unless (or anvil-eval--async-shutting-down
+              (timerp anvil-eval--async-pump-timer))
+    (setq anvil-eval--async-pump-timer
+          (run-at-time
+           0 nil
+           (lambda ()
+             (setq anvil-eval--async-pump-timer nil)
+             (anvil-eval--async-pump))))))
+
+(defun anvil-eval--async-terminalize (job-id status result reason)
+  "Settle JOB-ID once with public STATUS, RESULT, and REASON."
+  (let ((job (gethash job-id anvil-eval--async-jobs)))
+    (when (and job (not (anvil-eval--async-terminal-p job)))
+      (let* ((finish (current-time))
+             (start (plist-get job :start-time))
+             (run-start (plist-get job :run-start-time))
+             (deadline-timer (plist-get job :deadline-timer)))
+        (when (timerp deadline-timer)
+          (cancel-timer deadline-timer))
+        (anvil-eval--async-remove-from-queue job-id)
+        (when (plist-get job :active-counted)
+          (setq anvil-eval--async-active-count
+                (max 0 (1- anvil-eval--async-active-count))))
+        (setq job (plist-put job :status status))
+        (setq job (plist-put job :phase 'terminal))
+        (setq job (plist-put job :reason reason))
+        (setq job (plist-put job :result result))
+        (setq job (plist-put job :finish-time finish))
+        (setq job
+              (plist-put
+               job :queue-wait-sec
+               (or (plist-get job :queue-wait-sec)
+                   (float-time
+                    (time-subtract (or run-start finish) start)))))
+        (when run-start
+          (setq job
+                (plist-put
+                 job :runtime-sec
+                 (float-time (time-subtract finish run-start)))))
+        (setq job (plist-put job :deadline-timer nil))
+        (setq job (plist-put job :active-counted nil))
+        (setq job (plist-put job :future nil))
+        (setq job (plist-put job :context nil))
+        (setq job
+              (plist-put
+               job :cleanup-timer
+               (unless anvil-eval--async-shutting-down
+                 (run-at-time anvil-eval-async-retention-seconds nil
+                              #'anvil-eval--async-cleanup-job job-id))))
+        (puthash job-id job anvil-eval--async-jobs)
+        (anvil-eval--async-schedule-pump)
+        t))))
+
+(defun anvil-eval--async-started (job-id future)
+  "Record the child start transition for JOB-ID and FUTURE."
+  (let ((job (gethash job-id anvil-eval--async-jobs)))
+    (when (and job
+               (not (anvil-eval--async-terminal-p job))
+               (or (null (plist-get job :future))
+                   (eq future (plist-get job :future)))
+               (not (plist-get job :run-start-time)))
+      (let ((run-start (current-time)))
+        (setq job (plist-put job :phase 'executing))
+        (setq job (plist-put job :run-start-time run-start))
+        (setq job
+              (plist-put
+               job :queue-wait-sec
+               (float-time
+                (time-subtract run-start (plist-get job :start-time)))))
+        (puthash job-id job anvil-eval--async-jobs)))))
+
+(defun anvil-eval--async-settled (job-id future)
+  "Translate terminal FUTURE state into JOB-ID's public result."
+  (pcase (anvil-future-status future)
+    ('done
+     (anvil-eval--async-terminalize
+      job-id 'done (anvil-future-value future) 'done))
+    ('error
+     (anvil-eval--async-terminalize
+      job-id 'error
+      (format "Error: %s" (or (anvil-future-error future)
+                              "isolated child failed"))
+      (or (anvil-future--terminal-reason future) 'remote-error)))
+    ('killed
+     (anvil-eval--async-terminalize
+      job-id 'error
+      (format "Error: %s" (or (anvil-future-error future)
+                              "isolated child was killed"))
+      (or (anvil-future--terminal-reason future) 'killed)))
+    ('cancelled
+     (anvil-eval--async-terminalize
+      job-id 'error "Error: cancelled" 'cancelled))))
+
+(defun anvil-eval--async-timeout (job-id)
+  "Hard-stop JOB-ID after its finite wall-clock deadline."
+  (let* ((job (gethash job-id anvil-eval--async-jobs))
+         (future (and job (plist-get job :future))))
+    (when (and job (not (anvil-eval--async-terminal-p job)))
+      (if (and future (eq 'pending (anvil-future-status future)))
+          (anvil-future-kill future 'timeout)
+        (anvil-eval--async-terminalize
+         job-id 'error "Error: timeout before isolated child started"
+         'timeout))
+      (let ((remaining (gethash job-id anvil-eval--async-jobs)))
+        (when (and remaining (not (anvil-eval--async-terminal-p remaining)))
+          (anvil-eval--async-terminalize
+           job-id 'error "Error: async timeout cleanup failed" 'timeout))))))
+
+(defun anvil-eval--async-cancel-job (job-id)
+  "Cancel queued or active JOB-ID, returning its resulting job plist."
+  (let* ((job (gethash job-id anvil-eval--async-jobs))
+         (future (and job (plist-get job :future))))
+    (when (and job (not (anvil-eval--async-terminal-p job)))
+      (if (and future (eq 'pending (anvil-future-status future)))
+          (anvil-future-kill future 'cancelled)
+        (anvil-eval--async-terminalize
+         job-id 'error "Error: cancelled" 'cancelled)))
+    (gethash job-id anvil-eval--async-jobs)))
+
+(defun anvil-eval--async-pump ()
+  "Start queued jobs while isolated-child capacity is available."
+  (while (and (not anvil-eval--async-shutting-down)
+              (< anvil-eval--async-active-count
+                 (max 1 anvil-eval-async-max-active))
+              anvil-eval--async-queue)
+    (let* ((job-id (pop anvil-eval--async-queue))
+           (job (gethash job-id anvil-eval--async-jobs)))
+      (when (and job
+                 (eq 'running (plist-get job :status))
+                 (eq 'queued (plist-get job :phase)))
+        (setq anvil-eval--async-active-count
+              (1+ anvil-eval--async-active-count))
+        (setq job (plist-put job :phase 'starting))
+        (setq job (plist-put job :active-counted t))
+        (puthash job-id job anvil-eval--async-jobs)
+        (let ((context (plist-get job :context)))
+          (condition-case err
+              (let ((future
+                     (anvil-offload-isolated
+                      (anvil-eval--async-child-form
+                       (plist-get job :expression))
+                      :exact-load-path
+                      (plist-get context :load-path)
+                      :process-environment
+                      (plist-get context :process-environment)
+                      :exec-path (plist-get context :exec-path)
+                      :default-directory
+                      (plist-get context :default-directory)
+                      :shell-file-name
+                      (plist-get context :shell-file-name)
+                      :shell-command-switch
+                      (plist-get context :shell-command-switch)
+                      :on-start
+                      (lambda (future)
+                        (anvil-eval--async-started job-id future))
+                      :on-settle
+                      (lambda (future)
+                        (anvil-eval--async-settled job-id future)))))
+                (setq job (gethash job-id anvil-eval--async-jobs))
+                (if (and job (not (anvil-eval--async-terminal-p job)))
+                    (progn
+                      (setq job (plist-put job :future future))
+                      (setq job (plist-put job :context nil))
+                      (puthash job-id job anvil-eval--async-jobs))
+                  ;; Cancellation or timeout may terminalize the job while the
+                  ;; child is spawning.  Never leave that freshly owned child
+                  ;; alive without a job that can cancel or collect it.
+                  (anvil-future-kill future 'stale-job)))
+            (error
+             (anvil-eval--async-terminalize
+              job-id 'error
+              (format "Error: could not start isolated child: %s"
+                      (error-message-string err))
+              'spawn-error))))))))
+
+(defun anvil-eval--async (expression &optional timeout)
+  "Queue EXPRESSION for isolated asynchronous evaluation.
+Returns a job ID immediately.  User source is read, evaluated, and
+printed only in a dedicated one-shot subprocess.  The child receives the
+captured request environment, directory, shell, executable path, and exact
+load-path ordering, but it does not clone live root definitions, features,
+buffers, or buffer-local state.  Configure `anvil-offload-init-files' when
+expressions require explicit child initialization.
 
 MCP Parameters:
   expression - Emacs Lisp expression to evaluate asynchronously
                (string, required)
-               Example: \"(byte-compile-file \\\"~/.emacs.d/init.el\\\")\"
-               Use for long-running operations that would timeout with
-               emacs-eval."
+  timeout    - (number) Optional finite wall-clock timeout in seconds"
   (anvil-server-with-error-handling
-    (let* ((job-id (format "job-%d-%d"
-                           (setq anvil-eval--async-counter
-                                 (1+ anvil-eval--async-counter))
-                           (truncate (float-time))))
-           (form (car (read-from-string expression))))
-      (puthash job-id
-               (list :status 'running
-                     :result nil
-                     :expression expression
-                     :start-time (current-time))
-               anvil-eval--async-jobs)
-      (run-with-timer 0 nil
-        (lambda ()
-          (let ((job (gethash job-id anvil-eval--async-jobs)))
-            (when job
-              (let ((run-start (current-time))
-                    status result)
-                (setq job (plist-put job :run-start-time run-start))
-                (condition-case err
-                    (setq result (format "%S" (eval form t))
-                          status 'done)
-                  (error
-                   (setq result (format "Error: %S" err)
-                         status 'error)))
-                (let ((finish (current-time)))
-                  (setq job (plist-put job :status status))
-                  (setq job (plist-put job :result result))
-                  (setq job (plist-put job :finish-time finish))
-                  (setq
-                   job
-                   (plist-put
-                    job :queue-wait-sec
-                    (float-time
-                     (time-subtract run-start
-                                    (plist-get job :start-time)))))
-                  (setq
-                   job
-                   (plist-put
-                    job :runtime-sec
-                    (float-time
-                     (time-subtract finish run-start))))
-                  (puthash job-id job anvil-eval--async-jobs)))))))
-      (format "Job started: %s" job-id))))
+    (unless (stringp expression)
+      (error "expression must be a string"))
+    (when (> (string-bytes expression)
+             anvil-eval-async-max-expression-bytes)
+      (error "expression exceeds %d-byte limit"
+             anvil-eval-async-max-expression-bytes))
+    (let* ((timeout (or timeout anvil-eval-async-timeout))
+           (timeout
+            (if (and (stringp timeout)
+                     (string-match-p
+                      "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" timeout))
+                (string-to-number timeout)
+              timeout)))
+      (unless (and (numberp timeout)
+                   (> timeout 0)
+                   (<= timeout anvil-eval-async-max-timeout))
+        (error "timeout must be positive and no greater than %s seconds"
+               anvil-eval-async-max-timeout))
+      (let ((accepted 0))
+        (maphash
+         (lambda (_id job)
+           (unless (anvil-eval--async-terminal-p job)
+             (setq accepted (1+ accepted))))
+         anvil-eval--async-jobs)
+        (when (>= accepted
+                  (+ (max 1 anvil-eval-async-max-active)
+                     (max 0 anvil-eval-async-max-queued)))
+          (error "async evaluation queue is full (%d accepted)" accepted)))
+      (let* ((job-id (format "job-%d-%d"
+                             (setq anvil-eval--async-counter
+                                   (1+ anvil-eval--async-counter))
+                             (truncate (float-time))))
+             (job (list :status 'running
+                        :phase 'queued
+                        :reason nil
+                        :result nil
+                        :expression expression
+                        :start-time (current-time)
+                        :context (anvil-eval--async-context))))
+        (puthash job-id job anvil-eval--async-jobs)
+        (setq job
+              (plist-put
+               job :deadline-timer
+               (run-at-time timeout nil #'anvil-eval--async-timeout job-id)))
+        (puthash job-id job anvil-eval--async-jobs)
+        (setq anvil-eval--async-queue
+              (append anvil-eval--async-queue (list job-id)))
+        (anvil-eval--async-schedule-pump)
+        (format "Job started: %s" job-id)))))
 
 (defun anvil-eval--format-seconds (seconds)
   "Format SECONDS as a compact duration string, or return \"N/A\"."
   (if (numberp seconds)
       (format "%.1fs" seconds)
     "N/A"))
+
+(defun anvil-eval--cancel (job-id)
+  "Cancel an async JOB-ID and hard-stop its isolated child.
+
+MCP Parameters:
+  job-id - The job ID returned by emacs-eval-async (string, required)"
+  (anvil-server-with-error-handling
+    (let ((job (gethash job-id anvil-eval--async-jobs)))
+      (cond
+       ((not job) (format "Job not found: %s" job-id))
+       ((anvil-eval--async-terminal-p job)
+        (format "Job already %s: %s" (plist-get job :status) job-id))
+       (t
+        (anvil-eval--async-cancel-job job-id)
+        (format "Job cancelled: %s" job-id))))))
+
+(defun anvil-eval--async-cancel-all ()
+  "Hard-stop all active jobs and clear all async scheduling state."
+  (let ((anvil-eval--async-shutting-down t)
+        ids)
+    (when (timerp anvil-eval--async-pump-timer)
+      (cancel-timer anvil-eval--async-pump-timer))
+    (setq anvil-eval--async-pump-timer nil)
+    (maphash (lambda (id _job) (push id ids)) anvil-eval--async-jobs)
+    (dolist (id ids)
+      (let ((job (gethash id anvil-eval--async-jobs)))
+        (if (and job (not (anvil-eval--async-terminal-p job)))
+            (anvil-eval--async-cancel-job id)
+          (when-let ((timer (and job (plist-get job :cleanup-timer))))
+            (when (timerp timer) (cancel-timer timer))))))
+    (setq anvil-eval--async-queue nil
+          anvil-eval--async-active-count 0)
+    (clrhash anvil-eval--async-jobs)))
 
 (defun anvil-eval--result (job-id)
   "Get the result of an async job.
@@ -354,9 +709,15 @@ MCP Parameters:
                       (and run-start
                            (float-time
                             (time-subtract (or finish now)
-                                           run-start))))))
-          (when (and (not (eq status 'running))
-                     (> elapsed 600))
+                                           run-start)))))
+                 (terminal-age
+                  (and finish
+                       (float-time (time-subtract now finish)))))
+          (when (and terminal-age
+                     (> terminal-age
+                        anvil-eval-async-retention-seconds))
+            (when-let ((timer (plist-get job :cleanup-timer)))
+              (when (timerp timer) (cancel-timer timer)))
             (remhash job-id anvil-eval--async-jobs))
           (format
            (concat "status: %s\n"
@@ -440,6 +801,7 @@ commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
 
 (defun anvil-eval-enable ()
   "Register eval tools and install advice."
+  (setq anvil-eval--async-shutting-down nil)
   (setq anvil-eval--server-id
         (or (and (boundp 'anvil-server-id) anvil-server-id) "anvil"))
   ;; Install advice
@@ -459,9 +821,10 @@ commit 683efb8de5), shifting `dontkill' from index 4 to index 5."
    :intent '(eval)
    :layer 'dev
    :description
-   "Evaluate Emacs Lisp expression synchronously and return the result.
-Use for quick operations (< 30s): querying state, small edits,
-reading data. For heavy operations use emacs-eval-async instead."
+   "Evaluate Emacs Lisp in the live root session for quick state queries and
+small edits. Its timeout is cooperative and cannot preempt non-yielding Lisp;
+use emacs-eval-async for isolated work. Hard containment requires a dedicated
+daemon behind an external bridge watchdog."
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
    #'anvil-eval--async
@@ -469,10 +832,13 @@ reading data. For heavy operations use emacs-eval-async instead."
    :intent '(eval)
    :layer 'dev
    :description
-   "Evaluate Emacs Lisp expression asynchronously.
-Returns a job ID immediately. Emacs remains responsive during execution.
-Use for long-running operations: git clone, byte-compile, package install.
-Retrieve result with emacs-eval-result tool using the returned job ID."
+   "Evaluate Emacs Lisp in a process-isolated asynchronous job.
+Returns a job ID immediately; user source is never read or evaluated in the
+root Emacs. The child receives request environment and path context but not
+live root definitions, loaded features, buffers, or buffer-local state;
+configure anvil-offload-init-files for required child initialization. Use for
+durable long-running operations. Unsaved child-buffer changes do not survive.
+Retrieve the result with emacs-eval-result using the returned job ID."
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
    #'anvil-eval--result
@@ -483,6 +849,15 @@ Retrieve result with emacs-eval-result tool using the returned job ID."
    "Get the result of an async job started by emacs-eval-async.
 Returns status (running/done/error), age, queue wait, runtime, and result.
 Poll this until status is 'done' or 'error'."
+   :server-id anvil-eval--server-id)
+  (anvil-server-register-tool
+   #'anvil-eval--cancel
+   :id "emacs-eval-cancel"
+   :intent '(eval admin)
+   :layer 'dev
+   :description
+   "Cancel an async evaluation job and hard-stop its isolated subprocess.
+Already-terminal and unknown job IDs return stable informational messages."
    :server-id anvil-eval--server-id)
   (anvil-server-register-tool
    #'anvil-eval--jobs
@@ -514,9 +889,11 @@ NeLisp globals across calls, so it behaves as a practical MCP REPL."
 
 (defun anvil-eval-disable ()
   "Unregister eval tools and remove advice."
+  (anvil-eval--async-cancel-all)
   (anvil-server-unregister-tool "emacs-eval" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-async" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-result" anvil-eval--server-id)
+  (anvil-server-unregister-tool "emacs-eval-cancel" anvil-eval--server-id)
   (anvil-server-unregister-tool "emacs-eval-jobs" anvil-eval--server-id)
   (anvil-server-unregister-tool "nelisp-eval" anvil-eval--server-id)
   (anvil-server-unregister-tool "nelisp-eval-reset" anvil-eval--server-id)

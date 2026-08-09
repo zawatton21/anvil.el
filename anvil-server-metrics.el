@@ -129,7 +129,7 @@ approximated with `(length (format \"%S\" value))'."
        value
      (format "%S" value))))
 
-(defun anvil-server-metrics--tool-token-entry (tool-id)
+(defun anvil-server-metrics--token-entry (tool-id)
   "Return TOOL-ID's token telemetry plist, creating if needed."
   (or (gethash tool-id anvil-server-metrics--tool-token-table)
       (let ((entry (list :calls 0
@@ -215,7 +215,7 @@ REQUEST is measured from the dispatcher's in-memory arguments object via
 JSON encode pass.  RESPONSE is measured exactly when it is already a string;
 non-string or nil values fall back to the same `%S' approximation."
   (when (stringp tool-id)
-    (let* ((entry (anvil-server-metrics--tool-token-entry tool-id))
+    (let* ((entry (anvil-server-metrics--token-entry tool-id))
            (request-chars (anvil-server-metrics--measure-chars request))
            (response-chars (anvil-server-metrics--measure-chars response)))
       (plist-put entry :calls (1+ (or (plist-get entry :calls) 0)))

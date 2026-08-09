@@ -88,25 +88,34 @@
       (should-not (string-match-p "^runtime: N/A" out)))))
 
 (ert-deftest anvil-eval-test-async-records-runtime-fields ()
-  "The async timer path records queue wait and runtime fields."
+  "The isolated async path records queue wait and runtime fields."
   (let ((anvil-eval--async-jobs (make-hash-table :test 'equal))
-        (anvil-eval--async-counter 0))
-    (let* ((started (anvil-eval--async "(+ 1 2)"))
-           (job-id (replace-regexp-in-string "\\`Job started: " "" started))
-           (deadline (+ (float-time) 1.0)))
-      (while (and (< (float-time) deadline)
-                  (eq 'running
-                      (plist-get (gethash job-id anvil-eval--async-jobs)
-                                 :status)))
-        (accept-process-output nil 0.01))
-      (let ((job (gethash job-id anvil-eval--async-jobs)))
-        (should (eq 'done (plist-get job :status)))
-        (should (numberp (plist-get job :queue-wait-sec)))
-        (should (numberp (plist-get job :runtime-sec)))
-        (should (equal "3" (plist-get job :result))))
-      (let ((out (anvil-eval--result job-id)))
-        (should (string-match-p "^queue-wait: [0-9.]+s" out))
-        (should (string-match-p "^runtime: [0-9.]+s" out))))))
+        (anvil-eval--async-counter 0)
+        (anvil-eval--async-queue nil)
+        (anvil-eval--async-active-count 0)
+        (anvil-eval--async-pump-timer nil)
+        (anvil-eval--async-shutting-down nil))
+    (unwind-protect
+        (let* ((started (anvil-eval--async "(+ 1 2)"))
+               (job-id
+                (replace-regexp-in-string "\\`Job started: " "" started))
+               (deadline (+ (float-time) 5.0)))
+          (while (and (< (float-time) deadline)
+                      (eq 'running
+                          (plist-get
+                           (gethash job-id anvil-eval--async-jobs)
+                           :status)))
+            (accept-process-output nil 0.01))
+          (let ((job (gethash job-id anvil-eval--async-jobs)))
+            (should (eq 'done (plist-get job :status)))
+            (should (numberp (plist-get job :queue-wait-sec)))
+            (should (numberp (plist-get job :runtime-sec)))
+            (should (equal "3" (plist-get job :result))))
+          (let ((out (anvil-eval--result job-id)))
+            (should (string-match-p "^queue-wait: [0-9.]+s" out))
+            (should (string-match-p "^runtime: [0-9.]+s" out))))
+      (anvil-eval--async-cancel-all)
+      (anvil-offload-stop-repl))))
 
 
 ;;;; --- guards -------------------------------------------------------------

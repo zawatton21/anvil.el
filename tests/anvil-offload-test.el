@@ -16,13 +16,63 @@
 ;; so a plain require resolves to sibling sources.
 (require 'anvil-offload)
 
+(defun anvil-offload-test--assert-clean ()
+  "Refuse to discard ownership state before subprocess cleanup converges."
+  (let ((deadline (+ (float-time) 1.0)))
+    (while (and (hash-table-p anvil-offload--pending)
+                (> (hash-table-count anvil-offload--pending) 0)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.01)))
+  (let (owned pending)
+    (dolist (table (anvil-offload--registered-ownership-tables))
+      (maphash
+       (lambda (proc value)
+         (push (list table proc value) owned))
+       table))
+    (when (hash-table-p anvil-offload--pending)
+      (maphash (lambda (id _future) (push id pending))
+               anvil-offload--pending))
+    (when (or (anvil-offload--cleanup-active-p)
+              (anvil-offload--submission-active-p)
+              anvil-offload--pool
+              anvil-offload--pool-retiring-p
+              anvil-offload--pool-cleanup-active-p
+              anvil-offload--submission-active-p
+              anvil-offload--stop-retiring-p
+              anvil-offload--retired-pools
+              owned
+              pending)
+      (error
+       (concat
+        "offload cleanup did not converge: "
+        "pool=%S pool-retiring=%S cleanup-active=%S submission-active=%S stop-retiring=%S "
+        "retired=%S owned=%S pending=%S")
+       anvil-offload--pool
+       anvil-offload--pool-retiring-p
+       anvil-offload--pool-cleanup-active-p
+       anvil-offload--submission-active-p
+       anvil-offload--stop-retiring-p
+       anvil-offload--retired-pools
+       owned
+       pending))))
+
 (defun anvil-offload-test--reset ()
-  "Force a clean REPL + pending table between tests."
-  (when (anvil-offload-repl-alive-p)
-    (anvil-offload-stop-repl))
-  (setq anvil-offload--next-id 0
-        anvil-offload--pending (make-hash-table :test 'eql))
-  ;; Give Emacs a tick to reap the killed subprocess.
+  "Force clean offload state only after ownership convergence."
+  (anvil-offload-stop-repl)
+  (anvil-offload-test--assert-clean)
+  (setq anvil-offload--pool nil
+        anvil-offload--round-robin 0
+        anvil-offload--next-id 0
+        anvil-offload--pending (make-hash-table :test 'eql)
+        anvil-offload--isolated-processes (make-hash-table :test 'eq)
+        anvil-offload--pool-retiring-p nil
+        anvil-offload--pool-cleanup-active-p nil
+        anvil-offload--submission-active-p nil
+        anvil-offload--transaction-state (vector nil nil)
+        anvil-offload--stop-retiring-p nil
+        anvil-offload--retired-pools nil
+        anvil-offload--ownership-table-registry nil
+        anvil-offload--fallback-processes (make-hash-table :test 'eq))
   (sit-for 0.05))
 
 (defmacro anvil-offload-test--with-clean-repl (&rest body)
@@ -30,7 +80,7 @@
 Gated on `ANVIL_SLOW_TESTS=1' — the REPL spawn + sentinel wait
 flakes on slow CI hosts (see file commentary)."
   (declare (indent 0))
-  `(progn
+  `(let ((anvil-offload--transaction-state (vector nil nil)))
      (skip-unless (getenv "ANVIL_SLOW_TESTS"))
      (unwind-protect
          (progn (anvil-offload-test--reset) ,@body)
@@ -326,6 +376,92 @@ until the checkpoint arrives (non-settling), then kills the future."
               (should (anvil-future-await future 30))
               (should (= 42 (anvil-future-value future)))))
         (delete-directory tmp t)))))
+
+(ert-deftest anvil-offload-test-isolated-callbacks-and-child-exit ()
+  "A one-shot future starts, settles once, and leaves no live child."
+  (anvil-offload-test--with-clean-repl
+    (let ((started 0)
+          (settled 0)
+          future)
+      (setq future
+            (anvil-offload-isolated
+             '(+ 20 22)
+             :on-start (lambda (_future) (setq started (1+ started)))
+             :on-settle (lambda (_future) (setq settled (1+ settled)))))
+      (should (anvil-future-await future 30))
+      (should (eq 'done (anvil-future-status future)))
+      (should (= 42 (anvil-future-value future)))
+      (should (= 1 started))
+      (should (= 1 settled))
+      (let ((deadline (+ (float-time) 2)))
+        (while (and (process-live-p (anvil-future--process future))
+                    (< (float-time) deadline))
+          (accept-process-output (anvil-future--process future) 0.02)))
+      (should-not (process-live-p (anvil-future--process future)))
+      (should-not (anvil-offload-repl-alive-p)))))
+
+(ert-deftest anvil-offload-test-isolated-kill-does-not-affect-peer ()
+  "Hard-killing one isolated future cannot settle its peer."
+  (anvil-offload-test--with-clean-repl
+    (let* ((slow (anvil-offload-isolated '(sleep-for 30)))
+           (peer (anvil-offload-isolated
+                  '(progn (sleep-for 0.1) 'peer-done)))
+           (slow-process (anvil-future--process slow))
+           (peer-process (anvil-future--process peer)))
+      (should-not (eq slow-process peer-process))
+      (anvil-future-kill slow 'test-cancel)
+      (should (eq 'killed (anvil-future-status slow)))
+      (should (anvil-future-await peer 30))
+      (should (eq 'done (anvil-future-status peer)))
+      (should (eq 'peer-done (anvil-future-value peer))))))
+
+(ert-deftest anvil-offload-test-isolated-request-context ()
+  "Request bindings override the clean spawn environment only in the child."
+  (anvil-offload-test--with-clean-repl
+    (let* ((tmp (make-temp-file "anvil-offload-context-" t))
+           (baseline (copy-sequence process-environment))
+           (request-environment (copy-sequence baseline))
+           (anvil-offload-spawn-environment-function
+            (lambda () baseline)))
+      (unwind-protect
+          (progn
+            (let ((process-environment request-environment))
+              (setenv "ANVIL_OFFLOAD_CONTEXT_TEST" "request-only")
+              (setq request-environment (copy-sequence process-environment)))
+            (let ((future
+                   (anvil-offload-isolated
+                    '(list (getenv "ANVIL_OFFLOAD_CONTEXT_TEST")
+                           default-directory)
+                    :process-environment request-environment
+                    :default-directory (file-name-as-directory tmp))))
+              (should (anvil-future-await future 30))
+              (should (equal (list "request-only"
+                                   (file-name-as-directory tmp))
+                             (anvil-future-value future)))))
+        (delete-directory tmp t)))))
+
+(ert-deftest anvil-offload-test-frame-limit-fails-before-decode ()
+  "An unterminated over-limit frame fails and kills its exact subprocess."
+  (anvil-offload-test--with-clean-repl
+    (let* ((anvil-offload-max-frame-bytes 16)
+           (proc (make-process
+                  :name "anvil-offload-frame-limit-test"
+                  :command (list shell-file-name shell-command-switch
+                                 "sleep 30")
+                  :connection-type 'pipe
+                  :noquery t
+                  :sentinel #'ignore))
+           (future (make-anvil-future
+                    :id 991 :process proc :status 'pending)))
+      (unwind-protect
+          (progn
+            (puthash 991 future (anvil-offload--ensure-pending))
+            (anvil-offload--filter proc (make-string 17 ?x))
+            (should (eq 'error (anvil-future-status future)))
+            (should (string-match-p "frame exceeded"
+                                    (anvil-future-error future)))
+            (should-not (gethash 991 (anvil-offload--ensure-pending))))
+        (when (process-live-p proc) (delete-process proc))))))
 
 (provide 'anvil-offload-test)
 ;;; anvil-offload-test.el ends here

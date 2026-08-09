@@ -62,11 +62,41 @@ how BODY exits."
          (delete-directory ,var t)))))
 
 (defmacro anvil-extend-phaseB-test--with-fixture (storage staging &rest body)
-  "Compose the storage fixture with the Phase B staging fixture."
+  "Run BODY with isolated STORAGE, STAGING, watch, and debounce state."
   (declare (indent 2))
-  `(anvil-extend-phaseB-test--with-storage ,storage
-     (anvil-extend-phaseB-test--with-staging ,staging
-       ,@body)))
+  (let ((handles (make-symbol "handles"))
+        (timers (make-symbol "timers"))
+        (names (make-symbol "names"))
+        (name (make-symbol "name"))
+        (handle (make-symbol "handle"))
+        (timer (make-symbol "timer")))
+    `(anvil-extend-phaseB-test--with-storage ,storage
+       (anvil-extend-phaseB-test--with-staging ,staging
+         (let ((anvil-extend--watches nil)
+               (anvil-extend--reload-pending nil))
+           (unwind-protect
+               (progn ,@body)
+             (let ((,handles
+                    (mapcar #'cdr (copy-sequence anvil-extend--watches)))
+                   (,timers
+                    (mapcar #'cdr
+                            (copy-sequence anvil-extend--reload-pending)))
+                   (,names
+                    (mapcar #'car (copy-sequence anvil-extend--watches))))
+               (dolist (,name ,names)
+                 (anvil-extend-unwatch ,name))
+               (dolist (,timer ,timers)
+                 (when (timerp ,timer)
+                   (cancel-timer ,timer)))
+               (setq anvil-extend--reload-pending nil)
+               (dolist (,handle ,handles)
+                 (should-not (file-notify-valid-p ,handle)))
+               (dolist (,timer ,timers)
+                 (when (timerp ,timer)
+                   (should-not (memq ,timer timer-list))
+                   (should-not (memq ,timer timer-idle-list))))
+               (should-not anvil-extend--watches)
+               (should-not anvil-extend--reload-pending))))))))
 
 (defun anvil-extend-phaseB-test--cleanup (sym)
   "Best-effort watch teardown + `unload-feature' for SYM."
@@ -260,7 +290,7 @@ underlying lambda object."
     (unwind-protect
         (progn
           (anvil-extend-phaseB-test--scaffold-and-load 'watch-handle '(t))
-          (let ((anvil-extend--watches nil))
+          (progn
             (let ((handle (anvil-extend-watch 'watch-handle)))
               (should handle)
               (should (assq 'watch-handle anvil-extend--watches))
@@ -272,7 +302,7 @@ underlying lambda object."
   "Re-watching the same NAME tears down the old handle first."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((anvil-extend--watches nil))
+        (progn
           (anvil-extend-phaseB-test--scaffold-and-load 'watch-replace '(t))
           (anvil-extend-watch 'watch-replace)
           (anvil-extend-watch 'watch-replace)
@@ -285,7 +315,7 @@ underlying lambda object."
   "Unwatching by NAME drops the entry and returns t."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((anvil-extend--watches nil))
+        (progn
           (anvil-extend-phaseB-test--scaffold-and-load 'unwatch-sym '(t))
           (anvil-extend-watch 'unwatch-sym)
           (should (eq t (anvil-extend-unwatch 'unwatch-sym)))
@@ -298,7 +328,7 @@ underlying lambda object."
   "Unwatching by handle (not symbol) also drops the entry."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((anvil-extend--watches nil))
+        (progn
           (anvil-extend-phaseB-test--scaffold-and-load 'unwatch-handle '(t))
           (let ((handle (anvil-extend-watch 'unwatch-handle)))
             (should (eq t (anvil-extend-unwatch handle)))
@@ -309,7 +339,7 @@ underlying lambda object."
   "`anvil-extend-watch-all' installs one watch per visible extension."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((anvil-extend--watches nil))
+        (progn
           (anvil-extend-phaseB-test--scaffold-and-load 'wall-a '(t))
           (anvil-extend-phaseB-test--scaffold-and-load 'wall-b '(t))
           (let* ((pairs (anvil-extend-watch-all))
@@ -328,9 +358,8 @@ underlying lambda object."
   "Multiple `--schedule-reload' calls within debounce window keep one timer."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((anvil-extend--reload-pending nil)
-              ;; A long debounce window so the timer cannot expire mid-test.
-              (anvil-extend-watch-debounce 60.0))
+        ;; A long debounce window so the timer cannot expire mid-test.
+        (let ((anvil-extend-watch-debounce 60.0))
           (anvil-extend-phaseB-test--scaffold-and-load 'debounce-coal '(t))
           (let ((t1 (anvil-extend--schedule-reload 'debounce-coal))
                 (t2 (anvil-extend--schedule-reload 'debounce-coal))
@@ -373,8 +402,7 @@ underlying lambda object."
   "MCP watch wrapper returns a printed plist (no opaque handle leaks)."
   (anvil-extend-phaseB-test--with-fixture storage staging
     (unwind-protect
-        (let ((have-server (featurep 'anvil-server))
-              (anvil-extend--watches nil))
+        (let ((have-server (featurep 'anvil-server)))
           (anvil-extend-phaseB-test--scaffold-and-load 'mcp-watch '(t))
           (let ((out
                  (if have-server

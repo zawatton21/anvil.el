@@ -4,8 +4,8 @@
 
 ;; Regression / correctness tests for `anvil-shell' and related
 ;; `anvil-host' helpers.  Focused on behaviours that are easy to get
-;; wrong at the `make-process' boundary — most notably that background
-;; / disowned descendants spawned from inside the shell must survive
+;; wrong at the `make-process' boundary — most notably that detached
+;; descendants spawned from inside the shell must survive
 ;; the wrapper shell exiting (issue #10).
 
 ;;; Code:
@@ -19,18 +19,13 @@
 (ert-deftest anvil-host-test-shell-preserves-disowned-children ()
   "Regression guard for issue #10.
 
-A background / disowned descendant spawned inside the shell command
-must survive `anvil-shell' returning.  On Linux, `setsid --fork' is
-the only reliable way to detach — `& disown' alone keeps the child
-in the shell's session and the kernel SIGHUPs it when the wrapper
-shell exits.  Detail: `anvil-host--run' uses `:connection-type
-'pipe', but `make-process' still calls `setsid()' for its direct
-child, and the child inherits the parent's controlling TTY via fd 0.
-So plain `& disown' descendants remain in bash's (now session-leader)
-session and get SIGHUP when bash returns.  `setsid --fork' forks a
-grandchild into a brand-new session with no controlling TTY, which
-survives.  This is what `wl-copy' / `pbcopy' / `xclip' do internally
-when they spawn their clipboard-holder daemons.
+A detached descendant spawned inside the shell command must survive
+`anvil-shell' returning.  `anvil-host--run' gives the shell pipe
+streams and closes its process-input pipe immediately because the
+API has no stdin channel.  On Linux, `setsid --fork' creates the new
+session needed for a descendant to outlive the wrapper shell.  This
+is the same mechanism clipboard helpers such as `wl-copy' and
+`xclip' use for their owner daemons.
 
 The test schedules a short-delayed background `touch' via
 `setsid --fork' and asserts the marker file appears after the shell
@@ -75,6 +70,127 @@ line on exit; the wrapper silences it with `:sentinel #'ignore'
       (should (string-match-p "world" err)))))
 
 ;;;; --- basic exit / output semantics --------------------------------------
+
+(ert-deftest anvil-host-test-shell-stdin-is-eof ()
+  "Shell commands that read stdin must observe immediate EOF."
+  (skip-unless (memq system-type '(gnu/linux darwin windows-nt)))
+  (let* ((command
+          (if (eq system-type 'windows-nt)
+              "more >NUL & echo stdin-eof"
+            "cat >/dev/null; printf 'stdin-eof\\n'"))
+         (res (anvil-shell command '(:timeout 3))))
+    (should (eql 0 (plist-get res :exit)))
+    (should (equal "stdin-eof\n" (plist-get res :stdout)))
+    (should (equal "" (plist-get res :stderr)))))
+
+(ert-deftest anvil-host-test-shell-bounds-output-before-decoding ()
+  "A finite :max-output must cap lexical capture, not only returned text."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (skip-unless (executable-find "dd"))
+  (let ((decoded-byte-counts nil)
+        (decode-output (symbol-function 'anvil-host--decode-output)))
+    (cl-letf (((symbol-function 'anvil-host--decode-output)
+               (lambda (bytes coding)
+                 (push (string-bytes bytes) decoded-byte-counts)
+                 (funcall decode-output bytes coding))))
+      (let* ((limit 1024)
+             (res
+              (anvil-shell
+               "dd if=/dev/zero bs=1048576 count=1 2>/dev/null"
+               (list :timeout 5 :max-output limit))))
+        (should (eql 0 (plist-get res :exit)))
+        (should (eq t (plist-get res :truncated)))
+        (should (= 1048576 (plist-get res :stdout-total-bytes)))
+        (should (= 0 (plist-get res :stderr-total-bytes)))
+        (should decoded-byte-counts)
+        (should
+         (cl-every (lambda (size) (<= size limit))
+                   decoded-byte-counts))
+        (should
+         (string-match-p
+          "anvil-host: truncated, 1047552 more bytes"
+          (plist-get res :stdout)))))))
+
+(ert-deftest anvil-host-test-source-byte-fields-are-opt-in ()
+  "Exact source-byte fields are absent unless explicitly requested."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (dolist (opts
+           '((:timeout 3)
+             (:timeout 3 :include-source-bytes nil)))
+    (let ((res (anvil-shell "printf output" opts)))
+      (should-not
+       (plist-member res :stdout-captured-source-bytes))
+      (should-not
+       (plist-member res :stderr-captured-source-bytes)))))
+
+(ert-deftest anvil-host-test-source-byte-fields-are-exact-unibyte ()
+  "The opt-in fields preserve exact bounded bytes in the source encoding."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (skip-unless (coding-system-p 'cp932-dos))
+  (let* ((res
+          (anvil-shell
+           "printf '\\202\\240X'; printf '\\202\\242Y' >&2"
+           '(:timeout 3 :max-output 2 :coding cp932-dos
+             :include-source-bytes t)))
+         (stdout-source
+          (plist-get res :stdout-captured-source-bytes))
+         (stderr-source
+          (plist-get res :stderr-captured-source-bytes)))
+    (should (plist-member res :stdout-captured-source-bytes))
+    (should (plist-member res :stderr-captured-source-bytes))
+    (should (equal "あ" (plist-get res :stdout-captured)))
+    (should (equal "い" (plist-get res :stderr-captured)))
+    (should (= 3 (plist-get res :stdout-total-bytes)))
+    (should (= 3 (plist-get res :stderr-total-bytes)))
+    (should (equal (unibyte-string #x82 #xa0) stdout-source))
+    (should (equal (unibyte-string #x82 #xa2) stderr-source))
+    (should-not (multibyte-string-p stdout-source))
+    (should-not (multibyte-string-p stderr-source))
+    (should (= 2 (string-bytes stdout-source)))
+    (should (= 2 (string-bytes stderr-source)))))
+
+(ert-deftest anvil-host-test-child-bindings-are-spawn-local ()
+  "Dedicated child bindings apply at spawn without leaking into the root."
+  (skip-unless (memq system-type '(gnu/linux darwin)))
+  (let* ((root-environment process-environment)
+         (root-exec-path exec-path)
+         (root-shell shell-file-name)
+         (root-switch shell-command-switch)
+         (child-environment
+          (cons "ANVIL_HOST_CHILD_SCOPE=child"
+                (copy-sequence process-environment)))
+         (child-exec-path (reverse (copy-sequence exec-path)))
+         (child-shell (or (executable-find "sh") shell-file-name))
+         (anvil-host-child-process-environment child-environment)
+         (anvil-host-child-exec-path child-exec-path)
+         (anvil-host-child-shell-file-name child-shell)
+         (anvil-host-child-shell-command-switch "-c")
+         (original-make-process anvil-host--make-process-primitive)
+         observed)
+    (cl-letf ((anvil-host--make-process-primitive
+               (lambda (&rest args)
+                 (setq observed
+                       (list process-environment exec-path
+                             shell-file-name shell-command-switch))
+                 (apply original-make-process args))))
+      (let ((result
+             (anvil-host--run
+              "printf %s \"$ANVIL_HOST_CHILD_SCOPE\""
+              'utf-8 temporary-file-directory 3)))
+        (should
+         (equal
+          (list 0 "child" "" 5 0
+                (encode-coding-string "child" 'utf-8)
+                (encode-coding-string "" 'utf-8))
+          result))))
+    (should (equal child-environment (nth 0 observed)))
+    (should (equal child-exec-path (nth 1 observed)))
+    (should (equal child-shell (nth 2 observed)))
+    (should (equal "-c" (nth 3 observed)))
+    (should (eq root-environment process-environment))
+    (should (eq root-exec-path exec-path))
+    (should (eq root-shell shell-file-name))
+    (should (eq root-switch shell-command-switch))))
 
 (ert-deftest anvil-host-test-shell-nonzero-exit-reported ()
   "A non-zero shell exit is reported in :exit (not raised)."
