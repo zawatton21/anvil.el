@@ -89,6 +89,251 @@ Anything else explicitly provided is truthy."
    ((null value) default)
    (t t)))
 
+(defcustom anvil-file-max-inline-read-bytes 1048576
+  "Maximum raw bytes returned by an inline `anvil-file-read'.
+Positive values bound both an unpaginated body and the selected raw
+bytes of a paginated response.  Nil, zero, or a negative value restores
+the legacy full-file loader."
+  :type '(choice (const :tag "Use legacy full-file reads" nil) integer)
+  :group 'anvil)
+
+(defconst anvil-file--stream-chunk-bytes 65536
+  "Raw bytes read per chunk while scanning a paginated file.")
+
+(defconst anvil-file--stream-yield-chunks 16
+  "Number of paginated file chunks scanned between cooperative yields.")
+
+(defconst anvil-file--stream-yield-seconds 0.001
+  "Seconds yielded after each group of paginated file chunks.")
+
+(defun anvil-file--validate-read-range (offset limit)
+  "Validate OFFSET and LIMIT and return their normalized pair.
+OFFSET must be nil or a non-negative integer.  LIMIT must be nil or a
+positive integer.  Validation deliberately precedes all path and body
+operations."
+  (unless (or (null offset)
+              (and (integerp offset) (>= offset 0)))
+    (error "file-read offset must be a non-negative integer"))
+  (unless (or (null limit)
+              (and (integerp limit) (> limit 0)))
+    (error "file-read limit must be a positive integer"))
+  (list (or offset 0) limit))
+
+(defun anvil-file--parse-read-decimal (value name positive)
+  "Parse optional ASCII decimal VALUE for read argument NAME.
+When POSITIVE is non-nil, reject zero as well as malformed values."
+  (when value
+    (unless (and (stringp value)
+                 (string-match-p "\\`[0-9]+\\'" value))
+      (error "file-read %s must be an ASCII decimal integer" name))
+    (let ((number (string-to-number value)))
+      (when (and positive (zerop number))
+        (error "file-read %s must be a positive integer" name))
+      number)))
+
+(defun anvil-file--inline-read-enabled-p ()
+  "Return non-nil when the configured inline read bound is enabled."
+  (cond
+   ((or (null anvil-file-max-inline-read-bytes)
+        (and (numberp anvil-file-max-inline-read-bytes)
+             (<= anvil-file-max-inline-read-bytes 0)))
+    nil)
+   ((and (integerp anvil-file-max-inline-read-bytes)
+         (> anvil-file-max-inline-read-bytes 0))
+    t)
+   (t
+    (error "anvil-file-max-inline-read-bytes must be nil or an integer"))))
+
+(defun anvil-file--attribute-identity (attributes)
+  "Return a stable file identity from ATTRIBUTES on Emacs 28 and later."
+  (if (fboundp 'file-attribute-file-identifier)
+      (file-attribute-file-identifier attributes)
+    (list (file-attribute-inode-number attributes)
+          (file-attribute-device-number attributes))))
+
+(defun anvil-file--file-generation (target)
+  "Return TARGET's regular-file identity, size, and modification generation."
+  (let ((attributes (file-attributes target 'integer)))
+    (when (and attributes
+               (null (file-attribute-type attributes)))
+      (list :identity (anvil-file--attribute-identity attributes)
+            :size (file-attribute-size attributes)
+            :mtime (file-attribute-modification-time attributes)))))
+
+(defun anvil-file--signal-unbounded-overflow (size cap lower-bound)
+  "Signal an inline read overflow of SIZE against CAP.
+LOWER-BOUND distinguishes a capped observation from an exact stat size."
+  (error
+   (concat "File is too large for inline reading (%s%d bytes; "
+           "maximum %d bytes). Retry with pagination, for example "
+           "offset=0 and limit=200.")
+   (if lower-bound "at least " "") size cap))
+
+(defun anvil-file--insert-capped-unbounded (target cap)
+  "Insert decoded TARGET into the current buffer, bounded by CAP raw bytes.
+At most CAP+1 bytes are read.  A successful prefix is decoded as UTF-8
+without reopening TARGET."
+  (let* ((generation (anvil-file--file-generation target))
+         (size (and generation (plist-get generation :size))))
+    (unless generation
+      (error "File changed before it could be read; retry the request"))
+    (when (> size cap)
+      (anvil-file--signal-unbounded-overflow size cap nil))
+    (set-buffer-multibyte nil)
+    (let ((coding-system-for-read 'no-conversion))
+      (insert-file-contents-literally target nil 0 (1+ cap)))
+    (when (> (buffer-size) cap)
+      (erase-buffer)
+      (anvil-file--signal-unbounded-overflow (1+ cap) cap t))
+    ;; Decode the bounded raw prefix in place.  Do not create a second raw
+    ;; string while the buffer still retains the original CAP bytes.
+    (set-buffer-multibyte t)
+    (decode-coding-region (point-min) (point-max) 'utf-8)))
+
+(defun anvil-file--signal-stream-changed ()
+  "Signal a content-free diagnostic for a changing streamed file."
+  (error "File changed while it was being read; retry the request"))
+
+(defun anvil-file--signal-page-overflow (cap)
+  "Signal a content-free diagnostic for a selected page over CAP bytes."
+  (error
+   (concat "Selected page exceeds the inline maximum of %d bytes. "
+           "Retry with a lower limit or use a filtered or region tool.")
+   cap))
+
+(defun anvil-file--abort-page-overflow
+    (page-buffer chunk-buffer target initial cap)
+  "Erase retained bytes and reject TARGET's overflowing page.
+PAGE-BUFFER and CHUNK-BUFFER are cleared before any error can escape.
+INITIAL is revalidated so a race already observed by this read retains
+the existing content-free changed-file precedence."
+  (with-current-buffer page-buffer
+    (erase-buffer))
+  (with-current-buffer chunk-buffer
+    (erase-buffer))
+  (unless (equal initial (anvil-file--file-generation target))
+    (anvil-file--signal-stream-changed))
+  (anvil-file--signal-page-overflow cap))
+
+(defun anvil-file--read-streamed-page (target offset limit cap)
+  "Stream TARGET and return the OFFSET/LIMIT page bounded by CAP bytes.
+Successful reads scan the entire file for an exact line count.  An overflowing
+selected page aborts immediately.  At most one fixed raw chunk and CAP+1
+selected raw bytes are retained at a time."
+  (let* ((initial (anvil-file--file-generation target))
+         (initial-size (and initial (plist-get initial :size)))
+         (page-buffer (generate-new-buffer " *anvil-file-page*"))
+         (chunk-buffer (generate-new-buffer " *anvil-file-chunk*"))
+         (cursor 0)
+         (chunks 0)
+         (scanned-bytes 0)
+         (line-index 0)
+         (newline-count 0)
+         (saw-bytes nil)
+         (last-byte-newline nil)
+         (page-bytes 0)
+         content)
+    (unless initial
+      (kill-buffer page-buffer)
+      (kill-buffer chunk-buffer)
+      (anvil-file--signal-stream-changed))
+    (unwind-protect
+        (progn
+          (with-current-buffer page-buffer
+            (set-buffer-multibyte nil))
+          (with-current-buffer chunk-buffer
+            (set-buffer-multibyte nil))
+          (while (< cursor initial-size)
+            (let ((end (min initial-size
+                            (+ cursor anvil-file--stream-chunk-bytes))))
+              (condition-case nil
+                  (with-current-buffer chunk-buffer
+                    (erase-buffer)
+                    (let ((coding-system-for-read 'no-conversion))
+                      (insert-file-contents-literally target nil cursor end))
+                    (let ((chunk-size (buffer-size))
+                          (segment-start (point-min)))
+                      (cl-incf scanned-bytes chunk-size)
+                      (when (> chunk-size 0)
+                        (setq saw-bytes t
+                              last-byte-newline
+                              (= (char-after (1- (point-max))) ?\n)))
+                      (goto-char (point-min))
+                      (while (search-forward "\n" nil t)
+                        (when (and (>= line-index offset)
+                                   (< line-index (+ offset limit)))
+                          (let* ((segment-end (point))
+                                 (length (- segment-end segment-start))
+                                 (room (max 0 (- (1+ cap) page-bytes)))
+                                 (take (min length room)))
+                            (when (> take 0)
+                              (with-current-buffer page-buffer
+                                (insert-buffer-substring
+                                 chunk-buffer segment-start
+                                 (+ segment-start take)))
+                              (cl-incf page-bytes take))
+                            (when (or (> page-bytes cap)
+                                      (< take length))
+                              (anvil-file--abort-page-overflow
+                               page-buffer chunk-buffer target initial cap))))
+                        (cl-incf newline-count)
+                        (cl-incf line-index)
+                        (setq segment-start (point)))
+                      (when (< segment-start (point-max))
+                        (when (and (>= line-index offset)
+                                   (< line-index (+ offset limit)))
+                          (let* ((segment-end (point-max))
+                                 (length (- segment-end segment-start))
+                                 (room (max 0 (- (1+ cap) page-bytes)))
+                                 (take (min length room)))
+                            (when (> take 0)
+                              (with-current-buffer page-buffer
+                                (insert-buffer-substring
+                                 chunk-buffer segment-start
+                                 (+ segment-start take)))
+                              (cl-incf page-bytes take))
+                            (when (or (> page-bytes cap)
+                                      (< take length))
+                              (anvil-file--abort-page-overflow
+                               page-buffer chunk-buffer target initial cap)))))))
+                (file-error
+                 (with-current-buffer page-buffer (erase-buffer))
+                 (anvil-file--signal-stream-changed)))
+              (setq cursor end)
+              (cl-incf chunks)
+              (when (zerop (% chunks anvil-file--stream-yield-chunks))
+                (accept-process-output nil anvil-file--stream-yield-seconds))))
+          (unless (and (= scanned-bytes initial-size)
+                       (equal initial (anvil-file--file-generation target)))
+            (with-current-buffer page-buffer (erase-buffer))
+            (anvil-file--signal-stream-changed))
+          ;; The final raw chunk is no longer needed once generation and page
+          ;; bounds have been verified.  Release it before decoding or
+          ;; extracting the selected page.
+          (with-current-buffer chunk-buffer (erase-buffer))
+          (let* ((total-lines (+ newline-count
+                                 (if (and saw-bytes
+                                          (not last-byte-newline))
+                                     1
+                                   0)))
+                 (lines-returned
+                  (max 0 (min limit (- total-lines offset))))
+                 (decoded
+                  (with-current-buffer page-buffer
+                    (set-buffer-multibyte t)
+                    (decode-coding-region (point-min) (point-max) 'utf-8)
+                    (prog1 (buffer-substring-no-properties
+                            (point-min) (point-max))
+                      (erase-buffer)))))
+            (setq content decoded)
+            (list :content content
+                  :total-lines total-lines
+                  :lines-returned lines-returned)))
+      (when (buffer-live-p page-buffer)
+        (kill-buffer page-buffer))
+      (when (buffer-live-p chunk-buffer)
+        (kill-buffer chunk-buffer)))))
+
 (defcustom anvil-file-delta-cache-max-entries 16
   "Maximum number of session baselines retained for `anvil-file-read-delta'."
   :type 'integer
@@ -158,31 +403,63 @@ Anything else explicitly provided is truthy."
 (defun anvil-file-read (path &optional offset limit)
   "Read file PATH and return its content as a string.
 OFFSET is the 0-based line offset to start from (default 0).
-LIMIT is the maximum number of lines to return (default all).
+LIMIT is a positive integer maximum number of lines (default all).
+Large files require a positive LIMIT so their selected page can be
+streamed without loading the full body.
 Returns (:file PATH :content STR :total-lines N :offset OFFSET
          :lines-returned N :warnings LIST).
 :warnings is nil when the file has no visited buffer or is in-sync;
 otherwise a list of human-readable strings flagging divergence
 (see `anvil-file-warn-if-diverged')."
-  (let* ((abs (anvil--prepare-path path))
-         (warnings (anvil-file-warn-if-diverged abs)))
-    (with-temp-buffer
-      (anvil--insert-file abs)
-      (let ((total (count-lines (point-min) (point-max)))
-            (off (or offset 0))
-            (lim limit))
-        (goto-char (point-min))
-        (forward-line off)
-        (let* ((beg (point))
-               (end (if lim
-                        (progn (forward-line lim) (point))
-                      (point-max)))
-               (content (buffer-substring-no-properties beg end))
-               (lines-returned (count-lines beg end)))
-          (list :file abs :content content
-                :total-lines total :offset off
-                :lines-returned lines-returned
-                :warnings warnings))))))
+  (pcase-let* ((`(,off ,lim)
+                (anvil-file--validate-read-range offset limit))
+               (abs (anvil--prepare-path path))
+               (warnings (anvil-file-warn-if-diverged abs)))
+    (if (anvil-file--inline-read-enabled-p)
+        (let ((target (file-truename abs))
+              (cap anvil-file-max-inline-read-bytes))
+          (if lim
+              (let ((page
+                     (anvil-file--read-streamed-page target off lim cap)))
+                (list :file abs
+                      :content (plist-get page :content)
+                      :total-lines (plist-get page :total-lines)
+                      :offset off
+                      :lines-returned (plist-get page :lines-returned)
+                      :warnings warnings))
+            (with-temp-buffer
+              (anvil-file--insert-capped-unbounded target cap)
+              (let ((total (count-lines (point-min) (point-max))))
+                (goto-char (point-min))
+                (forward-line off)
+                (let ((beg (point))
+                      (end (point-max)))
+                  (let ((content (buffer-substring-no-properties beg end))
+                        (lines-returned (count-lines beg end)))
+                    ;; Release the bounded decoded body before the result
+                    ;; escapes this temporary buffer.
+                    (erase-buffer)
+                    (list :file abs
+                          :content content
+                          :total-lines total
+                          :offset off
+                          :lines-returned lines-returned
+                          :warnings warnings)))))))
+      (with-temp-buffer
+        (anvil--insert-file abs)
+        (let ((total (count-lines (point-min) (point-max))))
+          (goto-char (point-min))
+          (forward-line off)
+          (let* ((beg (point))
+                 (end (if lim
+                          (progn (forward-line lim) (point))
+                        (point-max))))
+            (list :file abs
+                  :content (buffer-substring-no-properties beg end)
+                  :total-lines total
+                  :offset off
+                  :lines-returned (count-lines beg end)
+                  :warnings warnings)))))))
 
 (defun anvil-file-read-delta (path &optional reset)
   "Read PATH with a session baseline cache and return full/delta states.
@@ -1225,7 +1502,9 @@ LIMIT (end-start+1) when the caller did not supply explicit values."
 
 (defun anvil-file--tool-read (path &optional offset limit)
   "Read file at PATH and return its content.
-Supports optional line-based pagination.  PATH may also be a
+Supports optional line-based pagination; LIMIT, when supplied, must be
+a positive ASCII decimal integer.  Large files require pagination.
+PATH may also be a
 `file://PATH[#L<s>-<e>]' citation URI emitted by the disclosure
 Layer-1 / Layer-2 tools; the embedded line range seeds offset/limit
 when the caller did not supply them.
@@ -1238,12 +1517,8 @@ MCP Parameters:
     (require 'anvil-uri nil t)
     (pcase-let ((`(,p ,off-str ,lim-str)
                  (anvil-file--read-normalize-uri-args path offset limit)))
-      (let ((off (if (and off-str (not (string-empty-p off-str)))
-                     (string-to-number off-str)
-                   nil))
-            (lim (if (and lim-str (not (string-empty-p lim-str)))
-                     (string-to-number lim-str)
-                   nil)))
+      (let ((off (anvil-file--parse-read-decimal off-str "offset" nil))
+            (lim (anvil-file--parse-read-decimal lim-str "limit" t)))
         (format "%S" (anvil-file-read p off lim))))))
 
 (defun anvil-file--tool-read-delta (path &optional reset)
@@ -2559,8 +2834,8 @@ either a plain absolute path or a `file://PATH[#L<start>[-<end>]]'
 citation URI emitted by Layer 1 (`file-outline') / Layer 2
 (`file-read-snippet') — the URI's line range becomes the default
 offset/limit.  Returns the file content as a string.  For large
-files, use `file-read-snippet' (Layer 2) or pass offset/limit to
-   read specific sections."
+files, use `file-read-snippet' (Layer 2) or pass an offset and a
+positive integer limit to read a specific page."
    :read-only t
    :server-id anvil-file--server-id)
 

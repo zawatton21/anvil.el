@@ -467,6 +467,11 @@ must not be counted as a reference.\"
         (progn
           (with-temp-file file (insert anvil-defs-test--trace-fixture))
           (call-process "git" nil nil nil "init" "-q")
+          (call-process "git" nil nil nil
+                        "config" "commit.gpgsign" "false")
+          ;; Prove the parser is independent of user-configured diff prefixes.
+          (call-process "git" nil nil nil
+                        "config" "diff.mnemonicPrefix" "true")
           (call-process "git" nil nil nil "add" "tc.el")
           (call-process "git" nil nil nil "commit" "-q" "-m" "init")
           (anvil-defs-index-rebuild (list dir))

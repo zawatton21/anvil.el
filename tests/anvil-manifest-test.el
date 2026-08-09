@@ -696,6 +696,13 @@ symbols in the default `anvil-manifest-server-profiles'."
     (should (> (length toolset) 0))
     (should (cl-every #'stringp toolset))))
 
+(ert-deftest anvil-manifest-test-core-covers-async-eval-lifecycle ()
+  "The core profile exposes every operation needed to manage async eval jobs."
+  (let ((toolset (anvil-manifest--profile-toolset 'core)))
+    (dolist (id '("emacs-eval" "emacs-eval-async" "emacs-eval-result"
+                  "emacs-eval-jobs" "emacs-eval-cancel"))
+      (should (member id toolset)))))
+
 (ert-deftest anvil-manifest-test-headless-profile-covers-phase5e-7-tools ()
   "Stage D Phase 6.1 MVP は NeLisp Phase 5-E の 7 tool を必ず expose する。"
   (let ((toolset (anvil-manifest--profile-toolset 'headless)))

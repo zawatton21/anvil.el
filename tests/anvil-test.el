@@ -1010,4 +1010,942 @@ that slip through plist detection (alist entries), otherwise
     (should (equal "default" (cdr (assq 'b parsed))))
     (should (listp (cdr (assq 'matrix parsed))))))
 
+;;;; --- bounded inline tool results --------------------------------------
+
+(defvar anvil-test--inline-payload nil)
+
+(defun anvil-test--inline-payload-tool ()
+  "Return the current inline-boundary fixture payload."
+  anvil-test--inline-payload)
+
+(defun anvil-test--inline-macro-error-tool ()
+  "Signal the current fixture payload through the public error wrapper."
+  (anvil-server-with-error-handling
+    (error "%s" anvil-test--inline-payload)))
+
+(defun anvil-test--inline-direct-error-tool ()
+  "Signal the current fixture payload as an explicit MCP tool error."
+  (anvil-server-tool-throw anvil-test--inline-payload))
+
+(defun anvil-test--inline-generic-error-tool ()
+  "Signal the current fixture payload as an ordinary error."
+  (error "%s" anvil-test--inline-payload))
+
+(defun anvil-test--inline-wrong-type-tool ()
+  "Signal an allowlisted condition with request-owned non-string data."
+  (signal 'wrong-type-argument
+          (list 'numberp (list anvil-test--inline-payload))))
+
+(defun anvil-test--inline-quit-tool ()
+  "Signal quit with the current fixture payload."
+  (signal 'quit (list anvil-test--inline-payload)))
+
+(defun anvil-test--inline-spoof-overflow-tool ()
+  "Spoof the internal overflow condition with the fixture payload."
+  (signal 'anvil-server-inline-result-too-large
+          (list anvil-test--inline-payload)))
+
+(defun anvil-test--inline-token-aware-spoof-overflow-tool ()
+  "Spoof the overflow condition using any published marker or a lookalike."
+  (signal 'anvil-server-inline-result-too-large
+          (list (if (boundp 'anvil-server--inline-result-overflow-token)
+                    (symbol-value
+                     'anvil-server--inline-result-overflow-token)
+                  (make-symbol "anvil-server-inline-result-overflow"))
+                anvil-test--inline-payload)))
+
+(defun anvil-test--inline-property-error-tool ()
+  "Signal an ordinary error whose text carries fixture properties."
+  (signal 'error (list anvil-test--inline-payload)))
+
+(defun anvil-test--response-text (response)
+  "Return the first MCP text item from decoded RESPONSE."
+  (let* ((decoded (json-read-from-string response))
+         (result (alist-get 'result decoded))
+         (content (and result (alist-get 'content result))))
+    (and content (alist-get 'text (aref content 0)))))
+
+(defun anvil-test--response-error-code (response)
+  "Return the JSON-RPC error code from RESPONSE, or nil."
+  (alist-get 'code
+             (alist-get 'error (json-read-from-string response))))
+
+(ert-deftest anvil-test-inline-result-limit-end-to-end ()
+  "Oversized results fail before disclosure, metrics, hooks, or encoding."
+  (let* ((server-id "anvil-test-inline-boundary")
+         (tool-id "inline.escape-heavy")
+         (anvil-test--inline-payload
+          (concat "INLINE-SENTINEL-" (make-string 64 ?\")))
+         (anvil-server-max-inline-result-bytes 32)
+         (anvil-server--running t)
+         (hook-values nil)
+         (payload-values nil))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id tool-id :description "inline fixture" :server-id server-id)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (cl-letf (((symbol-function
+                        'anvil-server-metrics--track-tool-payload)
+                       (lambda (_tool _args response)
+                         (push response payload-values)))
+                      ((symbol-function 'anvil-disclosure-budget-apply)
+                       (lambda (&rest _)
+                         (ert-fail "oversized raw result reached disclosure"))))
+              (let* ((request
+                      (json-encode
+                       `((jsonrpc . "2.0") (id . 91)
+                         (method . "tools/call")
+                         (params . ((name . ,tool-id)
+                                    (arguments . ()))))))
+                     (response
+                      (anvil-server-process-jsonrpc request server-id))
+                     (decoded (json-read-from-string response))
+                     (result (alist-get 'result decoded))
+                     (text (anvil-test--response-text response)))
+                (should (eq t (alist-get 'isError result)))
+                (should
+                 (equal
+                  (concat
+                   "Tool inline.escape-heavy result exceeds the inline "
+                   "response limit (raw-bytes=80 "
+                   "projected-bytes-at-least=34 limit=32). Use a paginated, "
+                   "filtered, tee, or asynchronous interface.")
+                  text))
+                (should (string-match-p "inline response limit" text))
+                (should (string-match-p "limit=32" text))
+                (should-not (string-match-p "INLINE-SENTINEL" response))
+                (should-not hook-values)
+                (should-not payload-values))))
+          ;; A disclosure transform is an untrusted expansion seam and gets
+          ;; the same guard before payload metrics or MCP wrapping.
+          (setq anvil-test--inline-payload "safe")
+          (cl-letf (((symbol-function 'anvil-disclosure-budget-apply)
+                     (lambda (_tool _text)
+                       (concat "DISCLOSURE-SENTINEL-"
+                               (make-string 64 ?\\))))
+                    ((symbol-function
+                      'anvil-server-metrics--track-tool-payload)
+                     (lambda (&rest _)
+                       (ert-fail "expanded disclosure reached metrics"))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    92 `((name . ,tool-id) (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should
+               (equal
+                (concat
+                 "Tool inline.escape-heavy result exceeds the inline "
+                 "response limit (raw-bytes=84 "
+                 "projected-bytes-at-least=34 limit=32). Use a paginated, "
+                 "filtered, tee, or asynchronous interface.")
+                (anvil-test--response-text response)))
+              (should (string-match-p "inline response limit" response))
+              (should-not (string-match-p "DISCLOSURE-SENTINEL" response)))))
+      (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
+
+(ert-deftest anvil-test-inline-result-limit-error-paths ()
+  "Tool-derived error cells and labels are reconstructed before hooks."
+  (let* ((server-id "anvil-test-inline-errors")
+         (tool-id "inline.macro-error")
+         (anvil-test--inline-payload
+          (concat "ERROR-SENTINEL-" (make-string 80 ?x)))
+         (anvil-server-max-inline-result-bytes 32)
+         (anvil-server--running t)
+         (hook-values nil))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-macro-error-tool
+           :id tool-id :description "error fixture" :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-direct-error-tool
+           :id "inline.direct-error" :description "error fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-generic-error-tool
+           :id "inline.generic-error" :description "error fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-wrong-type-tool
+           :id "inline.wrong-type" :description "error fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-quit-tool
+           :id "inline.quit" :description "error fixture"
+           :server-id server-id)
+          ;; A macro-wrapped generic failure hooks exactly once and is then
+          ;; transported as an MCP isError result without the rejected text.
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let* ((response
+                    (anvil-server--handle-tools-call
+                     93 `((name . ,tool-id) (arguments . ()))
+                     (make-anvil-server-metrics) server-id))
+                   (text (anvil-test--response-text response)))
+              (should (string-match-p "inline response limit" text))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should (= 1 (length hook-values)))
+              (pcase-let ((`(,condition ,label ,source)
+                           (car hook-values)))
+                (should (consp condition))
+                (should (eq 'error (car condition)))
+                (should (equal tool-id label))
+                (should (eq 'tool-body source))
+                (should-not
+                 (equal (cadr condition) anvil-test--inline-payload)))))
+          ;; Direct tool errors remain MCP isError results and are unhooked.
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    94 '((name . "inline.direct-error") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (string-match-p "inline response limit" response))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should-not hook-values)))
+          ;; Dispatcher generic errors keep the -32603 envelope and hook once.
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    95 '((name . "inline.generic-error") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (= anvil-server-jsonrpc-error-internal
+                         (anvil-test--response-error-code response)))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should (= 1 (length hook-values)))))
+          ;; Quit keeps the -32603 envelope and does not run the error hook.
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    96 '((name . "inline.quit") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (= anvil-server-jsonrpc-error-internal
+                         (anvil-test--response-error-code response)))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should-not hook-values)))
+          ;; Malformed params are contained by the real JSON-RPC path, hook
+          ;; exactly once, retain -32602, and never reach the outer formatter.
+          (setq hook-values nil)
+          (cl-letf (((symbol-function 'anvil-server--handle-error)
+                     (lambda (&rest _)
+                       (ert-fail "tool error escaped to outer handler"))))
+            (let ((anvil-server-tool-error-hook
+                   (list (lambda (&rest values) (push values hook-values)))))
+              (let* ((request
+                      (json-encode
+                       `((jsonrpc . "2.0") (id . 97)
+                         (method . "tools/call")
+                         (params . [,(concat "PARAMS-SENTINEL-"
+                                             (make-string 80 ?p))]))))
+                     (response
+                      (anvil-server-process-jsonrpc request server-id)))
+                (should (= anvil-server-jsonrpc-error-invalid-params
+                           (anvil-test--response-error-code response)))
+                (should-not (string-match-p "PARAMS-SENTINEL" response))
+                (should (= 1 (length hook-values))))))
+          ;; An oversized unexpected-parameter name is sanitized after the
+          ;; dispatcher's inner validation and retains -32602 plus one hook.
+          (setq hook-values nil)
+          (let* ((unexpected
+                  (intern (concat "UNEXPECTED-SENTINEL-"
+                                  (make-string 80 ?u))))
+                 (params
+                  `((name . "inline.macro-error")
+                    (arguments . ((,unexpected . "value"))))))
+            (let ((anvil-server-tool-error-hook
+                   (list (lambda (&rest values) (push values hook-values)))))
+              (let ((response
+                     (anvil-server--handle-tools-call
+                      951 params (make-anvil-server-metrics) server-id)))
+                (should (= anvil-server-jsonrpc-error-invalid-params
+                           (anvil-test--response-error-code response)))
+                (should-not
+                 (string-match-p "UNEXPECTED-SENTINEL" response))
+                (should (= 1 (length hook-values))))))
+          ;; Lazy loader failures are covered by the same outer boundary.
+          (let ((table (anvil-server--get-server-tools server-id)))
+            (puthash
+             "inline.lazy-generic"
+             (list :id "inline.lazy-generic" :json-fragment "{}"
+                   :lazy-placeholder t
+                   :lazy-loader (lambda (&rest _)
+                                  (error "%s" anvil-test--inline-payload)))
+             table)
+            (puthash
+             "inline.lazy-tool-error"
+             (list :id "inline.lazy-tool-error" :json-fragment "{}"
+                   :lazy-placeholder t
+                   :lazy-loader (lambda (&rest _)
+                                  (anvil-server-tool-throw
+                                   anvil-test--inline-payload)))
+             table))
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    98 '((name . "inline.lazy-generic") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (= anvil-server-jsonrpc-error-internal
+                         (anvil-test--response-error-code response)))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should (= 1 (length hook-values)))))
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    99 '((name . "inline.lazy-tool-error") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (string-match-p "inline response limit" response))
+              (should-not (string-match-p "ERROR-SENTINEL" response))
+              (should-not hook-values)))
+          ;; Lookup misses use only the placeholder and stay unhooked.
+          (setq hook-values nil)
+          (let ((anvil-server-tool-error-hook
+                 (list (lambda (&rest values) (push values hook-values)))))
+            (let ((response
+                   (anvil-server--handle-tools-call
+                    100
+                    '((name . "MISSING SENTINEL unsafe!") (arguments . ()))
+                    (make-anvil-server-metrics) server-id)))
+              (should (= anvil-server-jsonrpc-error-invalid-request
+                         (anvil-test--response-error-code response)))
+              (should (string-match-p "<oversized-tool-id>" response))
+              (should-not (string-match-p "MISSING SENTINEL" response))
+              (should-not hook-values)))
+          ;; The production harness hook receives the sanitized symbol and
+          ;; label and retains its classifier behavior at the final recorder.
+          (require 'anvil-harness-telemetry)
+          (let (recorded)
+            (cl-letf (((symbol-function 'anvil-harness-telemetry-record)
+                       (lambda (class &rest keys)
+                         (setq recorded (cons class keys))
+                         '(:id 1))))
+              (let ((anvil-server-tool-error-hook
+                     '(anvil-harness-telemetry--dispatcher-hook)))
+                (let ((response
+                       (anvil-server--handle-tools-call
+                        101 '((name . "inline.wrong-type") (arguments . ()))
+                        (make-anvil-server-metrics) server-id)))
+                  (should (= anvil-server-jsonrpc-error-internal
+                             (anvil-test--response-error-code response)))
+                  (should-not (string-match-p "ERROR-SENTINEL" response)))))
+            (should (eq 'no-exec (car recorded)))
+            (should (equal "inline.wrong-type"
+                           (plist-get (cdr recorded) :tool)))
+            (should-not (string-match-p
+                         "ERROR-SENTINEL" (format "%S" recorded))))
+          ;; Unknown condition names are canonicalized before persistence.
+          (let* ((sentinel-symbol
+                  (intern "request-owned-condition-ERROR-SENTINEL"))
+                 (sanitized
+                  (anvil-server--sanitize-tool-error
+                   "unsafe tool name!" 'generic
+                   (list sentinel-symbol anvil-test--inline-payload))))
+            (should (eq 'error (car (plist-get sanitized :condition))))
+            (should (equal "<oversized-tool-id>"
+                           (plist-get sanitized :tool)))
+            (should-not (string-match-p
+                         "ERROR-SENTINEL" (plist-get sanitized :text)))))
+      (dolist (id (list tool-id "inline.direct-error" "inline.generic-error"
+                        "inline.wrong-type" "inline.quit"
+                        "inline.lazy-generic" "inline.lazy-tool-error"))
+        (ignore-errors (anvil-server-unregister-tool id server-id))))))
+
+(ert-deftest anvil-test-inline-result-limit-boundaries ()
+  "Projected sizes match Emacs JSON escaping without using the encoder."
+  (let* ((controls (apply #'string (number-sequence 0 31)))
+         (unibyte-high
+          (apply #'unibyte-string (number-sequence #x80 #xff)))
+         (cases (list "plain" "\"\\" controls "éλ中" "😀" unibyte-high))
+         (oracles
+          (mapcar
+           (lambda (text)
+             (- (string-bytes (json-encode-string text)) 2))
+           cases)))
+    (cl-letf (((symbol-function 'json-encode-string)
+               (lambda (&rest _) (ert-fail "projector used json encoder")))
+              ((symbol-function 'json-encode)
+               (lambda (&rest _) (ert-fail "projector used json encoder"))))
+      (cl-mapc
+       (lambda (text expected)
+         (should (= expected
+                    (anvil-server--projected-json-string-bytes text nil))))
+       cases oracles)))
+  (should (= 172
+             (anvil-server--projected-json-string-bytes
+              (apply #'string (number-sequence 0 31)) nil)))
+  (should (= 640
+             (anvil-server--projected-json-string-bytes
+              (apply #'unibyte-string (number-sequence #x80 #xff)) nil)))
+  (dolist (label (list "a" "A0._/-" "tool/name.with-127-safe-chars"
+                       (make-string 128 ?a)))
+    (should (equal label (anvil-server--safe-tool-label label))))
+  (dolist (label (list nil "" " unsafe" "tool!" "é"
+                       (make-string 129 ?a)))
+    (should (equal "<oversized-tool-id>"
+                   (anvil-server--safe-tool-label label))))
+  (let ((anvil-server-max-inline-result-bytes 32))
+    (should (equal (make-string 32 ?a)
+                   (anvil-server--enforce-inline-result-limit
+                    "tool" (make-string 32 ?a))))
+    (should-error
+     (anvil-server--enforce-inline-result-limit
+      "tool" (make-string 33 ?a))
+     :type 'anvil-server-inline-result-too-large)
+    ;; Seven raw unibyte octets project to 35 bytes through Emacs octal
+    ;; escaping, so raw length alone is not a safe acceptance test.
+    (should-error
+     (anvil-server--enforce-inline-result-limit
+      "tool" (apply #'unibyte-string (make-list 7 #x80)))
+     :type 'anvil-server-inline-result-too-large)
+    (should (equal (make-string 8 #x1f600)
+                   (anvil-server--enforce-inline-result-limit
+                    "tool" (make-string 8 #x1f600))))
+    (should-error
+     (anvil-server--enforce-inline-result-limit
+      "tool" (make-string 9 #x1f600))
+     :type 'anvil-server-inline-result-too-large))
+  (dolist (disabled '(nil 0 -1))
+    (let ((anvil-server-max-inline-result-bytes disabled))
+      (should (equal "legacy"
+                     (anvil-server--enforce-inline-result-limit
+                      "tool" "legacy")))))
+  ;; Disabled caps preserve legacy success/error text and envelopes, while
+  ;; the hook still receives a fresh condition cell and fixed-grammar label.
+  (let* ((server-id "anvil-test-inline-disabled")
+         (anvil-test--inline-payload "legacy-payload"))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id "inline.legacy-success" :description "legacy fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-direct-error-tool
+           :id "inline.legacy-error" :description "legacy fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-macro-error-tool
+           :id "inline.legacy-macro" :description "legacy fixture"
+           :server-id server-id)
+          (dolist (disabled '(nil 0 -1))
+            (let ((anvil-server-max-inline-result-bytes disabled))
+              (should
+               (equal
+                "legacy-payload"
+                (anvil-test--response-text
+                 (anvil-server--handle-tools-call
+                  102
+                  '((name . "inline.legacy-success") (arguments . ()))
+                  (make-anvil-server-metrics) server-id))))
+              (should
+               (equal
+                "legacy-payload"
+                (anvil-test--response-text
+                 (anvil-server--handle-tools-call
+                  103
+                  '((name . "inline.legacy-error") (arguments . ()))
+                  (make-anvil-server-metrics) server-id))))))
+          (let ((anvil-server-max-inline-result-bytes nil)
+                hook-condition hook-label)
+            (let ((anvil-server-tool-error-hook
+                   (list (lambda (condition label _source)
+                           (setq hook-condition condition
+                                 hook-label label)))))
+              (let ((response
+                     (anvil-server--handle-tools-call
+                      104
+                      '((name . "inline.legacy-macro") (arguments . ()))
+                      (make-anvil-server-metrics) server-id)))
+                (should (string-match-p "legacy-payload" response)))
+              (should (consp hook-condition))
+              (should (eq 'error (car hook-condition)))
+              (should (string-match-p "legacy-payload"
+                                      (cadr hook-condition)))
+              (should (equal "inline.legacy-macro" hook-label)))))
+      (dolist (id '("inline.legacy-success" "inline.legacy-error"
+                    "inline.legacy-macro"))
+        (ignore-errors (anvil-server-unregister-tool id server-id)))))
+  ;; The sanitizer is a fail-closed, non-signaling boundary even if one of
+  ;; its helpers is unexpectedly broken.
+  (cl-letf (((symbol-function 'anvil-server--safe-tool-label)
+             (lambda (&rest _) (error "helper fault"))))
+    (should
+     (equal '(:condition (error "") :text ""
+               :tool "<oversized-tool-id>")
+            (anvil-server--sanitize-tool-error
+             "request-owned" 'generic '(error "request-owned")))))
+  (cl-letf (((symbol-function
+              'anvil-server--projected-json-string-bytes)
+             (lambda (&rest _) (error "counter fault"))))
+    (should
+     (equal '(:condition (error "") :text ""
+               :tool "<oversized-tool-id>")
+            (anvil-server--sanitize-tool-error
+             "request-owned" 'generic '(error "request-owned"))))))
+
+(ert-deftest anvil-test-inline-result-limit-malformed-config-fails-closed ()
+  "Malformed inline limits fail closed across every tool error boundary."
+  (let* ((server-id "anvil-test-inline-malformed-limit")
+         (anvil-test--inline-payload
+          (concat "MALFORMED-LIMIT-REQUEST-SENTINEL-"
+                  (make-string 4096 ?x)))
+         (anvil-server--running t)
+         (fallback '(:condition (error "") :text ""
+                     :tool "<oversized-tool-id>"))
+         (tool-ids
+          '("inline.malformed-success"
+            "inline.malformed-macro"
+            "inline.malformed-tool-error"
+            "inline.malformed-generic"
+            "inline.malformed-wrong-type"
+            "inline.malformed-quit"
+            "inline.malformed-spoof"
+            "inline.malformed-lazy-generic"
+            "inline.malformed-lazy-tool-error")))
+    (unwind-protect
+        (progn
+          (dolist (registration
+                   `((anvil-test--inline-payload-tool
+                      "inline.malformed-success")
+                     (anvil-test--inline-macro-error-tool
+                      "inline.malformed-macro")
+                     (anvil-test--inline-direct-error-tool
+                      "inline.malformed-tool-error")
+                     (anvil-test--inline-generic-error-tool
+                      "inline.malformed-generic")
+                     (anvil-test--inline-wrong-type-tool
+                      "inline.malformed-wrong-type")
+                     (anvil-test--inline-quit-tool
+                      "inline.malformed-quit")
+                     (anvil-test--inline-spoof-overflow-tool
+                      "inline.malformed-spoof")))
+            (anvil-server-register-tool
+             (car registration)
+             :id (cadr registration) :description "malformed limit fixture"
+             :server-id server-id))
+          (let ((table (anvil-server--get-server-tools server-id)))
+            (puthash
+             "inline.malformed-lazy-generic"
+             (list :id "inline.malformed-lazy-generic" :json-fragment "{}"
+                   :lazy-placeholder t
+                   :lazy-loader
+                   (lambda (&rest _)
+                     (error "%s" anvil-test--inline-payload)))
+             table)
+            (puthash
+             "inline.malformed-lazy-tool-error"
+             (list :id "inline.malformed-lazy-tool-error"
+                   :json-fragment "{}" :lazy-placeholder t
+                   :lazy-loader
+                   (lambda (&rest _)
+                     (anvil-server-tool-throw anvil-test--inline-payload)))
+             table))
+          (dolist (malformed '(t 1.5 "not-an-integer"))
+            (let ((anvil-server-max-inline-result-bytes malformed))
+              (should-error
+               (anvil-server--enforce-inline-result-limit
+                "inline.malformed-success" anvil-test--inline-payload)
+               :type 'anvil-server-invalid-inline-result-limit)
+              (dolist (class '(inline-result macro invalid-params tool-error
+                                             quit generic not-found))
+                (should
+                 (equal
+                  fallback
+                  (anvil-server--sanitize-tool-error
+                   anvil-test--inline-payload class
+                   (list 'request-owned-condition
+                         anvil-test--inline-payload)))))
+              (dolist
+                  (case
+                   `(("success"
+                      ((name . "inline.malformed-success") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("macro"
+                      ((name . "inline.malformed-macro") (arguments . ()))
+                      nil)
+                     ("tool-error"
+                      ((name . "inline.malformed-tool-error")
+                       (arguments . ()))
+                      nil)
+                     ("generic"
+                      ((name . "inline.malformed-generic") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("wrong-type"
+                      ((name . "inline.malformed-wrong-type")
+                       (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("quit"
+                      ((name . "inline.malformed-quit") (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("spoofed-overflow"
+                      ((name . "inline.malformed-spoof") (arguments . ()))
+                      nil)
+                     ("inner-invalid-params"
+                      ((name . "inline.malformed-success")
+                       (arguments
+                        . ((unexpected . ,anvil-test--inline-payload))))
+                      ,anvil-server-jsonrpc-error-invalid-params)
+                     ("outer-invalid-params"
+                      [,anvil-test--inline-payload]
+                      ,anvil-server-jsonrpc-error-invalid-params)
+                     ("lazy-generic"
+                      ((name . "inline.malformed-lazy-generic")
+                       (arguments . ()))
+                      ,anvil-server-jsonrpc-error-internal)
+                     ("lazy-tool-error"
+                      ((name . "inline.malformed-lazy-tool-error")
+                       (arguments . ()))
+                      nil)
+                     ("not-found"
+                      ((name . ,anvil-test--inline-payload) (arguments . ()))
+                      ,anvil-server-jsonrpc-error-invalid-request)))
+                (ert-info ((format "limit type %S, path %s"
+                                   (type-of malformed) (car case)))
+                  (let* ((hook-values nil)
+                         (anvil-server-tool-error-hook
+                          (list
+                           (lambda (&rest values)
+                             (push values hook-values))))
+                         (response
+                          (anvil-server--handle-tools-call
+                           105 (cadr case) (make-anvil-server-metrics)
+                           server-id))
+                         (decoded (json-read-from-string response))
+                         (expected-code (caddr case)))
+                    (should (< (string-bytes response) 1024))
+                    (should-not
+                     (string-match-p "MALFORMED-LIMIT-REQUEST-SENTINEL"
+                                     response))
+                    (if expected-code
+                        (let ((error-object (alist-get 'error decoded)))
+                          (should (= expected-code
+                                     (alist-get 'code error-object)))
+                          (should (equal ""
+                                         (alist-get 'message error-object))))
+                      (let ((result (alist-get 'result decoded)))
+                        (should (eq t (alist-get 'isError result)))
+                        (should (equal ""
+                                       (anvil-test--response-text response)))))
+                    (dolist (values hook-values)
+                      (should-not
+                       (string-match-p
+                        "MALFORMED-LIMIT-REQUEST-SENTINEL"
+                        (format "%S" values))))))))))
+      (dolist (tool-id tool-ids)
+        (ignore-errors (anvil-server-unregister-tool tool-id server-id))))))
+
+(ert-deftest anvil-test-inline-result-projects-wide-and-raw-characters ()
+  "The projector matches Emacs's five-byte extended character encoding."
+  (let* ((below-threshold (string #x1fffff))
+         (at-threshold (string #x200000))
+         (multibyte-raw
+          (string-make-multibyte (unibyte-string #x80 #xff)))
+         (cases (list below-threshold at-threshold multibyte-raw))
+         (expected
+          (mapcar
+           (lambda (text)
+             (- (string-bytes (json-encode-string text)) 2))
+           cases)))
+    (cl-letf (((symbol-function 'json-encode-string)
+               (lambda (&rest _) (ert-fail "projector used JSON encoder")))
+              ((symbol-function 'json-encode)
+               (lambda (&rest _) (ert-fail "projector used JSON encoder"))))
+      (cl-mapc
+       (lambda (text projected)
+         (should
+          (= projected
+             (anvil-server--projected-json-string-bytes text nil))))
+       cases expected)))
+  (should (= 4 (anvil-server--projected-json-string-bytes
+                (string #x1fffff))))
+  (should (= 5 (anvil-server--projected-json-string-bytes
+                (string #x200000))))
+  (should (= 10 (anvil-server--projected-json-string-bytes
+                 (string-make-multibyte (unibyte-string #x80 #xff))))))
+
+(ert-deftest anvil-test-inline-result-spoofed-condition-is-bounded ()
+  "Handler, lazy-loader, and disclosure overflow spoofs cannot bypass the cap."
+  (let* ((server-id "anvil-test-inline-spoof")
+         (anvil-server-max-inline-result-bytes 512)
+         (anvil-server--running t)
+         (anvil-test--inline-payload
+          (concat "SPOOFED-OVERFLOW-SENTINEL-" (make-string 4096 ?x))))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-spoof-overflow-tool
+           :id "inline.spoof-handler" :description "spoof fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-token-aware-spoof-overflow-tool
+           :id "inline.spoof-token-aware" :description "spoof fixture"
+           :server-id server-id)
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id "inline.spoof-disclosure" :description "spoof fixture"
+           :server-id server-id)
+          (puthash
+           "inline.spoof-loader"
+           (list :id "inline.spoof-loader" :json-fragment "{}"
+                 :lazy-placeholder t
+                 :lazy-loader
+                 (lambda (&rest _)
+                   (signal 'anvil-server-inline-result-too-large
+                           (list anvil-test--inline-payload))))
+           (anvil-server--get-server-tools server-id))
+          (dolist (tool-id '("inline.spoof-handler" "inline.spoof-token-aware"
+                            "inline.spoof-loader"))
+            (let* ((response
+                    (anvil-server--handle-tools-call
+                     105 `((name . ,tool-id) (arguments . ()))
+                     (make-anvil-server-metrics) server-id))
+                   (text (anvil-test--response-text response)))
+              (should (stringp text))
+              (should-not
+               (string-match-p "SPOOFED-OVERFLOW-SENTINEL" response))
+              (if (equal tool-id "inline.spoof-token-aware")
+                  (should (equal "Tool error contained non-string data" text))
+                (should
+                 (string-match-p
+                  "inline-result error text exceeds" text)))
+              (should-not (string-match-p " result exceeds" text))
+              (should
+               (<= (anvil-server--projected-json-string-bytes text)
+                   anvil-server-max-inline-result-bytes))))
+          (setq anvil-test--inline-payload "safe")
+          (cl-letf (((symbol-function 'anvil-disclosure-budget-apply)
+                     (lambda (&rest _)
+                       (signal 'anvil-server-inline-result-too-large
+                               (list
+                                (concat
+                                 "SPOOFED-OVERFLOW-SENTINEL-"
+                                 (make-string 4096 ?d)))))))
+            (let* ((response
+                    (anvil-server--handle-tools-call
+                     106
+                     '((name . "inline.spoof-disclosure") (arguments . ()))
+                     (make-anvil-server-metrics) server-id))
+                   (text (anvil-test--response-text response)))
+              (should (stringp text))
+              (should-not
+               (string-match-p "SPOOFED-OVERFLOW-SENTINEL" response))
+              (should
+               (string-match-p "inline-result error text exceeds" text))
+              (should-not (string-match-p " result exceeds" text))
+              (should
+               (<= (anvil-server--projected-json-string-bytes text)
+                   anvil-server-max-inline-result-bytes)))))
+      (dolist (id '("inline.spoof-handler" "inline.spoof-loader"
+                    "inline.spoof-token-aware" "inline.spoof-disclosure"))
+        (ignore-errors (anvil-server-unregister-tool id server-id))))))
+
+(ert-deftest anvil-test-inline-result-malformed-internal-count-is-bounded ()
+  "An impossible internal overflow count must use the ordinary error path."
+  (let* ((server-id "anvil-test-inline-malformed-internal")
+         (tool-id "inline.malformed-internal")
+         (anvil-server-max-inline-result-bytes 512)
+         (anvil-server--running t)
+         (anvil-test--inline-payload "safe")
+         (impossible-count (expt 10 1000))
+         (malformed-counts
+          (list
+           (list impossible-count 513)
+           (list 80 (1+ most-positive-fixnum))
+           (list 0 513)
+           (list 80 512)
+           (list 80 519)
+           (list 80 513 'extra)
+           (list "80" 513))))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id tool-id :description "malformed internal fixture"
+           :server-id server-id)
+          (dolist (counts malformed-counts)
+            (cl-letf (((symbol-function
+                        'anvil-server--enforce-inline-result-limit)
+                       (lambda (&rest _)
+                         (signal 'anvil-server-inline-result-too-large
+                                 counts))))
+              (let* ((response
+                      (anvil-server--handle-tools-call
+                       107 `((name . ,tool-id) (arguments . ()))
+                       (make-anvil-server-metrics) server-id))
+                     (decoded (json-read-from-string response))
+                     (error-object (alist-get 'error decoded))
+                     (message (alist-get 'message error-object)))
+                (should (= -32603 (alist-get 'code error-object)))
+                (should
+                 (equal "Internal error executing tool with non-string data"
+                        message))
+                (should-not
+                 (string-match-p
+                  (number-to-string impossible-count) response))
+                (should
+                 (<= (anvil-server--projected-json-string-bytes message)
+                     anvil-server-max-inline-result-bytes))))))
+      (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
+
+(ert-deftest anvil-test-inline-result-error-hook-strips-properties ()
+  "The real dispatcher hook receives plain sanitized error text."
+  (let* ((server-id "anvil-test-inline-properties")
+         (tool-id "inline.property-error")
+         (hidden-object (list :request-owned-object))
+         (request-tool-id
+          (propertize (copy-sequence tool-id)
+                      'request-owned hidden-object))
+         (anvil-test--inline-payload
+          (propertize "visible error" 'request-owned hidden-object))
+         (anvil-server-max-inline-result-bytes 512)
+         (anvil-server--running t)
+         hook-label
+         recorded)
+    (unwind-protect
+        (progn
+          (require 'anvil-harness-telemetry)
+          (anvil-server-register-tool
+           #'anvil-test--inline-property-error-tool
+           :id tool-id :description "property fixture" :server-id server-id)
+          (cl-letf (((symbol-function 'anvil-harness-telemetry-record)
+                     (lambda (class &rest keys)
+                       (setq recorded (cons class keys))
+                       '(:id 1))))
+            (let ((anvil-server-tool-error-hook
+                   (list
+                    (lambda (err label source)
+                      (setq hook-label label)
+                      (anvil-harness-telemetry--dispatcher-hook
+                       err label source)))))
+              (let ((response
+                     (anvil-server--handle-tools-call
+                      107 `((name . ,request-tool-id) (arguments . ()))
+                      (make-anvil-server-metrics) server-id)))
+                (should (= anvil-server-jsonrpc-error-internal
+                           (anvil-test--response-error-code response))))))
+          (should (consp recorded))
+          (should (equal tool-id hook-label))
+          (should-not (eq request-tool-id hook-label))
+          (should-not (text-properties-at 0 hook-label))
+          (should
+           (stringp (plist-get (cdr recorded) :error-message)))
+          (should-not
+           (text-property-not-all
+            0 (length (plist-get (cdr recorded) :error-message))
+            'request-owned nil
+            (plist-get (cdr recorded) :error-message)))
+          (should-not
+           (string-match-p
+            "request-owned-object"
+            (plist-get (cdr recorded) :raw-context))))
+      (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
+
+(ert-deftest anvil-test-inline-result-projects-error-before-concat ()
+  "Oversized generic error data is projected before any combined copy."
+  (let* ((anvil-server-max-inline-result-bytes 32)
+         (payload (make-string 4096 ?x))
+         (original-join
+          (symbol-function 'anvil-server--join-error-segments))
+         (copied-request-data nil)
+         sanitized)
+    (cl-letf (((symbol-function 'anvil-server--join-error-segments)
+               (lambda (segments)
+                 (when (memq payload segments)
+                   (setq copied-request-data t))
+                 (funcall original-join segments))))
+      (setq sanitized
+            (anvil-server--sanitize-tool-error
+             "inline.generic" 'generic (list 'error payload))))
+    (should-not copied-request-data)
+    (should
+     (string-match-p "inline response limit"
+                     (plist-get sanitized :text)))))
+
+(ert-deftest anvil-test-inline-result-fallback-values-are-fresh ()
+  "Each sanitizer fault returns independent mutable fallback values."
+  (dolist (failure '(error quit))
+    (cl-letf (((symbol-function 'anvil-server--safe-tool-label)
+               (lambda (&rest _)
+                 (if (eq failure 'quit)
+                     (signal 'quit nil)
+                   (error "helper fault")))))
+      (let* ((first
+              (anvil-server--sanitize-tool-error
+               "request-owned" 'generic '(error "request-owned")))
+             (first-condition (plist-get first :condition))
+             (first-label (plist-get first :tool)))
+        (unwind-protect
+            (progn
+              (setcar first :mutated)
+              (setcar first-condition 'file-error)
+              (aset first-label 0 ?X)
+              (let* ((second
+                      (anvil-server--sanitize-tool-error
+                       "request-owned" 'generic '(error "request-owned")))
+                     (second-condition (plist-get second :condition))
+                     (second-label (plist-get second :tool)))
+                (should (eq :condition (car second)))
+                (should (eq 'error (car second-condition)))
+                (should (equal "<oversized-tool-id>" second-label))
+                (should-not (eq first second))
+                (should-not (eq first-condition second-condition))
+                (should-not (eq first-label second-label))))
+          (setcar first :condition)
+          (setcar first-condition 'error)
+          (aset first-label 0 ?<))))))
+
+(ert-deftest anvil-test-inline-result-rejected-labels-are-fresh ()
+  "Rejected request labels cannot mutate a later sanitizer result."
+  (let* ((first
+          (anvil-server--sanitize-tool-error
+           "!invalid" 'generic '(error "request-owned")))
+         (first-label (plist-get first :tool)))
+    (unwind-protect
+        (progn
+          (aset first-label 0 ?X)
+          (let* ((second
+                  (anvil-server--sanitize-tool-error
+                   "!invalid" 'generic '(error "request-owned")))
+                 (second-label (plist-get second :tool)))
+            (should (equal "<oversized-tool-id>" second-label))
+            (should-not (eq first-label second-label))))
+      (aset first-label 0 ?<))))
+
+(ert-deftest anvil-test-tools-call-allows-nil-json-object-key ()
+  "A JSON object key decoded as symbol nil remains a valid alist entry."
+  (let* ((server-id "anvil-test-nil-json-key")
+         (tool-id "inline.nil-json-key")
+         (anvil-test--inline-payload "nil-key accepted")
+         (anvil-server--running t)
+         (request
+          (concat
+           "{\"jsonrpc\":\"2.0\",\"id\":108,\"method\":\"tools/call\","
+           "\"params\":{\"name\":\"inline.nil-json-key\","
+           "\"arguments\":{},\"nil\":\"ignored\"}}")))
+    (unwind-protect
+        (progn
+          (anvil-server-register-tool
+           #'anvil-test--inline-payload-tool
+           :id tool-id :description "nil-key fixture" :server-id server-id)
+          (let* ((decoded (json-read-from-string request))
+                 (params (alist-get 'params decoded)))
+            (should (consp (assq nil params))))
+          (let ((response (anvil-server-process-jsonrpc request server-id)))
+            (should-not (anvil-test--response-error-code response))
+            (should
+             (equal anvil-test--inline-payload
+                    (anvil-test--response-text response)))))
+      (ignore-errors (anvil-server-unregister-tool tool-id server-id)))))
+
 ;;; anvil-test.el ends here

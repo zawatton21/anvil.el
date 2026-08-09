@@ -42,6 +42,25 @@ or socket round-trip) on the startup path.
 - **THEN** the check returns a falsy result within milliseconds
 - **AND** the daemon remains responsive
 
+### Requirement: Worker status reporting MUST be truthful and non-mutating
+
+The system SHALL distinguish a never-demanded worker with no endpoint from a
+demanded worker whose endpoint is absent.  A reachable endpoint SHALL be
+reported according to its recorded busy and full-probe-failure evidence.
+
+#### Scenario: Status and MCP probe report worker lifecycle state
+
+- **GIVEN** a never-demanded worker whose endpoint is absent
+- **THEN** status and probe report that worker as `cold`
+- **GIVEN** a demanded worker whose endpoint is absent
+- **THEN** status and probe report that worker as `dead`
+- **GIVEN** a worker whose endpoint is reachable
+- **THEN** status and probe report that worker as `alive`, `busy`, or
+  `unresponsive`, with `busy` taking precedence over stale probe failures
+- **AND** each reporting path observes the endpoint exactly once per worker
+- **AND** reporting performs no spawn, full liveness probe, deletion, log
+  write, or worker mutation
+
 ### Requirement: Filesystem watcher registration MUST NOT run synchronously at startup on Windows
 
 The system SHALL avoid calling `file-notify-add-watch` from the

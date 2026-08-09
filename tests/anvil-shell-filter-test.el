@@ -546,6 +546,22 @@
     (should (< (length out) 100))
     (should (string-match-p "…(\\([0-9]+\\) bytes elided)" out))))
 
+(ert-deftest anvil-shell-filter-test/tee-grep-multibyte-cap-is-exact ()
+  "A multibyte line retains only whole characters within the full byte cap."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (let* ((line (concat (make-string 20 ?雪) "🙂tail"))
+         (total (string-bytes line))
+         (out (anvil-shell-filter--truncate-line line 40))
+         (marker-start (string-match "…" out))
+         (prefix (substring out 0 marker-start))
+         (omitted
+          (and (string-match "…(\\([0-9]+\\) bytes elided)\\'" out)
+               (string-to-number (match-string 1 out)))))
+    (should (<= (string-bytes out) 40))
+    (should (string-prefix-p prefix line))
+    (should omitted)
+    (should (= total (+ (string-bytes prefix) omitted)))))
+
 (ert-deftest anvil-shell-filter-test/tee-grep-tail-fallback-on-zero-match ()
   "tee-grep falls back to last N lines when regex yields zero matches."
   (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
@@ -566,12 +582,14 @@
     (should (string-empty-p (cdr cell)))))
 
 (ert-deftest anvil-shell-filter-test/tee-grep-truncate-line-helper ()
-  "`--truncate-line' wraps oversized strings with elision sentinel."
+  "`--truncate-line' bounds the complete rendered line in bytes."
   (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
   (should (equal (anvil-shell-filter--truncate-line "abc" 10) "abc"))
+  (should (equal (anvil-shell-filter--truncate-line "abc" 0) "abc"))
+  (should (equal (anvil-shell-filter--truncate-line "abcdef" 2) ".."))
   (let ((out (anvil-shell-filter--truncate-line (make-string 200 ?y) 60)))
-    (should (< (length out) 80))
-    (should (string-match-p "…(140 bytes elided)\\'" out))))
+    (should (= 60 (string-bytes out)))
+    (should (string-match-p "…(161 bytes elided)\\'" out))))
 
 (ert-deftest anvil-shell-filter-test/tee-grep-end-to-end ()
   "End-to-end: shell echo + grep + tee + match-count + raw retrieval."
@@ -827,16 +845,202 @@ Pipeline order under test:
 ;;;; --- §7.3 tee-put cap (regression for state.db bloat) ----------------
 
 (ert-deftest anvil-shell-filter-test/tee-put-respects-max-bytes ()
-  "Tee-put truncates raw when it exceeds `anvil-shell-tee-max-bytes'."
+  "Tee-put stores payload plus its omission marker within the byte cap."
   (skip-unless (anvil-shell-filter-test--supported-p 'tee))
   (anvil-shell-filter-test--with-state
     (let* ((anvil-shell-tee-max-bytes 32)
            (raw (concat (make-string 200 ?x) "TAIL"))
            (id (anvil-shell-filter--tee-put raw))
            (got (anvil-shell-filter-tee-get id)))
-      (should (stringp got))
-      (should (string-match-p "anvil-shell-tee: truncated" got))
+      (should (equal (concat (make-string 25 ?x) "[+179B]") got))
+      (should (<= (string-bytes got) anvil-shell-tee-max-bytes))
       (should (< (length got) (length raw))))))
+
+(ert-deftest anvil-shell-filter-test/run-bounds-capture-before-filter ()
+  "Shell-run filters and tees undecorated bounded command bytes."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let ((anvil-shell-tee-max-bytes 32)
+          observed-options
+          filtered)
+      (cl-letf (((symbol-function 'anvil-shell)
+                 (lambda (_command options)
+                   (setq observed-options options)
+                   (list
+                    :exit 0
+                    :stdout
+                    (concat
+                     (make-string 32 ?x)
+                     "\n...[anvil-host: truncated, 168 more bytes]")
+                    :stdout-captured (make-string 32 ?x)
+                    :stdout-captured-source-bytes
+                    (encode-coding-string (make-string 32 ?x) 'utf-8)
+                    :stderr "[anvil-host: truncated]"
+                    :stderr-captured ""
+                    :stderr-captured-source-bytes ""
+                    :stdout-total-bytes 200
+                    :stderr-total-bytes 0
+                    :coding 'utf-8
+                    :truncated t)))
+                ((symbol-function 'anvil-shell-filter-apply)
+                 (lambda (_filter raw)
+                   (setq filtered raw)
+                   raw)))
+        (let* ((result
+                (anvil-shell-filter-run
+                 "unknown-command" :filter 'git-status))
+               (tee
+                (anvil-shell-filter-tee-get
+                 (plist-get result :tee-id)))
+               (expected-tee
+                (concat (make-string 25 ?x) "[+175B]")))
+          (should (= 32 (plist-get observed-options :max-output)))
+          (should (eq t (plist-get observed-options :include-source-bytes)))
+          (should (= 200 (plist-get result :raw-size)))
+          (should (= 32 (plist-get result :compressed-size)))
+          (should (eq t (plist-get result :truncated)))
+          (should (equal (make-string 32 ?x) filtered))
+          (should (equal filtered (plist-get result :compressed)))
+          (should (equal "[anvil-host: truncated]"
+                         (plist-get result :stderr)))
+          (should (equal expected-tee tee))
+          (should (<= (string-bytes tee) anvil-shell-tee-max-bytes))
+          (should-not (string-match-p "anvil-host: truncated" tee)))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-multibyte-cap-is-character-safe ()
+  "Tee capping never splits UTF-8 characters and reports exact omitted bytes."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 6)
+           (id (anvil-shell-filter--tee-put "雪🙂abc"))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (equal "[+10B]" got))
+      (should (= 6 (string-bytes got))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-cp932-source-byte-accounting ()
+  "CP932 tee capping reports omitted source bytes without text properties."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (skip-unless (coding-system-p 'cp932))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 47)
+           (all-source
+            (encode-coding-string (make-string 30 ?日) 'cp932))
+           (source (substring all-source 0 46))
+           (raw (decode-coding-string source 'cp932))
+           (id (anvil-shell-filter--tee-put raw 60 source 'cp932))
+           (got (anvil-shell-filter-tee-get id)))
+      (should
+       (equal
+        "日日\n…[anvil-shell-tee: truncated 56 bytes]"
+        got))
+      (should (= 47 (string-bytes got)))
+      (should
+       (cl-loop for i below (length got)
+                never (text-properties-at i got))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-complete-invalid-utf8-is-not-stored-raw ()
+  "A complete capture ending inside UTF-8 is represented only by a marker."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 10)
+           (source
+            (substring (encode-coding-string "🙂" 'utf-8) 0 3))
+           (raw (decode-coding-string source 'utf-8))
+           (id (anvil-shell-filter--tee-put raw 3 source 'utf-8))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (equal "[+3B]" got))
+      (should-not
+       (seq-some #'anvil-shell-filter--raw-byte-character-p got)))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-roomy-partial-utf8-is-not-stored-raw ()
+  "A roomy cap does not allow an incomplete UTF-8 suffix into tee storage."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 50)
+           (source
+            (substring (encode-coding-string "🙂" 'utf-8) 0 3))
+           (raw (decode-coding-string source 'utf-8))
+           (id (anvil-shell-filter--tee-put raw 4 source 'utf-8))
+           (got (anvil-shell-filter-tee-get id)))
+      (should
+       (equal
+        "\n…[anvil-shell-tee: truncated 4 bytes]"
+        got))
+      (should-not
+       (seq-some #'anvil-shell-filter--raw-byte-character-p got)))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-split-utf8-is-not-stored-raw ()
+  "A captured partial UTF-8 character is omitted rather than stored raw."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 44)
+           (full (concat "abc" (make-string 38 ?x) "🙂tail"))
+           (all-source (encode-coding-string full 'utf-8))
+           (source (substring all-source 0 44))
+           (raw (decode-coding-string source 'utf-8))
+           (id (anvil-shell-filter--tee-put raw 49 source 'utf-8))
+           (got (anvil-shell-filter-tee-get id)))
+      (should
+       (equal
+        "abc\n…[anvil-shell-tee: truncated 46 bytes]"
+        got))
+      (should (= 44 (string-bytes got)))
+      (should-not
+       (seq-some #'anvil-shell-filter--raw-byte-character-p got)))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-strips-text-properties ()
+  "Tee storage never persists decoded source text properties."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 32)
+           (raw (propertize "plain" 'charset 'japanese-jisx0208))
+           (source (encode-coding-string raw 'utf-8))
+           (id (anvil-shell-filter--tee-put raw 5 source 'utf-8))
+           (got (anvil-shell-filter-tee-get id)))
+      (should (equal "plain" got))
+      (should
+       (cl-loop for i below (length got)
+                never (text-properties-at i got))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-stateful-complete-output-fast-path ()
+  "Complete stateful output is retained without prefix re-encoding."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (skip-unless (coding-system-p 'iso-2022-jp))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes nil)
+           (raw "日本語")
+           (source (encode-coding-string raw 'iso-2022-jp))
+           (id
+            (cl-letf
+                (((symbol-function 'anvil-shell-filter--tee-candidate)
+                  (lambda (&rest _args)
+                    (ert-fail "complete output entered prefix search"))))
+              (anvil-shell-filter--tee-put
+               raw (string-bytes source) source 'iso-2022-jp))))
+      (should (equal raw (anvil-shell-filter-tee-get id))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-four-mib-complete-fast-path ()
+  "A common four-MiB complete capture bypasses prefix search."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (let* ((size (* 4 1024 1024))
+         (raw (make-string size ?x))
+         (source (string-as-unibyte raw)))
+    (cl-letf
+        (((symbol-function 'anvil-shell-filter--tee-candidate)
+          (lambda (&rest _args)
+            (ert-fail "complete output entered prefix search"))))
+      (should
+       (equal raw
+              (anvil-shell-filter--bounded-tee-value
+               raw source 'utf-8 size size))))))
+
+(ert-deftest anvil-shell-filter-test/tee-put-tiny-cap-uses-ellipsis ()
+  "A cap that holds no exact marker receives an ASCII ellipsis."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let* ((anvil-shell-tee-max-bytes 3)
+           (id (anvil-shell-filter--tee-put (make-string 100 ?x))))
+      (should (equal "..." (anvil-shell-filter-tee-get id))))))
 
 (ert-deftest anvil-shell-filter-test/tee-put-cap-nil-keeps-full ()
   "Setting `anvil-shell-tee-max-bytes' to nil disables capping."
@@ -931,6 +1135,159 @@ Pipeline order under test:
       (let ((result (anvil-shell-filter-run "unknown-tool")))
         (should-not (plist-get result :filter))
         (should (equal "one\ntwo\nthree" (plist-get result :compressed)))))))
+
+(ert-deftest anvil-shell-filter-test/explicit-nil-filter-bypasses-auto ()
+  "An explicit nil filter bypasses lookup and the TACO fallback."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (cl-letf
+        (((symbol-function 'anvil-shell-filter-lookup)
+          (lambda (&rest _args)
+            (ert-fail "explicit nil invoked filter lookup")))
+         ((symbol-function 'anvil-shell-filter--taco-critical-maybe)
+          (lambda (&rest _args)
+            (ert-fail "explicit nil invoked TACO")))
+         ((symbol-function 'anvil-shell)
+          (lambda (_cmd _opts)
+            '(:exit 2
+              :stdout "captured output"
+              :stderr "decorated stderr"
+              :stderr-captured "captured stderr"))))
+      (let ((result
+             (anvil-shell-filter-run "unknown-tool" :filter nil)))
+        (should-not (plist-get result :filter))
+        (should (equal "captured output" (plist-get result :compressed)))
+        (should (equal "decorated stderr" (plist-get result :stderr)))))))
+
+(ert-deftest anvil-shell-filter-test/taco-uses-captured-stderr ()
+  "TACO sees captured stderr while the public result keeps decoration."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee))
+  (anvil-shell-filter-test--with-state
+    (let (seen)
+      (cl-letf
+          (((symbol-function 'anvil-shell-filter-lookup)
+            (lambda (_cmd) nil))
+           ((symbol-function 'anvil-shell-filter--taco-critical-maybe)
+            (lambda (raw stderr exit)
+              (setq seen (list raw stderr exit))
+              "taco result"))
+           ((symbol-function 'anvil-shell)
+            (lambda (_cmd opts)
+              (should (eq t (plist-get opts :include-source-bytes)))
+              '(:exit 2
+                :stdout "decorated stdout"
+                :stdout-captured "captured stdout"
+                :stdout-captured-source-bytes "captured stdout"
+                :stdout-total-bytes 15
+                :stderr "captured stderr\n...[anvil-host: truncated]"
+                :stderr-captured "captured stderr"
+                :stderr-total-bytes 99
+                :coding utf-8
+                :truncated t))))
+        (let ((result (anvil-shell-filter-run "unknown-tool")))
+          (should (equal '("captured stdout" "captured stderr" 2) seen))
+          (should (equal "taco result" (plist-get result :compressed)))
+          (should
+           (equal
+            "captured stderr\n...[anvil-host: truncated]"
+            (plist-get result :stderr))))))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-returns-decorated-stderr ()
+  "Tee-grep filters captured stdout but returns public decorated stderr."
+  (skip-unless (anvil-shell-filter-test--supported-p 'tee-grep))
+  (anvil-shell-filter-test--with-state
+    (cl-letf
+        (((symbol-function 'anvil-shell)
+          (lambda (_cmd opts)
+            (should (eq t (plist-get opts :include-source-bytes)))
+            '(:exit 0
+              :stdout "match\n...[anvil-host: truncated]"
+              :stdout-captured "match"
+              :stdout-captured-source-bytes "match"
+              :stdout-total-bytes 50
+              :stderr "warning\n...[anvil-host: truncated]"
+              :stderr-captured "warning"
+              :stderr-total-bytes 40
+              :coding utf-8
+              :truncated t))))
+      (let ((result
+             (anvil-shell-filter-tee-grep
+              "unknown-tool" :grep "match" :tail-fallback 0)))
+        (should (equal "match" (plist-get result :compressed)))
+        (should
+         (equal
+          "warning\n...[anvil-host: truncated]"
+          (plist-get result :stderr)))))))
+
+(ert-deftest anvil-shell-filter-test/sync-timeout-cap-precedes-spawn ()
+  "Oversize shell-run requests fail before starting a child."
+  (let ((anvil-shell-filter-max-sync-timeout 2)
+        shell-called
+        timeout-seen)
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (_cmd opts)
+                 (setq shell-called t
+                       timeout-seen (plist-get opts :timeout))
+                 '(:exit 0 :stdout "" :stderr "")))
+              ((symbol-function 'anvil-shell-filter--tee-put)
+               (lambda (&rest _args) "test-tee")))
+      (should-error (anvil-shell-filter-run "true" :timeout 3)
+                    :type 'user-error)
+      (should-not shell-called)
+      (let ((result (anvil-shell-filter-run "true" :timeout 2)))
+        (should shell-called)
+        (should (= 2 timeout-seen))
+        (should (zerop (plist-get result :exit)))))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-rejects-negative-cap-before-spawn ()
+  "A negative per-line byte cap fails before shell construction."
+  (let (shell-called)
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (&rest _args)
+                 (setq shell-called t)
+                 '(:exit 0 :stdout "" :stderr ""))))
+      (should-error
+       (anvil-shell-filter-tee-grep
+        "true" :grep "x" :max-line-bytes -1)
+       :type 'user-error)
+      (should-not shell-called))))
+
+(ert-deftest anvil-shell-filter-test/multibyte-size-fields-count-bytes ()
+  "Direct filtering and tee-grep report byte counts for multibyte text."
+  (let* ((raw "雪🙂")
+         (direct (anvil-shell-filter--tool-shell-filter "" raw))
+         tee-result)
+    (should (= 7 (plist-get direct :raw-size)))
+    (should (= 7 (plist-get direct :compressed-size)))
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (&rest _args)
+                 (list :exit 0
+                       :stdout raw
+                       :stdout-captured raw
+                       :stderr ""
+                       :stderr-captured ""
+                       :stdout-total-bytes 7
+                       :stderr-total-bytes 0)))
+              ((symbol-function 'anvil-shell-filter--tee-put)
+               (lambda (&rest _args) "byte-test-tee")))
+      (setq tee-result
+            (anvil-shell-filter-tee-grep
+             "true" :grep "." :max-line-bytes 0 :tail-fallback 0)))
+    (should (= 7 (plist-get tee-result :raw-size)))
+    (should (= 7 (plist-get tee-result :compressed-size)))))
+
+(ert-deftest anvil-shell-filter-test/tee-grep-honors-sync-timeout-cap ()
+  "Oversize tee-grep requests fail before starting a child."
+  (let ((anvil-shell-filter-max-sync-timeout 2)
+        shell-called)
+    (cl-letf (((symbol-function 'anvil-shell)
+               (lambda (&rest _args)
+                 (setq shell-called t)
+                 '(:exit 0 :stdout "" :stderr ""))))
+      (should-error
+       (anvil-shell-filter-tee-grep "true" :grep "x" :timeout 3)
+       :type 'user-error)
+      (should-not shell-called))))
 
 
 (provide 'anvil-shell-filter-test)

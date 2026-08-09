@@ -27,9 +27,11 @@ Disable health timer + spawning so no real subprocesses start."
           (anvil-worker-batch-pool-size (or (plist-get ,sizes :batch) 0))
           (anvil-worker--pool nil)
           (anvil-worker--dispatch-index (list :read 0 :write 0 :batch 0))
+          (anvil-worker--spawn-times (make-hash-table :test #'equal))
+          (anvil-worker--owned-processes (make-hash-table :test #'equal))
           (anvil-worker--alive-set ,alive-set))
      (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
-                (lambda (worker)
+                (lambda (worker &optional _deadline)
                   (and worker
                        (member (plist-get worker :name)
                                anvil-worker--alive-set))))
@@ -69,6 +71,90 @@ Disable health timer + spawning so no real subprocesses start."
                             (plist-get (anvil-worker--worker :write 0)
                                        :server-file)))))
 
+
+(ert-deftest anvil-worker-test-init-pool-workers-start-undemanded ()
+  "Fresh pool entries do not become health-check obligations."
+  (anvil-worker-test--with-pool '(:read 2 :write 1 :batch 1) nil
+    (anvil-worker--map-pool
+     (lambda (worker)
+       (should-not (plist-get worker :demanded))))))
+
+(ert-deftest anvil-worker-test-init-pool-restores-demanded-workers ()
+  "Pool reinitialisation preserves workers already spawned or owned."
+  (anvil-worker-test--with-pool '(:read 3) nil
+    (puthash "anvil-worker-read-1" 1.0 anvil-worker--spawn-times)
+    (puthash "anvil-worker-read-2" 'owned-process
+             anvil-worker--owned-processes)
+    (anvil-worker--init-pool)
+    (should (plist-get (anvil-worker--worker :read 0) :demanded))
+    (should (plist-get (anvil-worker--worker :read 1) :demanded))
+    (should-not (plist-get (anvil-worker--worker :read 2) :demanded))))
+
+(ert-deftest anvil-worker-test-explicit-spawn-demands-every-worker ()
+  "Explicit pool spawn preserves the eager all-lane contract."
+  (anvil-worker-test--with-pool '(:read 2 :write 1 :batch 1) nil
+    (let (scheduled)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_delay _repeat function worker)
+                   (push (list function worker) scheduled))))
+        (anvil-worker-spawn))
+      (should (= 4 (length scheduled)))
+      (anvil-worker--map-pool
+       (lambda (worker)
+         (should (plist-get worker :demanded)))))))
+
+(ert-deftest anvil-worker-test-first-pick-demands-and-spawns-worker ()
+  "Lazy dispatch marks its first worker before spawning it."
+  (anvil-worker-test--with-pool '(:read 1) nil
+    (let (spawned)
+      (cl-letf (((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)
+                   (push (plist-get worker :name) anvil-worker--alive-set))))
+        (let ((worker (anvil-worker--pick-worker :read)))
+          (should worker)
+          (should (plist-get worker :demanded))
+          (should (equal '("anvil-worker-read-1") spawned)))))))
+
+(ert-deftest anvil-worker-test-health-skips-never-demanded-worker ()
+  "Health checks neither probe nor spawn a lazy, unused worker."
+  (anvil-worker-test--with-pool '(:read 1) nil
+    (let ((worker (anvil-worker--worker :read 0))
+          (probes 0)
+          (spawns 0))
+      (cl-letf (((symbol-function 'anvil-worker--worker-alive-p)
+                 (lambda (_worker) (setq probes (1+ probes)) nil))
+                ((symbol-function 'anvil-worker--quick-alive-p)
+                 (lambda (_worker) nil))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (_worker) (setq spawns (1+ spawns)))))
+        (anvil-worker--health-check-one worker)
+        (should (= 0 probes))
+        (should (= 0 spawns))
+        (should-not (plist-get worker :last-state))
+        (plist-put worker :demanded t)
+        (anvil-worker--health-check-one worker)
+        (should (= 1 probes))
+        (should (= 1 spawns))
+        (should (eq 'dead (plist-get worker :last-state)))))))
+
+(ert-deftest anvil-worker-test-enable-honours-eager-spawn-option ()
+  "Enable schedules eager pool creation only when configured."
+  (dolist (eager '(nil t))
+    (let ((anvil-worker-eager-spawn eager)
+          (anvil-worker--pool nil)
+          scheduled)
+      (cl-letf (((symbol-function 'anvil-server-register-tool)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'anvil-worker-health-timer-start)
+                 (lambda () nil))
+                ((symbol-function 'run-at-time)
+                 (lambda (&rest args) (push args scheduled))))
+        (anvil-worker-enable))
+      (should (eq (not (null scheduled)) eager))
+      (when scheduled
+        (should (eq #'anvil-worker-spawn (nth 2 (car scheduled))))))))
+
 ;;;; --- pick-worker -------------------------------------------------------
 
 (ert-deftest anvil-worker-test-pick-read-only-honours-lane ()
@@ -95,6 +181,24 @@ Disable health timer + spawning so no real subprocesses start."
       '("anvil-worker-read-1" "anvil-worker-write-1")
     (let ((w (anvil-worker--pick-worker :auto)))
       (should (eq :write (plist-get w :lane))))))
+
+(ert-deftest anvil-worker-test-pick-auto-starts-cold-requested-lane ()
+  "A cold requested lane starts before dispatch uses a live fallback lane."
+  (anvil-worker-test--with-pool
+      '(:read 1 :write 1)
+      '("anvil-worker-write-1")
+    (let ((anvil-worker--metrics-classify
+           (list :read 0 :write 0 :batch 0 :unknown-fallback 0))
+          spawned)
+      (cl-letf (((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)
+                   (push (plist-get worker :name)
+                         anvil-worker--alive-set))))
+        (let ((worker
+               (anvil-worker--pick-worker :auto "(file-read \"x\")")))
+          (should (eq :read (plist-get worker :lane)))
+          (should (equal '("anvil-worker-read-1") spawned)))))))
 
 (ert-deftest anvil-worker-test-pick-auto-falls-through ()
   "When :read has no alive workers :auto descends to :write."
@@ -133,6 +237,265 @@ Disable health timer + spawning so no real subprocesses start."
     (let ((w (anvil-worker--pick-worker :read)))
       (should w)
       (should (eq :read (plist-get w :lane))))))
+
+
+(ert-deftest anvil-worker-test-pick-scales-before-busy-fallback ()
+  "A busy managed worker causes an unused peer to start on demand."
+  (anvil-worker-test--with-pool
+      '(:read 2)
+      '("anvil-worker-read-1")
+    (let ((first (anvil-worker--worker :read 0))
+          spawned)
+      (plist-put first :demanded t)
+      (plist-put first :busy t)
+      (cl-letf (((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)
+                   (push (plist-get worker :name) anvil-worker--alive-set))))
+        (let ((worker (anvil-worker--pick-worker :read)))
+          (should (equal "anvil-worker-read-2" (plist-get worker :name)))
+          (should (plist-get worker :demanded))
+          (should (equal '("anvil-worker-read-2") spawned)))))))
+
+
+(ert-deftest anvil-worker-test-pick-recovers-demanded-dead-before-busy-fallback ()
+  "A dead managed peer restarts before dispatch reuses a busy worker."
+  (anvil-worker-test--with-pool
+      '(:read 2)
+      '("anvil-worker-read-1")
+    (let ((first (anvil-worker--worker :read 0))
+          (second (anvil-worker--worker :read 1))
+          spawned)
+      (plist-put first :demanded t)
+      (plist-put first :busy t)
+      (plist-put second :demanded t)
+      (cl-letf (((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)
+                   (push (plist-get worker :name) anvil-worker--alive-set))))
+        (let ((worker (anvil-worker--pick-worker :read)))
+          (should (eq worker second))
+          (should (equal '("anvil-worker-read-2") spawned)))))))
+
+(ert-deftest anvil-worker-test-pick-all-dead-has-one-aggregate-spawn-deadline ()
+  "Dead peers in one lane consume one shared spawn budget."
+  (anvil-worker-test--with-pool
+      '(:read 3 :write 2 :batch 2)
+      nil
+    (plist-put (anvil-worker--worker :read 1) :demanded t)
+    (plist-put (anvil-worker--worker :read 2) :demanded t)
+    (let ((anvil-worker-spawn-wait 30.0)
+          (now 100.0)
+          spawned)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned))))
+        (should-not (anvil-worker--pick-worker :read)))
+      (should (equal '("anvil-worker-read-1"
+                       "anvil-worker-read-2"
+                       "anvil-worker-read-3")
+                     (sort spawned #'string<)))
+      (should (<= now 130.000001)))))
+
+(ert-deftest anvil-worker-test-pick-cold-pool-starts-one-requested-worker ()
+  "One cold read dispatch starts only read-1, preserving lazy startup."
+  (anvil-worker-test--with-pool '(:read 2 :write 1 :batch 1) nil
+    (let ((anvil-worker-spawn-wait 0.4)
+          (now 0.0)
+          spawned)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned))))
+        (should-not (anvil-worker--pick-worker :read)))
+      (should (equal '("anvil-worker-read-1") spawned))
+      (should (<= now 0.400001)))))
+
+(ert-deftest anvil-worker-test-pick-busy-live-fallback-survives-spawn-timeout ()
+  "A failed idle-peer restart falls back to the cached live busy worker."
+  (anvil-worker-test--with-pool
+      '(:read 2)
+      '("anvil-worker-read-1")
+    (let ((anvil-worker-spawn-wait 0.4)
+          (now 0.0)
+          (busy (anvil-worker--worker :read 0))
+          (dead (anvil-worker--worker :read 1))
+          spawned)
+      (plist-put busy :busy t)
+      (plist-put busy :demanded t)
+      (plist-put dead :demanded t)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned))))
+        (should (eq busy (anvil-worker--pick-worker :read))))
+      (should (equal '("anvil-worker-read-2") spawned))
+      (should (<= now 0.400001)))))
+
+(ert-deftest anvil-worker-test-pick-live-idle-precedes-hanging-busy-probe ()
+  "A ready idle worker wins without spending its deadline on a busy probe."
+  (anvil-worker-test--with-pool '(:read 2) nil
+    (let ((anvil-worker-spawn-wait 0.4)
+          (now 0.0)
+          (busy (anvil-worker--worker :read 0))
+          (idle (anvil-worker--worker :read 1))
+          (busy-probes 0))
+      (plist-put busy :busy t)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'anvil-worker--worker-alive-p)
+                 (lambda (worker &optional deadline)
+                   (if (plist-get worker :busy)
+                       (progn
+                         (cl-incf busy-probes)
+                         (setq now (or deadline (+ now 2.0)))
+                         nil)
+                     (< now (or deadline most-positive-fixnum))))))
+        (should (eq idle (anvil-worker--pick-worker :read))))
+      (should (= 0 busy-probes))
+      (should (< now 0.4)))))
+
+(ert-deftest anvil-worker-test-pick-hanging-probes-share-spawn-deadline ()
+  "Per-worker probes receive and cannot multiply the aggregate deadline."
+  (anvil-worker-test--with-pool
+      '(:read 3 :write 2 :batch 2)
+      nil
+    (plist-put (anvil-worker--worker :read 1) :demanded t)
+    (plist-put (anvil-worker--worker :read 2) :demanded t)
+    (let ((anvil-worker-spawn-wait 0.4)
+          (now 0.0)
+          spawned)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (push (plist-get worker :name) spawned)))
+                ((symbol-function 'anvil-worker--worker-alive-p)
+                 (lambda (_worker &optional deadline)
+                   (setq now
+                         (+ now (if deadline
+                                    (max 0.0 (- deadline now))
+                                  2.0)))
+                   nil)))
+        (should-not (anvil-worker--pick-worker :read)))
+      (should (equal '("anvil-worker-read-1"
+                       "anvil-worker-read-2"
+                       "anvil-worker-read-3")
+                     (sort spawned #'string<)))
+      (should (<= now 0.400001)))))
+
+(ert-deftest anvil-worker-test-probe-clamps-poll-to-caller-deadline ()
+  "A liveness probe never waits beyond the caller's absolute deadline."
+  (let ((anvil-worker-alive-check-timeout 2.0)
+        (now 0.0)
+        (live t))
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) now))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) 'fake-probe))
+              ((symbol-function 'process-live-p)
+               (lambda (_process) live))
+              ((symbol-function 'accept-process-output)
+               (lambda (_process seconds &rest _)
+                 (setq now (+ now seconds))
+                 nil))
+              ((symbol-function 'delete-process)
+               (lambda (_process) (setq live nil)))
+              ((symbol-function 'anvil-worker--log)
+               (lambda (&rest _) nil)))
+      (should-not (anvil-worker--probe-emacsclient "/tmp/fake" 0.25)))
+    (should (<= now 0.250001))))
+
+(ert-deftest anvil-worker-test-pick-observes-late-peer-before-deadline ()
+  "A peer that starts late can win without waiting on a dead peer first."
+  (anvil-worker-test--with-pool '(:read 2) nil
+    (plist-put (anvil-worker--worker :read 1) :demanded t)
+    (let ((anvil-worker-spawn-wait 1.0)
+          (now 0.0)
+          (spawned (make-hash-table :test #'equal)))
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (puthash (plist-get worker :name) t spawned)))
+                ((symbol-function 'anvil-worker--worker-alive-p)
+                 (lambda (worker &optional _deadline)
+                   (let ((name (plist-get worker :name)))
+                     (and (gethash name spawned)
+                          (equal name "anvil-worker-read-2")
+                          (>= now 0.3))))))
+        (let ((worker (anvil-worker--pick-worker :read)))
+          (should (equal "anvil-worker-read-2"
+                         (plist-get worker :name)))
+          (should (< now 0.5))
+          (should (= 2 (hash-table-count spawned))))))))
+
+(ert-deftest anvil-worker-test-pick-waits-for-requested-lane-before-live-fallback ()
+  "A requested lane that becomes ready within budget outranks a live fallback."
+  (anvil-worker-test--with-pool '(:read 1 :write 1) nil
+    (let ((anvil-worker-spawn-wait 1.0)
+          (now 0.0)
+          read-spawned)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (worker)
+                   (when (eq :read (plist-get worker :lane))
+                     (setq read-spawned t))))
+                ((symbol-function 'anvil-worker--worker-alive-p)
+                 (lambda (worker &optional _deadline)
+                   (pcase (plist-get worker :lane)
+                     (:read (and read-spawned (>= now 0.3)))
+                     (:write t)))))
+        (let ((worker (anvil-worker--pick-worker :read)))
+          (should (eq :read (plist-get worker :lane)))
+          (should (< now 1.0)))))))
+
+(ert-deftest anvil-worker-test-pick-does-not-redemand-after-aggregate-timeout ()
+  "Fallback cleanup neither respawns a candidate nor starts a second wait."
+  (anvil-worker-test--with-pool '(:read 1) nil
+    (let ((anvil-worker-spawn-wait 0.4)
+          (now 0.0)
+          (spawns 0))
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'sit-for)
+                 (lambda (seconds &rest _)
+                   (setq now (+ now seconds))
+                   t))
+                ((symbol-function 'anvil-worker--spawn-worker)
+                 (lambda (_worker) (cl-incf spawns))))
+        (should-not (anvil-worker--pick-worker :read)))
+      (should (= 1 spawns))
+      (should (<= now 0.400001)))))
 
 ;;;; --- arg parsing -------------------------------------------------------
 
@@ -365,12 +728,12 @@ Disable health timer + spawning so no real subprocesses start."
           (should (member "/tmp/sf" call)))))))
 
 (ert-deftest anvil-worker-test-emacsclient-server-args-tcp-vs-socket ()
-  "`anvil-worker--emacsclient-server-args' picks `-s' for Unix sockets, `-f' for TCP."
+  "Worker clients fail closed and select the right endpoint option."
   (let ((server-use-tcp nil))
-    (should (equal '("-s" "/tmp/sf")
+    (should (equal '("-a" "false" "-s" "/tmp/sf")
                    (anvil-worker--emacsclient-server-args "/tmp/sf"))))
   (let ((server-use-tcp t))
-    (should (equal '("-f" "/tmp/sf")
+    (should (equal '("-a" "false" "-f" "/tmp/sf")
                    (anvil-worker--emacsclient-server-args "/tmp/sf")))))
 
 (ert-deftest anvil-worker-test-maybe-schedule-warmup-only-batch ()
@@ -521,6 +884,24 @@ deadlock on Windows (2026-04-16) that could not be broken with
   (should (eq 'emacsclient
               (default-value 'anvil-worker-connection-method))))
 
+(ert-deftest anvil-worker-test-dispatch-emacsclient-omits-sentinel-text ()
+  "The internal client sentinel must not contaminate the worker reply."
+  (anvil-worker-test--with-fresh-latency
+    (let ((real-start-process (symbol-function 'start-process)))
+      (cl-letf (((symbol-function 'start-process)
+                 (lambda (name buffer _program &rest _arguments)
+                   (funcall real-start-process
+                            name buffer shell-file-name shell-command-switch
+                            "printf '42\\n'"))))
+        (let ((worker (list :lane :read
+                            :name "anvil-worker-read-1"
+                            :server-file "/unused")))
+          (should
+           (equal
+            "42"
+            (anvil-worker--dispatch-via-emacsclient
+             worker "(+ 20 22)" 5))))))))
+
 (ert-deftest anvil-worker-test-dispatch-server-eval-at-roundtrips-value ()
   "`--dispatch-via-server-eval-at' returns prin1 of the server's result."
   (anvil-worker-test--with-fresh-latency
@@ -577,12 +958,182 @@ deadlock on Windows (2026-04-16) that could not be broken with
 
 ;;;; --- MCP probe / reset-pool tools --------------------------------------
 
+(ert-deftest anvil-worker-test-reported-state-precedence ()
+  "Reporting classifies worker state with one deterministic precedence."
+  (dolist (case
+           '(((:demanded nil) nil cold)
+             ((:demanded t) nil dead)
+             ((:demanded nil) t alive)
+             ((:demanded t :hung-checks 1) t unresponsive)
+             ((:demanded t :hung-checks 1 :busy t) t busy)))
+    (pcase-let ((`(,worker ,endpoint ,expected) case))
+      (should (eq expected
+                  (anvil-worker--reported-state worker endpoint))))))
+
+(ert-deftest anvil-worker-test-reporting-endpoint-nowait ()
+  "The real reporting observer never waits for a local socket connect."
+  (let* ((server-use-tcp nil)
+         (server-file (make-temp-file "anvil-worker-reporting-"))
+         (worker (list :server-file server-file))
+        (fake-process (make-pipe-process
+                       :name "anvil-worker-reporting-test-pipe"
+                       :noquery t))
+        captured)
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-network-process)
+                   (lambda (&rest arguments)
+                     (setq captured arguments)
+                     fake-process))
+                  ((symbol-function 'anvil-worker--server-file-stale-p)
+                   (lambda (&rest _)
+                     (ert-fail "reporting called the blocking stale probe")))
+                  ((symbol-function 'accept-process-output)
+                   (lambda (&rest _)
+                     (ert-fail "reporting waited for connection completion"))))
+          (should (anvil-worker--reporting-endpoint-alive-p worker))
+          (should (eq t (plist-get captured :nowait)))
+          (should (eq 'local (plist-get captured :family)))
+          (should (eq t (plist-get captured :noquery)))
+          (should-not (plist-get captured :buffer)))
+      (when (process-live-p fake-process)
+        (delete-process fake-process))
+      (delete-file server-file))))
+
+(ert-deftest anvil-worker-test-reporting-endpoint-propagates-errors ()
+  "Unexpected observer errors remain visible to callers."
+  (let* ((server-use-tcp nil)
+         (server-file (make-temp-file "anvil-worker-reporting-"))
+         (worker (list :server-file server-file)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'make-network-process)
+                   (lambda (&rest _arguments)
+                     (error "test programming error"))))
+          (should-error
+           (anvil-worker--reporting-endpoint-alive-p worker)
+           :type 'error))
+      (delete-file server-file))))
+
+(ert-deftest anvil-worker-test-status-nonblocking ()
+  "Pool status reports all states without lifecycle side effects."
+  (anvil-worker-test--with-pool '(:read 5) nil
+    (pcase-let* ((`[,cold ,dead ,alive ,unresponsive ,busy]
+                  (anvil-worker--lane-pool :read))
+                 (workers (list cold dead alive unresponsive busy))
+                 (reachable (list alive unresponsive busy))
+                 (checks (make-hash-table :test #'eq)))
+      (plist-put cold :last-state nil)
+      (plist-put dead :demanded t)
+      (plist-put dead :last-state 'dead)
+      (plist-put alive :demanded t)
+      (plist-put alive :last-state 'alive)
+      (plist-put unresponsive :demanded t)
+      (plist-put unresponsive :hung-checks 1)
+      (plist-put unresponsive :last-state 'dead)
+      (plist-put busy :demanded t)
+      (plist-put busy :hung-checks 1)
+      (plist-put busy :busy t)
+      (plist-put busy :last-state 'alive)
+      (let ((before (copy-tree anvil-worker--pool t)))
+        (cl-labels ((forbid (name)
+                      (lambda (&rest _args)
+                        (ert-fail (format "%s must not run during status"
+                                          name)))))
+          (cl-letf (((symbol-function
+                      'anvil-worker--reporting-endpoint-alive-p)
+                     (lambda (worker)
+                       (puthash worker
+                                (1+ (gethash worker checks 0))
+                                checks)
+                       (memq worker reachable)))
+                    ((symbol-function 'anvil-worker-spawn)
+                     (forbid 'anvil-worker-spawn))
+                    ((symbol-function 'anvil-worker--worker-alive-p)
+                     (forbid 'anvil-worker--worker-alive-p))
+                    ((symbol-function 'anvil-worker--quick-alive-p)
+                     (forbid 'anvil-worker--quick-alive-p))
+                    ((symbol-function 'delete-file)
+                     (forbid 'delete-file))
+                    ((symbol-function 'anvil-worker--log)
+                     (forbid 'anvil-worker--log)))
+            (let ((report (anvil-worker-status)))
+              (dolist (row
+                       '("anvil-worker-read-1: state=cold demanded=no last=unknown"
+                         "anvil-worker-read-2: state=dead demanded=yes last=dead"
+                         "anvil-worker-read-3: state=alive demanded=yes last=alive"
+                         "anvil-worker-read-4: state=unresponsive demanded=yes last=dead"
+                         "anvil-worker-read-5: state=busy demanded=yes last=alive"))
+                (should (string-match-p (regexp-quote row) report))))))
+        (dolist (worker workers)
+          (should (= 1 (gethash worker checks 0))))
+        (should (equal before anvil-worker--pool))))))
+
+(ert-deftest anvil-worker-test-probe-rendering ()
+  "The MCP probe renders lifecycle evidence without mutating workers."
+  (anvil-worker-test--with-pool '(:read 3) nil
+    (pcase-let* ((`[,cold ,unresponsive ,busy]
+                  (anvil-worker--lane-pool :read))
+                 (workers (list cold unresponsive busy))
+                 (reachable (list unresponsive busy))
+                 (checks (make-hash-table :test #'eq)))
+      (plist-put cold :last-state 'alive)
+      (plist-put unresponsive :demanded t)
+      (plist-put unresponsive :hung-checks 1)
+      (plist-put unresponsive :last-state 'dead)
+      (plist-put busy :demanded t)
+      (plist-put busy :hung-checks 2)
+      (plist-put busy :busy t)
+      (plist-put busy :last-state nil)
+      (let ((before (copy-tree anvil-worker--pool t)))
+        (cl-labels ((forbid (name)
+                      (lambda (&rest _args)
+                        (ert-fail (format "%s must not run during probe"
+                                          name)))))
+          (cl-letf (((symbol-function
+                      'anvil-worker--reporting-endpoint-alive-p)
+                     (lambda (worker)
+                       (puthash worker
+                                (1+ (gethash worker checks 0))
+                                checks)
+                       (memq worker reachable)))
+                    ((symbol-function 'anvil-worker-spawn)
+                     (forbid 'anvil-worker-spawn))
+                    ((symbol-function 'anvil-worker--worker-alive-p)
+                     (forbid 'anvil-worker--worker-alive-p))
+                    ((symbol-function 'anvil-worker--quick-alive-p)
+                     (forbid 'anvil-worker--quick-alive-p))
+                    ((symbol-function 'delete-file)
+                     (forbid 'delete-file))
+                    ((symbol-function 'anvil-worker--log)
+                     (forbid 'anvil-worker--log))
+                    ((symbol-function 'anvil-worker--server-file-pid)
+                     (lambda (_server-file) 99999)))
+            (let ((report (anvil-worker--tool-probe)))
+              (should (string-match-p
+                       (regexp-quote
+                        "anvil-worker-read-1: state=cold demanded=no last=alive")
+                       report))
+              (should (string-match-p
+                       (regexp-quote
+                        (concat
+                         "anvil-worker-read-2: state=unresponsive demanded=yes"
+                         " last=dead pid=99999 probe-failures=1/3"))
+                       report))
+              (should (string-match-p
+                       (regexp-quote
+                        (concat
+                         "anvil-worker-read-3: state=busy demanded=yes"
+                         " last=unknown pid=99999 probe-failures=2/3"))
+                       report)))))
+        (dolist (worker workers)
+          (should (= 1 (gethash worker checks 0))))
+        (should (equal before anvil-worker--pool))))))
+
 (ert-deftest anvil-worker-test-tool-probe-reports-per-lane ()
   "`anvil-worker--tool-probe' returns a string with lane headers and metrics."
   (anvil-worker-test--with-pool
       '(:read 2 :write 1 :batch 1)
       '("anvil-worker-read-1" "anvil-worker-write-1")
-    (cl-letf (((symbol-function 'anvil-worker--quick-alive-p)
+    (cl-letf (((symbol-function 'anvil-worker--reporting-endpoint-alive-p)
                (lambda (w)
                  (member (plist-get w :name)
                          anvil-worker--alive-set)))
@@ -597,13 +1148,15 @@ deadlock on Windows (2026-04-16) that could not be broken with
         (should (string-match-p "\\[read\\]" report))
         (should (string-match-p "\\[write\\]" report))
         (should (string-match-p "\\[batch\\]" report))
-        ;; alive workers get pid= suffix
+        ;; Reachable workers get the alive state and pid= suffix.
         (should (string-match-p
-                 "anvil-worker-read-1: alive pid=99999"
+                 (concat "anvil-worker-read-1: state=alive demanded=no"
+                         " last=unknown pid=99999")
                  report))
-        ;; dead workers do NOT get pid=
+        ;; Never-demanded absent workers are cold and do not get pid=.
         (should (string-match-p
-                 "anvil-worker-read-2: dead\\($\\|\n\\)"
+                 (concat "anvil-worker-read-2: state=cold demanded=no"
+                         " last=unknown\\($\\|\n\\)")
                  report))
         (should (string-match-p "classify:" report))
         (should (string-match-p "latency:" report))))))

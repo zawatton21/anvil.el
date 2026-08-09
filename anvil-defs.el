@@ -1250,7 +1250,8 @@ via `anvil-git--run' and parses the hunk headers.  Deleted files
 anchor line."
   (require 'anvil-git)
   (let* ((res (anvil-git--run
-               (format "diff -U0 %s" (shell-quote-argument (or rev "HEAD")))
+               (format "diff --src-prefix=a/ --dst-prefix=b/ -U0 %s"
+                       (shell-quote-argument (or rev "HEAD")))
                repo '(:max-output 1048576)))
          (_ (anvil-git--check res "diff -U0"))
          (out (or (plist-get res :stdout) ""))

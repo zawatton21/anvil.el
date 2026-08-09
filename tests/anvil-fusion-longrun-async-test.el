@@ -16,8 +16,56 @@
 (require 'anvil-fusion-ask)
 (require 'anvil-fusion-longrun-async)
 
+(defconst anvil-fusion-longrun-async-test--clrhash-primitive
+  (symbol-function 'clrhash)
+  "Unadvised hash-table cleanup primitive for fixture teardown.")
+
+(defvar anvil-fusion-longrun-async-test--databases (cons nil nil)
+  "Stable state whose cdr owns temporary database handles and paths.")
+
+(defun anvil-fusion-longrun-async-test--cleanup-databases ()
+  "Close and remove every temporary database owned by the current test."
+  (let ((entries (cdr anvil-fusion-longrun-async-test--databases))
+        (inhibit-quit t))
+    (unwind-protect
+        (dolist (entry entries)
+          (when (car entry)
+            (condition-case nil
+                (sqlite-close (car entry))
+              ((error quit) nil)))
+          (dolist (suffix '("" "-wal" "-shm" "-journal"))
+            (condition-case nil
+                (delete-file (concat (cdr entry) suffix))
+              ((error quit) nil))))
+      (setcdr anvil-fusion-longrun-async-test--databases nil))))
+
+(defmacro anvil-fusion-longrun-async-test--with-resources (&rest body)
+  "Run BODY with isolated jobs and deterministic database cleanup."
+  (declare (indent 0) (debug t))
+  `(let ((anvil-fusion-longrun-async-test--databases (cons nil nil))
+         (anvil-fusion-longrun--jobs (make-hash-table :test 'equal)))
+     (unwind-protect
+         (progn ,@body)
+       (let ((inhibit-quit t))
+         (unwind-protect
+             (condition-case nil
+                 (funcall anvil-fusion-longrun-async-test--clrhash-primitive
+                          anvil-fusion-longrun--jobs)
+               ((error quit) nil))
+           (anvil-fusion-longrun-async-test--cleanup-databases))))))
+
 (defun anvil-fusion-longrun-async-test--tmpdb ()
-  (anvil-fusion-longrun-store-open (make-temp-file "alr-async-" nil ".db")))
+  "Stage, open, and publish a fresh temporary quest store."
+  (let (path entry db)
+    (let ((inhibit-quit t))
+      (setq path (make-temp-file "alr-async-" nil ".db")
+            entry (cons nil path))
+      (setcdr anvil-fusion-longrun-async-test--databases
+              (cons entry
+                    (cdr anvil-fusion-longrun-async-test--databases)))
+      (setq db (anvil-fusion-longrun-store-open path))
+      (setcar entry db))
+    db))
 
 (defun anvil-fusion-longrun-async-test--drain (job-id &optional cap)
   "Poll JOB-ID until terminal (or CAP polls); return the last status."
@@ -71,8 +119,63 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
                       (list :summary (format "stepout-%s" name)))))))
        ,@body)))
 
+(ert-deftest anvil-fusion-longrun-async-test-fixture-cleans-nonlocal-exit ()
+  "The fixture must survive open failure, error, quit, and cleanup quit."
+  (let (failed-path database path jobs
+                    quit-database quit-path quit-jobs quit-seen)
+    (cl-letf (((symbol-function 'anvil-fusion-longrun-store-open)
+               (lambda (candidate)
+                 (setq failed-path candidate)
+                 (error "Injected async store open failure"))))
+      (should-error
+       (anvil-fusion-longrun-async-test--with-resources
+        (anvil-fusion-longrun-async-test--tmpdb))))
+    (dolist (suffix '("" "-wal" "-shm" "-journal"))
+      (should-not (file-exists-p (concat failed-path suffix))))
+    (should-error
+     (anvil-fusion-longrun-async-test--with-resources
+      (setq database (anvil-fusion-longrun-async-test--tmpdb)
+            path
+            (cdar (cdr anvil-fusion-longrun-async-test--databases))
+            jobs anvil-fusion-longrun--jobs)
+      (puthash "retained" (list :db database) jobs)
+      (error "Fixture nonlocal exit")))
+    (should (hash-table-p jobs))
+    (should (= 0 (hash-table-count jobs)))
+    (should-error (sqlite-select database "SELECT 1"))
+    (dolist (suffix '("" "-wal" "-shm" "-journal"))
+      (should-not (file-exists-p (concat path suffix))))
+    (setq quit-seen
+          (condition-case nil
+              (progn
+                (anvil-fusion-longrun-async-test--with-resources
+                 (setq quit-database
+                       (anvil-fusion-longrun-async-test--tmpdb)
+                       quit-path
+                       (cdar
+                        (cdr anvil-fusion-longrun-async-test--databases))
+                       quit-jobs anvil-fusion-longrun--jobs)
+                 (puthash "quit" (list :db quit-database) quit-jobs)
+                 (signal 'quit nil))
+                nil)
+            (quit t)))
+    (should quit-seen)
+    (should (= 0 (hash-table-count quit-jobs)))
+    (should-error (sqlite-select quit-database "SELECT 1"))
+    (dolist (suffix '("" "-wal" "-shm" "-journal"))
+      (should-not (file-exists-p (concat quit-path suffix))))
+    (let* ((anvil-fusion-longrun-async-test--databases (cons nil nil))
+           (cleanup-path (make-temp-file "alr-async-cleanup-" nil ".db")))
+      (setcdr anvil-fusion-longrun-async-test--databases
+              (list (cons :fake cleanup-path)))
+      (cl-letf (((symbol-function 'sqlite-close)
+                 (lambda (_db) (signal 'quit nil))))
+        (anvil-fusion-longrun-async-test--cleanup-databases))
+      (should-not (cdr anvil-fusion-longrun-async-test--databases))
+      (should-not (file-exists-p cleanup-path)))))
+
 (ert-deftest anvil-fusion-longrun-async-test-lifecycle-budget ()
-  (let ((distill-status "CONTINUE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "CONTINUE")
         (db (anvil-fusion-longrun-async-test--tmpdb)))
     (anvil-fusion-longrun-async-test--with-stub
         (list :running 0 :queued 0)
@@ -91,10 +194,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
           (should (equal (plist-get q :status) "budget")))
         (should (= (length (anvil-fusion-longrun-store-steps
                             db (plist-get s :quest-id)))
-                   2))))))
+                   2)))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-early-done ()
-  (let ((distill-status "DONE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "DONE")
         (db (anvil-fusion-longrun-async-test--tmpdb)))
     (anvil-fusion-longrun-async-test--with-stub
         (list :running 0 :queued 0)
@@ -107,10 +210,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
         (should (equal (plist-get (anvil-fusion-longrun-store-get
                                    db (plist-get s :quest-id))
                                   :status)
-                       "done"))))))
+                       "done")))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-running-does-not-advance ()
-  (let ((distill-status "CONTINUE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "CONTINUE")
         (db (anvil-fusion-longrun-async-test--tmpdb))
         (polls 0))
     (anvil-fusion-longrun-async-test--with-stub
@@ -125,10 +228,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
         (should (eq (plist-get r1 :stage) 'step-running))
         (let ((r (anvil-fusion-longrun-async-test--drain (plist-get s :job-id))))
           (should (eq (plist-get r :status) 'done))
-          (should (= (plist-get r :steps) 1)))))))
+          (should (= (plist-get r :steps) 1))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-resume ()
-  (let ((distill-status "CONTINUE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "CONTINUE")
         (db (anvil-fusion-longrun-async-test--tmpdb)))
     (anvil-fusion-longrun-async-test--with-stub
         (list :running 0 :queued 0)
@@ -143,17 +246,17 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
           (should (eq (plist-get b :stage) 'step-ready))
           (should (eq (plist-get rb :status) 'done))
           (should (= (plist-get rb :steps) 4))
-          (should (= (length (anvil-fusion-longrun-store-steps db qid)) 4)))))))
+          (should (= (length (anvil-fusion-longrun-store-steps db qid)) 4))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-unknown-job ()
-  (should-error (anvil-fusion-longrun-status "nope")))
+  (anvil-fusion-longrun-async-test--with-resources (should-error (anvil-fusion-longrun-status "nope"))))
 
 (ert-deftest anvil-fusion-longrun-async-test-resume-unknown-quest ()
-  (let ((db (anvil-fusion-longrun-async-test--tmpdb)))
-    (should-error (anvil-fusion-longrun-resume-async "nope" :db db))))
+  (anvil-fusion-longrun-async-test--with-resources (let ((db (anvil-fusion-longrun-async-test--tmpdb)))
+    (should-error (anvil-fusion-longrun-resume-async "nope" :db db)))))
 
 (ert-deftest anvil-fusion-longrun-async-test-converges ()
-  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+  (anvil-fusion-longrun-async-test--with-resources (let ((db (anvil-fusion-longrun-async-test--tmpdb))
         (--counter 0)
         (--names (make-hash-table :test 'equal)))
     (cl-letf (((symbol-function 'anvil-orchestrator-submit)
@@ -176,10 +279,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
              (r (anvil-fusion-longrun-async-test--drain (plist-get s :job-id))))
         (should (eq (plist-get r :status) 'done))
         (should (eq (plist-get r :stopped) 'converged))
-        (should (= (plist-get r :steps) 3))))))
+        (should (= (plist-get r :steps) 3)))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-hermetic-allowed-tools ()
-  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+  (anvil-fusion-longrun-async-test--with-resources (let ((db (anvil-fusion-longrun-async-test--tmpdb))
         captured)
     (cl-letf (((symbol-function 'anvil-orchestrator-submit)
                (lambda (tasks)
@@ -199,10 +302,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
       (let ((task (car captured)))
         (should (string-match-p "mcp__emacs-eval-ultra__file-outline"
                                 (plist-get task :allowed-tools)))
-        (should (string-match-p "読み取り専用" (plist-get task :prompt)))))))
+        (should (string-match-p "読み取り専用" (plist-get task :prompt))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-panel-hard-only-routes-next-step-via-ask ()
-  (let ((distill-status "CONTINUE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "CONTINUE")
         (db (anvil-fusion-longrun-async-test--tmpdb)))
     (anvil-fusion-longrun-async-test--with-stub
         (list :running 0 :queued 0)
@@ -243,10 +346,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
                            '("lr-step-1" "lr-distill-1" "lr-distill-2"
                              "lr-step-3" "lr-distill-3")))
             (should (string-match-p "DIGEST-1" (plist-get ask-call :prompt)))
-            (should (string-match-p "PANEL-OUT" (plist-get distill-2 :prompt)))))))))
+            (should (string-match-p "PANEL-OUT" (plist-get distill-2 :prompt))))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-panel-budget-cap-falls-back ()
-  (let ((distill-status "CONTINUE")
+  (anvil-fusion-longrun-async-test--with-resources (let ((distill-status "CONTINUE")
         (db (anvil-fusion-longrun-async-test--tmpdb))
         (anvil-fusion-longrun-max-panel-steps 1))
     (anvil-fusion-longrun-async-test--with-stub
@@ -274,10 +377,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
           (should (= (length --asks) 1))
           (should (member "lr-step-3"
                           (mapcar (lambda (task) (plist-get task :name))
-                                  --submitted))))))))
+                                  --submitted)))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-verify-retry-then-pass ()
-  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+  (anvil-fusion-longrun-async-test--with-resources (let ((db (anvil-fusion-longrun-async-test--tmpdb))
         (--counter 0)
         (--order nil)
         (--tasks (make-hash-table :test 'equal))
@@ -336,10 +439,10 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
                          '("lr-step-1" "lr-distill-1" "lr-step-1"
                            "lr-distill-1" "lr-step-2" "lr-distill-2")))
           (should (string-match-p "前回試行への反証" (cadr step1-prompts)))
-          (should (string-match-p "wrong fact" (cadr step1-prompts))))))))
+          (should (string-match-p "wrong fact" (cadr step1-prompts)))))))))
 
 (ert-deftest anvil-fusion-longrun-async-test-verify-retry-then-fail ()
-  (let ((db (anvil-fusion-longrun-async-test--tmpdb))
+  (anvil-fusion-longrun-async-test--with-resources (let ((db (anvil-fusion-longrun-async-test--tmpdb))
         (--counter 0)
         (--order nil)
         (--tasks (make-hash-table :test 'equal))
@@ -389,7 +492,7 @@ BODY may inspect `--submitted', `--asks', and `--tasks'."
                          "lr-distill-1" "lr-step-2" "lr-distill-2")))
         (should (= (length (anvil-fusion-longrun-store-steps
                             db (plist-get s :quest-id)))
-                   2))))))
+                   2)))))))
 
 (provide 'anvil-fusion-longrun-async-test)
 ;;; anvil-fusion-longrun-async-test.el ends here

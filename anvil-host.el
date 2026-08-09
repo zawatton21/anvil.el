@@ -42,6 +42,46 @@
 ;; the detection contract.
 (require 'anvil-config)
 
+(defun anvil-host--capture-primitive (symbol)
+  "Return SYMBOL's underlying function, stripping already-installed advice."
+  (let ((function (symbol-function symbol)))
+    (if (fboundp 'advice--cd*r)
+        (advice--cd*r function)
+      function)))
+
+(defconst anvil-host--process-list-primitive (anvil-host--capture-primitive 'process-list)
+  "Unadvised process identity snapshot primitive for constructor custody.")
+
+(defconst anvil-host--make-process-primitive (anvil-host--capture-primitive 'make-process)
+  "Unadvised subprocess constructor captured before runtime configuration.")
+
+(defconst anvil-host--make-pipe-process-primitive
+  (anvil-host--capture-primitive 'make-pipe-process)
+  "Unadvised pipe constructor captured before runtime configuration.")
+
+(defconst anvil-host--process-send-eof-primitive
+  (anvil-host--capture-primitive 'process-send-eof)
+  "Unadvised stdin close primitive for private child execution.")
+
+(defconst anvil-host--accept-process-output-primitive
+  (anvil-host--capture-primitive 'accept-process-output)
+  "Unadvised targeted wait primitive for private child execution.")
+
+(defconst anvil-host--run-at-time-function
+  (anvil-host--capture-primitive 'run-at-time)
+  "Unadvised one-shot scheduler captured before runtime configuration.")
+
+(defconst anvil-host--process-filter-primitive
+  (anvil-host--capture-primitive 'process-filter)
+  "Unadvised process filter reader for private-output validation.")
+
+(defconst anvil-host--process-name-primitive (anvil-host--capture-primitive 'process-name)
+  "Unadvised process name reader for constructor recovery.")
+
+(defconst anvil-host--set-process-buffer-primitive
+  (anvil-host--capture-primitive 'set-process-buffer)
+  "Unadvised buffer detach primitive for output secrecy.")
+
 ;;;; --- defaults / constants -----------------------------------------------
 
 (defconst anvil-host--default-timeout 30
@@ -57,6 +97,37 @@ the shell child died.  Capped so a disowned descendant which
 inherits fd 2 (e.g. `setsid --fork') cannot extend
 `anvil-shell' beyond this budget.")
 
+(defvar anvil-host-cleanup-timeout 1.0
+  "Seconds allowed to confirm that an interrupted host child is dead.")
+
+(defvar anvil-host--cleanup-state (cons nil nil)
+  "Stable host-child cleanup state.
+The car is the unwatchable transaction-active bit.  The cdr lazily becomes
+a vector containing the hash-table mirror, callback-free staging list,
+authoritative one-shot timer, and submission-active bit.  Minimal Elisp
+runtimes can therefore load this file without constructing unsupported
+process-custody objects.")
+
+(defvar anvil-host--cleanup-timer nil
+  "Timer retrying exact host resources whose cleanup has not converged.")
+
+(defvar anvil-host--cleanup-active nil
+  "Observable dynamic cleanup state.
+The stable car of anvil-host--cleanup-state, not this watchable variable,
+is authoritative for reentrancy exclusion.")
+
+(defvar anvil-host-child-process-environment nil
+  "Optional process environment used only while creating a shell child.")
+
+(defvar anvil-host-child-exec-path nil
+  "Optional executable path used only while creating a shell child.")
+
+(defvar anvil-host-child-shell-file-name nil
+  "Optional shell executable used only while creating a shell child.")
+
+(defvar anvil-host-child-shell-command-switch nil
+  "Optional shell command switch used only while creating a shell child.")
+
 (defun anvil-host--default-coding ()
   "Return the default coding system for shell I/O on this OS.
 Windows defaults to cp932-dos because wmic / systeminfo emit Shift_JIS
@@ -65,100 +136,866 @@ on Japanese Windows. Other OSes default to utf-8."
 
 ;;;; --- internal: shell run ------------------------------------------------
 
-(defun anvil-host--truncate (str max)
-  "Truncate STR to MAX bytes, append a marker if cut."
-  (if (and (numberp max) (> (length str) max))
-      (concat (substring str 0 max)
-              (format "\n...[anvil-host: truncated, %d more bytes]"
-                      (- (length str) max)))
-    str))
+(defun anvil-host--truncate (str max &optional total-bytes)
+  "Append a truncation marker to bounded STR when TOTAL-BYTES exceeds MAX.
+Callers must already have limited the captured unibyte stream to MAX bytes.
+When TOTAL-BYTES is nil, derive it from STR for compatibility."
+  (let ((total (or total-bytes (string-bytes str))))
+    (if (and (numberp max) (> total max))
+        (concat str
+                (format "\n...[anvil-host: truncated, %d more bytes]"
+                        (- total max)))
+      str)))
 
-(defun anvil-host--run (command coding cwd timeout)
-  "Run COMMAND in shell asynchronously and wait up to TIMEOUT seconds.
-Returns (EXIT STDOUT STDERR). Errors on timeout.
+(defun anvil-host--scheduled-timers ()
+  "Return a snapshot of every normal and idle timer identity."
+  (append (copy-sequence timer-list)
+          (copy-sequence timer-idle-list)))
 
-`:connection-type' is forced to `pipe' (rather than the Emacs default
-PTY) so `isatty(0/1/2)' stays false for the shell and any grand-
-children; helpers we invoke (wmic / wl-copy / xclip / pbcopy /
-PowerShell / ...) are all fine with non-tty I/O and this keeps the
-captured stdout / stderr byte-accurate.
+(defun anvil-host--timer-scheduled-p (timer)
+  "Return non-nil when TIMER is scheduled normally or while Emacs is idle."
+  (and (timerp timer)
+       (or (memq timer timer-list)
+           (memq timer timer-idle-list))))
 
-Detach semantics (issue #10):  pipe mode alone does NOT let an
-arbitrary `& disown' descendant outlive the wrapper shell.
-`make-process' always calls `setsid()' for its direct child so the
-spawned shell is a session leader; fd 0 is inherited from Emacs'
-stdin, which on a typical desktop or server session is a pts/
-device — that becomes the shell's controlling TTY.  `& disown'
-keeps the background job in the shell's session (just hides it
-from `jobs'), so the kernel SIGHUPs it when the shell exits and
-releases the TTY.
+(defun anvil-host--resource-state ()
+  "Return the stable vector for table, staging, timer, and submission."
+  (let* ((tail (cdr anvil-host--cleanup-state))
+         (legacy-timer
+          (and (timerp anvil-host--cleanup-timer)
+               (anvil-host--timer-scheduled-p anvil-host--cleanup-timer)
+               anvil-host--cleanup-timer))
+         resources)
+    (setq resources
+          (cond
+           ((null tail)
+            (vector nil nil legacy-timer nil))
+           ((hash-table-p tail)
+            (vector tail nil legacy-timer nil))
+           ((and (vectorp tail) (= (length tail) 4)) tail)
+           ((and (vectorp tail) (= (length tail) 3))
+            (vector (aref tail 0) (aref tail 1) (aref tail 2) nil))
+           ((consp tail)
+            (vector (car tail) (cdr tail) legacy-timer nil))
+           (t (error "anvil-host: invalid cleanup state"))))
+    (unless (eq tail resources)
+      (setcdr anvil-host--cleanup-state resources))
+    ;; Reconcile a scheduled legacy mirror after partial live reloads too.
+    (when (and legacy-timer
+               (let ((current (aref resources 2)))
+                 (not (anvil-host--timer-scheduled-p current))))
+      (aset resources 2 legacy-timer))
+    resources))
 
-The only reliable detach on Linux is `setsid --fork' (or
-equivalent double-fork), which moves the grandchild into a brand-
-new session with no controlling TTY.  That's what `wl-copy' /
-`pbcopy' / `xclip' already do internally for their clipboard-owner
-daemons, which is why clipboard set-then-read works over
-`anvil-shell' in practice.  Callers that need a detached descendant
-for other reasons should invoke `setsid --fork' explicitly."
-  (let* ((stdout-buf (generate-new-buffer " *anvil-host-stdout*"))
-         (stderr-buf (generate-new-buffer " *anvil-host-stderr*"))
-         (default-directory (or cwd default-directory))
-         (process-coding-system-alist
-          (cons (cons "" (cons coding coding))
-                process-coding-system-alist))
-         proc)
+(defun anvil-host--retired-table ()
+  "Return the lazily initialized retirement-table mirror."
+  (let* ((resources (anvil-host--resource-state))
+         (table (aref resources 0)))
+    (or table
+        (progn
+          (setq table (make-hash-table :test #'eq))
+          (aset resources 0 table)
+          table))))
+
+(defun anvil-host--retired-entries ()
+  "Return a snapshot of every uniquely owned retirement entry."
+  (let* ((resources (anvil-host--resource-state))
+         (table (aref resources 0))
+         (entries (copy-sequence (aref resources 1))))
+    (when (hash-table-p table)
+      (maphash
+       (lambda (owner metadata)
+         (unless (assq owner entries)
+           (push (cons owner metadata) entries)))
+       table))
+    entries))
+
+(defun anvil-host--retired-count ()
+  "Return the number of uniquely owned host resource records."
+  (length (anvil-host--retired-entries)))
+
+(defun anvil-host--retired-empty-p ()
+  "Return non-nil when no host resource remains in global custody."
+  (null (anvil-host--retired-entries)))
+
+(defun anvil-host--owned-metadata-p (owner metadata)
+  "Return non-nil when OWNER still names exact METADATA globally."
+  (let* ((resources (anvil-host--resource-state))
+         (entry (assq owner (aref resources 1)))
+         (table (aref resources 0)))
+    (or (eq (cdr-safe entry) metadata)
+        (and (hash-table-p table)
+             (eq (gethash owner table) metadata)))))
+
+(defun anvil-host--stage-metadata (metadata)
+  "Give METADATA callback-free global custody and return its entry."
+  (let* ((resources (anvil-host--resource-state))
+         (owner (make-symbol "anvil-host-resource-custody"))
+         (entry (cons owner metadata)))
+    ;; Mutating the stable resource vector invokes neither variable watchers
+    ;; nor hash-table advice.  Publication therefore precedes every
+    ;; observable binding and destructive callback.
+    (aset resources 1 (cons entry (aref resources 1)))
+    entry))
+
+(defun anvil-host--cleanup-active-p ()
+  "Return non-nil during an exact-resource cleanup transaction."
+  (car anvil-host--cleanup-state))
+
+(defun anvil-host--terminate-exact-process (process)
+  "Try to terminate exact PROCESS and return non-nil only after its death."
+  (if (not (processp process))
+      t
+    (let ((deadline (+ (float-time) anvil-host-cleanup-timeout))
+          (inhibit-quit t))
+      (when (process-live-p process)
+        (condition-case nil
+            (kill-process process)
+          ((error quit) nil)))
+      (while (and (process-live-p process)
+                  (< (float-time) deadline))
+        ;; The integer JUST-THIS-ONE value prioritizes this exact process and
+        ;; suppresses ordinary timers.  Emacs may still dispatch an already-
+        ;; ready foreign process filter.
+        (funcall anvil-host--accept-process-output-primitive process 0.02 nil 1))
+      (condition-case nil
+          (delete-process process)
+        ((error quit) nil))
+      (while (and (process-live-p process)
+                  (< (float-time) deadline))
+        (funcall anvil-host--accept-process-output-primitive process 0.02 nil 1))
+      (and (not (process-live-p process))
+           (not (memq process
+                      (funcall anvil-host--process-list-primitive)))))))
+
+(defun anvil-host--close-exact-pipe (process)
+  "Close exact pipe PROCESS without waiting for an inherited descriptor."
+  (if (not (processp process))
+      t
+    (let ((inhibit-quit t))
+      (condition-case nil
+          (delete-process process)
+        ((error quit) nil))
+      (and (not (process-live-p process))
+           (not (memq process
+                      (funcall anvil-host--process-list-primitive)))))))
+
+(defun anvil-host--release-process-resources (owner metadata)
+  "Release OWNER only after every exact METADATA resource has converged.
+The staged entry is removed last, so hash callbacks and tagged exits retain
+global custody for the retry timer."
+  (let* ((resources (anvil-host--resource-state))
+         (table (aref resources 0))
+         (process (plist-get metadata :process))
+         (primary-released-p
+          (or (not (processp process))
+              (and (not (process-live-p process))
+                   (not (memq
+                         process
+                         (funcall anvil-host--process-list-primitive)))))))
+    (when (and (anvil-host--owned-metadata-p owner metadata)
+               primary-released-p)
+      (let* ((stderr-process (plist-get metadata :stderr-process))
+             (custody-buffer (plist-get metadata :custody-buffer))
+             (stderr-custody-buffer
+              (plist-get metadata :stderr-custody-buffer))
+             (inhibit-quit t)
+             (stderr-released-p
+              (or (not (processp stderr-process))
+                  (anvil-host--close-exact-pipe stderr-process))))
+        (when (and stderr-released-p
+                   (buffer-live-p custody-buffer))
+          (condition-case nil
+              (kill-buffer custody-buffer)
+            ((error quit) nil)))
+        (when (and stderr-released-p
+                   (buffer-live-p stderr-custody-buffer))
+          (condition-case nil
+              (kill-buffer stderr-custody-buffer)
+            ((error quit) nil)))
+        (when (and primary-released-p
+                   stderr-released-p
+                   (not (buffer-live-p custody-buffer))
+                   (not (buffer-live-p stderr-custody-buffer))
+                   (anvil-host--owned-metadata-p owner metadata))
+          ;; Remove the advised hash mirror before the callback-free stage.
+          ;; An exit after real `remhash' still leaves the staged entry.
+          (when (and (hash-table-p table)
+                     (eq (gethash owner table) metadata))
+            (remhash owner table))
+          (aset resources 1
+                (assq-delete-all owner (aref resources 1)))
+          t)))))
+
+(defun anvil-host--cleanup-owned-entry (entry)
+  "Try to converge the exact resource retirement ENTRY."
+  (let ((owner (car entry))
+        (metadata (cdr entry)))
+    (when (anvil-host--owned-metadata-p owner metadata)
+      (let ((process (plist-get metadata :process)))
+        (when (anvil-host--terminate-exact-process process)
+          (anvil-host--release-process-resources owner metadata))))))
+
+(defun anvil-host--retry-owned-entries ()
+  "Converge a snapshot of retained entries under an acquired cleanup guard."
+  (let ((entries (anvil-host--retired-entries)))
+    (let ((anvil-host-child-process-environment nil)
+          (anvil-host-child-exec-path nil)
+          (anvil-host-child-shell-file-name nil)
+          (anvil-host-child-shell-command-switch nil))
+      (dolist (entry entries)
+        (let* ((metadata (cdr entry))
+               (custody-buffer (plist-get metadata :custody-buffer))
+               (context-buffer
+                (if (buffer-live-p custody-buffer)
+                    custody-buffer
+                  (plist-get metadata :stderr-custody-buffer))))
+          (if (buffer-live-p context-buffer)
+              (with-current-buffer context-buffer
+                (anvil-host--cleanup-owned-entry entry))
+            (anvil-host--cleanup-owned-entry entry)))))
+    (when (anvil-host--retired-empty-p)
+      (anvil-host--cancel-cleanup-timer))))
+
+(defun anvil-host--retry-retired-processes ()
+  "Retry every exact host resource retained after failed cleanup."
+  (unless (anvil-host--cleanup-active-p)
+    (setcar anvil-host--cleanup-state t)
+    (unwind-protect
+        (let ((anvil-host--cleanup-active t))
+          (anvil-host--retry-owned-entries))
+      (unwind-protect
+          (unless (anvil-host--retired-empty-p)
+            (anvil-host--ensure-cleanup-timer))
+        (setcar anvil-host--cleanup-state nil)))))
+
+(defun anvil-host--cleanup-timer-scheduled-p (&optional timer)
+  "Return non-nil when TIMER, or the authoritative timer, is scheduled."
+  (let ((candidate
+         (or timer (aref (anvil-host--resource-state) 2))))
+    (anvil-host--timer-scheduled-p candidate)))
+
+(defun anvil-host--cancel-cleanup-timer ()
+  "Cancel and forget the exact authoritative cleanup timer."
+  (let* ((resources (anvil-host--resource-state))
+         (timer (aref resources 2)))
+    ;; Clear the callback-free identity before cancel-timer or mirror watchers
+    ;; can reenter.  A one-shot timer which escapes cancellation expires.
+    (when (eq (aref resources 2) timer)
+      (aset resources 2 nil))
+    (when (anvil-host--cleanup-timer-scheduled-p timer)
+      (cancel-timer timer))
+    (when (or (eq anvil-host--cleanup-timer timer)
+              (and (timerp anvil-host--cleanup-timer)
+                   (not (anvil-host--timer-scheduled-p
+                         anvil-host--cleanup-timer))))
+      (condition-case nil
+          (setq anvil-host--cleanup-timer nil)
+        ((error quit) nil)))))
+
+(defun anvil-host--cleanup-timer-fired (timer)
+  "Handle exact one-shot cleanup TIMER under the stable cleanup guard."
+  (let* ((state anvil-host--cleanup-state)
+         (outer-active (car state))
+         (inhibit-quit t))
+    (unless outer-active
+      (setcar state t))
+    (unwind-protect
+        (if outer-active
+            (let ((resources (anvil-host--resource-state)))
+              (when (eq (aref resources 2) timer)
+                (aset resources 2 nil))
+              (when (and (timerp timer)
+                         (eq anvil-host--cleanup-timer timer))
+                (condition-case nil
+                    (setq anvil-host--cleanup-timer nil)
+                  ((error quit) nil))))
+          (let ((anvil-host--cleanup-active t)
+                (resources (anvil-host--resource-state)))
+            (unwind-protect
+                (progn
+                  (when (eq (aref resources 2) timer)
+                    (aset resources 2 nil))
+                  (when (and (timerp timer)
+                             (eq anvil-host--cleanup-timer timer))
+                    (condition-case nil
+                        (setq anvil-host--cleanup-timer nil)
+                      ((error quit) nil))))
+              ;; Watcher errors and tagged exits cannot skip convergence.
+              (anvil-host--retry-owned-entries))))
+      (unless outer-active
+        (unwind-protect
+            (unless (anvil-host--retired-empty-p)
+              (anvil-host--ensure-cleanup-timer))
+          (setcar state nil))))))
+
+(defun anvil-host--discard-cleanup-timer (timer)
+  "Cancel exact constructor TIMER without allowing it to repeat."
+  (when (timerp timer)
+    (condition-case nil
+        (progn
+          (setf (timer--repeat-delay timer) nil)
+          (when (anvil-host--timer-scheduled-p timer)
+            (cancel-timer timer)))
+      ((error quit) nil))))
+
+(defun anvil-host--normalize-cleanup-timer (timer callback)
+  "Make exact TIMER a fresh one-shot invoking CALLBACK with no arguments."
+  (unless (timerp timer)
+    (error "anvil-host: cleanup timer constructor returned no timer"))
+  (when (anvil-host--timer-scheduled-p timer)
+    (cancel-timer timer))
+  (timer-set-function timer callback nil)
+  (timer-set-time timer (timer-relative-time nil 1) nil)
+  (timer-activate timer)
+  timer)
+
+(defun anvil-host--make-direct-cleanup-timer (callback)
+  "Create and activate a fallback one-shot for CALLBACK."
+  (anvil-host--normalize-cleanup-timer (timer-create) callback))
+
+(defun anvil-host--select-cleanup-timer
+    (returned observed before callback)
+  "Return one exact normalized cleanup timer for this constructor.
+RETURNED and OBSERVED are accepted only when absent from BEFORE.  A timer with
+the unique CALLBACK identity is preferred, but a new returned wrapper is also
+constructor-owned.  Duplicate exact-callback timers are canceled while
+non-callback helper timers are preserved.  When advice creates no recoverable
+timer, construct a direct fallback."
+  (let (candidates)
+    (dolist (candidate
+             (append (anvil-host--scheduled-timers)
+                     (list returned observed)))
+      (when
+          (and
+           (timerp candidate)
+           (not (memq candidate before))
+           (or
+            (eq candidate returned)
+            (eq candidate observed)
+            (eq (timer--function candidate) callback)))
+        (cl-pushnew candidate candidates :test #'eq)))
+    (let ((selected
+           (or
+            ;; When several exact callback timers were created, the
+            ;; constructor's returned identity is authoritative.
+            (and (memq returned candidates)
+                 (eq (timer--function returned) callback)
+                 returned)
+            (and (memq observed candidates)
+                 (eq (timer--function observed) callback)
+                 observed)
+            (cl-find-if
+             (lambda (candidate)
+               (eq (timer--function candidate) callback))
+             candidates)
+            (and (memq returned candidates) returned)
+            (and (memq observed candidates) observed)
+            (car candidates))))
+      (if selected
+          (progn
+            (dolist (candidate candidates)
+              (when (and (not (eq candidate selected))
+                         (eq (timer--function candidate) callback))
+                (anvil-host--discard-cleanup-timer candidate)))
+            (anvil-host--normalize-cleanup-timer selected callback))
+        (anvil-host--make-direct-cleanup-timer callback)))))
+
+(defun anvil-host--ensure-cleanup-timer ()
+  "Ensure failed host-child cleanup has an exact one-shot retry timer."
+  (let* ((resources (anvil-host--resource-state))
+         (current (aref resources 2)))
+    (unless (anvil-host--cleanup-timer-scheduled-p current)
+      (let ((inhibit-quit t)
+            (before (anvil-host--scheduled-timers))
+            callback returned timer published-p)
+        (setq callback
+              (lambda (&rest _ignored)
+                (let ((fired
+                       (or
+                        (and
+                         (boundp 'timer-event-last)
+                         (timerp timer-event-last)
+                         (not (memq timer-event-last before))
+                         (eq (timer--function timer-event-last) callback)
+                         timer-event-last)
+                        (and (timerp timer) timer))))
+                  (when (timerp fired)
+                    (setq timer fired))
+                  (if (anvil-host--cleanup-active-p)
+                      ;; Constructor advice may yield past the deadline before
+                      ;; returning.  Retain and rearm the exact executing
+                      ;; one-shot so the active transaction cannot lose retry.
+                      (when (timerp fired)
+                        (aset (anvil-host--resource-state) 2 fired)
+                        (condition-case nil
+                            (anvil-host--normalize-cleanup-timer
+                             fired callback)
+                          ((error quit) nil)))
+                    (anvil-host--cleanup-timer-fired fired)))))
+        (unwind-protect
+            (progn
+              (setq returned
+                    (funcall anvil-host--run-at-time-function
+                             1 nil callback)
+                    timer
+                    (anvil-host--select-cleanup-timer
+                     returned timer before callback))
+              ;; The stable identity is authoritative and precedes the
+              ;; watchable compatibility mirror.
+              (aset resources 2 timer)
+              (setq published-p t)
+              (setq anvil-host--cleanup-timer timer))
+          ;; Constructor advice may leave nonlocally after creating the timer.
+          ;; Recover its exact callback identity without invoking watchers or
+          ;; replacing the original exit.
+          (unless published-p
+            (let ((recovered
+                   (condition-case nil
+                       (anvil-host--select-cleanup-timer
+                        returned timer before callback)
+                     ((error quit) nil))))
+              (when recovered
+                (setq timer recovered)
+                (aset resources 2 timer)
+                (setq published-p t)))))))))
+
+(defun anvil-host--retire-resources (metadata-list)
+  "Publish and converge every exact resource record in METADATA-LIST."
+  (when metadata-list
+    (let* ((state anvil-host--cleanup-state)
+           (outer-active (car state))
+           (inhibit-quit t))
+      ;; Acquire the stable guard before any observable binding or advised
+      ;; table operation.  Stage every record before deleting the first.
+      (unless outer-active
+        (setcar state t))
+      (unwind-protect
+          (let ((entries
+                 (mapcar #'anvil-host--stage-metadata metadata-list)))
+            (if outer-active
+                ;; A destructive callback reentered retirement.  Publish its
+                ;; exact records, but let the outer transaction or timer
+                ;; converge them without recursive deletion.
+                (let ((table (anvil-host--retired-table)))
+                  (dolist (entry entries)
+                    (puthash (car entry) (cdr entry) table)))
+              ;; Entries are globally staged before this watched binding.
+              (let ((anvil-host--cleanup-active t)
+                    (table (anvil-host--retired-table)))
+                (dolist (entry entries)
+                  (puthash (car entry) (cdr entry) table))
+                (dolist (entry entries)
+                  (anvil-host--cleanup-owned-entry entry)))))
+        ;; This unwind encloses staging, the watched binding, hash
+        ;; publication, and every destructive callback.
+        (unwind-protect
+            (unless (anvil-host--retired-empty-p)
+              (anvil-host--ensure-cleanup-timer))
+          (unless outer-active
+            (setcar state nil)))))))
+
+(defun anvil-host--retire-process
+    (process stderr-process custody-buffer &optional stderr-custody-buffer)
+  "Retain and terminate exact PROCESS and its auxiliary resources.
+STDERR-PROCESS is retained beside PROCESS.  CUSTODY-BUFFER and
+STDERR-CUSTODY-BUFFER support callers that own temporary buffers.
+Callback-free staging precedes observable bindings and destructive callbacks."
+  (let* ((primary (and (processp process) process))
+         (auxiliary (and (processp stderr-process) stderr-process))
+         (has-resources
+          (or primary auxiliary
+              (buffer-live-p custody-buffer)
+              (buffer-live-p stderr-custody-buffer))))
+    (when has-resources
+      (anvil-host--retire-resources
+       (list
+        (list :process primary
+              :stderr-process auxiliary
+              :custody-buffer custody-buffer
+              :stderr-custody-buffer stderr-custody-buffer))))))
+
+(defun anvil-host--unique-process-name (prefix)
+  "Return a process name beginning with PREFIX that is unused in this Emacs."
+  (let (name)
+    (while
+        (progn
+          (setq name (symbol-name (gensym prefix)))
+          (get-process name)))
+    name))
+
+(defun anvil-host--process-matches-constructor-p (process name filter)
+  "Return non-nil when PROCESS retains constructor NAME or FILTER identity."
+  (and (processp process)
+       (or
+        (string-match-p
+         (concat "\\`" (regexp-quote name) "\\(?:<[0-9]+>\\)?\\'")
+         (funcall anvil-host--process-name-primitive process))
+        (and filter
+             (eq (funcall anvil-host--process-filter-primitive process)
+                 filter)))))
+
+(defun anvil-host--new-processes-in-name-family
+    (name preexisting &optional filter)
+  "Return new transaction processes for NAME, PREEXISTING, and FILTER."
+  (cl-remove-if-not
+   (lambda (process)
+     (and (not (memq process preexisting))
+          (anvil-host--process-matches-constructor-p
+           process name filter)))
+   (funcall anvil-host--process-list-primitive)))
+
+(defun anvil-host--new-processes-since (snapshot)
+  "Return process identities created after SNAPSHOT."
+  (cl-remove-if
+   (lambda (process) (memq process snapshot))
+   (funcall anvil-host--process-list-primitive)))
+
+(defun anvil-host--transaction-processes
+    (returned name filter constructor-started-p constructor-before
+              constructor-complete-p constructor-invalid-p
+              constructor-processes)
+  "Return exact children created by one constructor transaction.
+A full constructor delta is owned only after nonlocal exit or invalid return;
+a successful valid constructor may create unrelated helper processes."
+  (let ((processes
+         (and constructor-invalid-p
+              (copy-sequence constructor-processes))))
+    (when (and constructor-started-p (not constructor-complete-p))
+      (setq processes
+            (anvil-host--new-processes-since constructor-before)))
+    (dolist (process
+             (anvil-host--new-processes-in-name-family
+              name constructor-before filter))
+      (cl-pushnew process processes :test #'eq))
+    (when (and (processp returned)
+               (not (memq returned constructor-before)))
+      (cl-pushnew returned processes :test #'eq))
+    processes))
+
+(defun anvil-host--candidate-metadata (processes stderr-processes)
+  "Return retirement records for exact PROCESSES and STDERR-PROCESSES."
+  (if (and (= (length processes) 1)
+           (= (length stderr-processes) 1))
+      (list
+       (list :process (car processes)
+             :stderr-process (car stderr-processes)
+             :custody-buffer nil
+             :stderr-custody-buffer nil))
+    (append
+     (mapcar
+      (lambda (process)
+        (list :process process :stderr-process nil
+              :custody-buffer nil :stderr-custody-buffer nil))
+      processes)
+     (mapcar
+      (lambda (process)
+        (list :process nil :stderr-process process
+              :custody-buffer nil :stderr-custody-buffer nil))
+      stderr-processes))))
+
+(defun anvil-host--scrub-code-conversion-work-buffer ()
+  "Erase Emacs's reusable coding scratch buffer after private decoding."
+  (when-let ((buffer (get-buffer " *code-conversion-work*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (set-buffer-modified-p nil)))))
+
+(defun anvil-host--decode-output (bytes coding)
+  "Decode private unibyte BYTES with CODING, then scrub coding scratch."
+  (unwind-protect
+      (decode-coding-string bytes coding)
+    (anvil-host--scrub-code-conversion-work-buffer)))
+
+(defun anvil-host--detach-constructor-processes (processes)
+  "Detach exact constructor PROCESSES from every discoverable output buffer."
+  (dolist (process (cl-delete-duplicates processes :test #'eq))
+    (when (processp process)
+      (funcall anvil-host--set-process-buffer-primitive process nil))))
+
+(defun anvil-host--run (command coding cwd timeout &optional max-output)
+  "Run one non-reentrant host-shell submission transaction.
+MAX-OUTPUT bounds captured bytes per output stream; nil means unbounded."
+  (let* ((resources (anvil-host--resource-state))
+         (outer-inhibit-quit inhibit-quit))
+    (when (aref resources 3)
+      (error "anvil-host: submission already active"))
+    ;; Establish the callback-free guard before restoring caller quit policy.
+    (let ((inhibit-quit t))
+      (aset resources 3 t)
+      (unwind-protect
+          (let ((inhibit-quit outer-inhibit-quit))
+            (anvil-host--run-transaction
+             command coding cwd timeout max-output))
+        (aset resources 3 nil)))))
+
+(defun anvil-host--run-transaction (command coding cwd timeout max-output)
+  "Run shell COMMAND using CODING in CWD, waiting up to TIMEOUT seconds.
+Return (EXIT STDOUT STDERR STDOUT-TOTAL STDERR-TOTAL
+        STDOUT-SOURCE STDERR-SOURCE), where the final values are exact
+captured unibyte source strings.  Signal an error on timeout.
+
+The shell and both output streams use pipes.  This API has no stdin
+channel, so the process-input pipe is closed immediately after spawn.
+A detached descendant may retain stdout or stderr; bounded waiting and
+post-exit draining prevent inherited descriptors from retaining the call.
+
+Output is accumulated in lexical filter state rather than discoverable
+buffers.  Request-specific child bindings are present only during spawn.
+Waits target this shell for return semantics while servicing all process
+output, so Emacs server sockets and helper filters remain responsive.
+Secret-bearing child overrides are shadowed during every yield; hard
+containment therefore belongs to the dedicated-daemon bridge watchdog.
+Nonlocal exits recover every exact post-snapshot constructor child."
+  (anvil-host--resource-state)
+  ;; Public submission is fail-closed across cleanup snapshots.
+  (when (anvil-host--cleanup-active-p)
+    (error "anvil-host: cleanup already active"))
+  (unless (anvil-host--retired-empty-p)
+    (anvil-host--retry-retired-processes))
+  (when (or (anvil-host--cleanup-active-p)
+            (not (anvil-host--retired-empty-p)))
+    (error "anvil-host: retained cleanup has not converged"))
+  ;; Cold table construction still precedes every process constructor.
+  (anvil-host--retired-table)
+  (let* ((shell-process-name
+          (anvil-host--unique-process-name "anvil-host-shell-"))
+         (stderr-process-name
+          (anvil-host--unique-process-name "anvil-host-stderr-"))
+         (child-directory (or cwd default-directory))
+         (child-process-environment
+          (copy-sequence
+           (or anvil-host-child-process-environment process-environment)))
+         (child-exec-path
+          (copy-sequence (or anvil-host-child-exec-path exec-path)))
+         (child-shell
+          (or anvil-host-child-shell-file-name shell-file-name))
+         (child-switch
+          (or anvil-host-child-shell-command-switch shell-command-switch))
+         stdout-chunks
+         stderr-chunks
+         (stdout-captured-bytes 0)
+         (stderr-captured-bytes 0)
+         (stdout-total-bytes 0)
+         (stderr-total-bytes 0)
+         (stdout-filter
+          (lambda (_process chunk)
+            (unwind-protect
+                (let* ((size (string-bytes chunk))
+                       (remaining
+                        (and max-output
+                             (max 0 (- max-output
+                                       stdout-captured-bytes))))
+                       (take (if remaining (min size remaining) size)))
+                  (setq stdout-total-bytes
+                        (+ stdout-total-bytes size))
+                  (when (> take 0)
+                    ;; Binary process coding makes CHUNK unibyte, so string
+                    ;; indices and byte counts are identical here.
+                    (push (if (= take size)
+                              chunk
+                            (substring chunk 0 take))
+                          stdout-chunks)
+                    (setq stdout-captured-bytes
+                          (+ stdout-captured-bytes take))))
+              (anvil-host--scrub-code-conversion-work-buffer))))
+         (stderr-filter
+          (lambda (_process chunk)
+            (unwind-protect
+                (let* ((size (string-bytes chunk))
+                       (remaining
+                        (and max-output
+                             (max 0 (- max-output
+                                       stderr-captured-bytes))))
+                       (take (if remaining (min size remaining) size)))
+                  (setq stderr-total-bytes
+                        (+ stderr-total-bytes size))
+                  (when (> take 0)
+                    (push (if (= take size)
+                              chunk
+                            (substring chunk 0 take))
+                          stderr-chunks)
+                    (setq stderr-captured-bytes
+                          (+ stderr-captured-bytes take))))
+              (anvil-host--scrub-code-conversion-work-buffer))))
+         stderr-constructor-started-p
+         stderr-constructor-before
+         stderr-constructor-processes
+         stderr-constructor-complete-p
+         stderr-constructor-invalid-p
+         main-constructor-started-p
+         main-constructor-before
+         main-constructor-processes
+         main-constructor-complete-p
+         main-constructor-invalid-p
+         proc
+         stderr-proc)
     (unwind-protect
         (progn
-          (setq proc
-                (make-process
-                 :name "anvil-host-shell"
-                 :buffer stdout-buf
-                 :stderr stderr-buf
+          (setq stderr-constructor-before
+                (funcall anvil-host--process-list-primitive)
+                stderr-constructor-started-p t)
+          (setq stderr-proc
+                (funcall anvil-host--make-pipe-process-primitive
+                 :name stderr-process-name
+                 ;; Unlike `make-process', a nil pipe buffer creates a buffer
+                 ;; named after the process.  Use an existing anchor while the
+                 ;; lexical filter is installed, then detach it.
+                 :buffer (current-buffer)
+                 :coding 'binary
                  :noquery t
-                 :connection-type 'pipe
-                 ;; Emacs' default process sentinel writes a
-                 ;; "Process NAME finished" status line into the
-                 ;; process buffer on exit, which then shows up in
-                 ;; the captured stdout.  Silence it so callers can
-                 ;; `string-trim' :stdout and get the actual bytes.
                  :sentinel #'ignore
-                 :command (list shell-file-name shell-command-switch command)))
-          ;; `make-process' wraps the :stderr buffer in a pipe process
-          ;; whose default sentinel ALSO writes a status line.  Nuke
-          ;; that too.
-          (let ((stderr-proc (get-buffer-process stderr-buf)))
-            (when (processp stderr-proc)
-              (set-process-sentinel stderr-proc #'ignore))
+                 :filter stderr-filter))
+          (setq stderr-constructor-processes
+                (anvil-host--new-processes-since
+                 stderr-constructor-before)
+                stderr-constructor-complete-p t)
+          (let ((valid
+                 (and
+                  (processp stderr-proc)
+                  (not (memq stderr-proc stderr-constructor-before))
+                  (eq
+                   (funcall
+                    anvil-host--process-filter-primitive stderr-proc)
+                   stderr-filter))))
+            (setq stderr-constructor-invalid-p (not valid))
+            (anvil-host--detach-constructor-processes
+             (if valid
+                 (cl-remove-if-not
+                  (lambda (candidate)
+                    (anvil-host--process-matches-constructor-p
+                     candidate stderr-process-name stderr-filter))
+                  stderr-constructor-processes)
+               stderr-constructor-processes))
+            (unless valid
+              (if (memq stderr-proc stderr-constructor-before)
+                  (error
+                   "anvil-host: pipe constructor returned a preexisting process")
+                (error
+                 "anvil-host: pipe constructor returned an invalid process"))))
+          ;; Dedicated backends may supply immutable child bindings.  Their
+          ;; dynamic scope ends immediately after process creation.
+          (let ((default-directory child-directory)
+                (process-environment child-process-environment)
+                (exec-path child-exec-path)
+                (shell-file-name child-shell)
+                (shell-command-switch child-switch))
+            (setq main-constructor-before
+                  (funcall anvil-host--process-list-primitive)
+                  main-constructor-started-p t)
+            (setq proc
+                  (funcall anvil-host--make-process-primitive
+                   :name shell-process-name
+                   :buffer nil
+                   :stderr stderr-proc
+                   :filter stdout-filter
+                   :coding '(binary . binary)
+                   :noquery t
+                   :connection-type 'pipe
+                   :sentinel #'ignore
+                   :command (list child-shell child-switch command)))
+            (setq main-constructor-processes
+                  (anvil-host--new-processes-since
+                   main-constructor-before)
+                  main-constructor-complete-p t))
+          (let ((valid
+                 (and
+                  (processp proc)
+                  (not (memq proc main-constructor-before))
+                  (eq
+                   (funcall anvil-host--process-filter-primitive proc)
+                   stdout-filter))))
+            (setq main-constructor-invalid-p (not valid))
+            (anvil-host--detach-constructor-processes
+             (if valid
+                 (cl-remove-if-not
+                  (lambda (candidate)
+                    (anvil-host--process-matches-constructor-p
+                     candidate shell-process-name stdout-filter))
+                  main-constructor-processes)
+               main-constructor-processes))
+            (unless valid
+              (cond
+               ((not (processp proc))
+                (error "anvil-host: shell spawn returned no process"))
+               ((memq proc main-constructor-before)
+                (error
+                 "anvil-host: shell constructor returned a preexisting process"))
+               (t
+                (error
+                 "anvil-host: shell constructor returned an invalid process")))))
+          ;; Commands that read non-TTY stdin must see EOF instead of retaining
+          ;; the root event loop until the tool timeout.
+          (condition-case error
+              (funcall anvil-host--process-send-eof-primitive proc)
+            (error
+             (when (process-live-p proc)
+               (signal (car error) (cdr error)))))
+          ;; Shadow secret-bearing outer advice bindings during every yield.
+          ;; Accept foreign process output as well: Emacs server sockets and
+          ;; helper filters must remain responsive while the child is running.
+          (let ((anvil-host-child-process-environment nil)
+                (anvil-host-child-exec-path nil)
+                (anvil-host-child-shell-file-name nil)
+                (anvil-host-child-shell-command-switch nil))
             (let ((deadline (+ (float-time) timeout)))
               (while (and (process-live-p proc)
                           (< (float-time) deadline))
-                (accept-process-output proc 0.1))
+                (funcall anvil-host--accept-process-output-primitive proc 0.05 nil nil)
+                (when (and (processp stderr-proc)
+                           (process-live-p stderr-proc))
+                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0 nil nil)))
               (when (process-live-p proc)
-                (delete-process proc)
-                (when (and stderr-proc (process-live-p stderr-proc))
-                  (delete-process stderr-proc))
                 (error "anvil-host: shell timeout after %ss: %s"
                        timeout command)))
-            ;; Brief bounded drain for late stderr after proc exit.
-            ;; The stderr pipe-proc is independent: when proc dies the
-            ;; kernel pipe may still hold bytes the proc just wrote,
-            ;; and the pipe-proc only goes inactive once we read them.
-            ;; Bound the drain so that a disowned descendant which
-            ;; inherits fd 2 (e.g. `setsid --fork') cannot extend the
-            ;; call past `anvil-host--stderr-drain-budget-sec'.
-            (when (and stderr-proc (process-live-p stderr-proc))
+            ;; A detached descendant may retain stderr; drain only briefly.
+            (when (and (processp stderr-proc)
+                       (process-live-p stderr-proc))
               (let ((drain-deadline
-                     (+ (float-time)
-                        anvil-host--stderr-drain-budget-sec)))
+                     (+ (float-time) anvil-host--stderr-drain-budget-sec)))
                 (while (and (process-live-p stderr-proc)
                             (< (float-time) drain-deadline))
-                  (accept-process-output stderr-proc 0.02)))))
-          (let ((exit (process-exit-status proc))
-                (out  (with-current-buffer stdout-buf (buffer-string)))
-                (err  (with-current-buffer stderr-buf (buffer-string))))
-            (list exit out err)))
-      (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
-      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+                  (funcall anvil-host--accept-process-output-primitive stderr-proc 0.02 nil nil)
+                  (funcall anvil-host--accept-process-output-primitive proc 0 nil nil))))
+            (funcall anvil-host--accept-process-output-primitive proc 0.01 nil nil))
+          (let ((stdout-source
+                 (apply #'concat (nreverse stdout-chunks)))
+                (stderr-source
+                 (apply #'concat (nreverse stderr-chunks))))
+            (list
+             (process-exit-status proc)
+             (anvil-host--decode-output stdout-source coding)
+             (anvil-host--decode-output stderr-source coding)
+             stdout-total-bytes
+             stderr-total-bytes
+             stdout-source
+             stderr-source)))
+      ;; Always derive custody from the pre-call identity snapshot.  A
+      ;; constructor may rewrite names, detach buffers, create suffix
+      ;; collisions, or return a preexisting peer instead of its new child.
+      (let ((inhibit-quit t)
+            (anvil-host-child-process-environment nil)
+            (anvil-host-child-exec-path nil)
+            (anvil-host-child-shell-file-name nil)
+            (anvil-host-child-shell-command-switch nil))
+        (let* ((processes
+                (anvil-host--transaction-processes
+                 proc shell-process-name stdout-filter
+                 main-constructor-started-p main-constructor-before
+                 main-constructor-complete-p
+                 main-constructor-invalid-p main-constructor-processes))
+               (stderr-processes
+                (anvil-host--transaction-processes
+                 stderr-proc stderr-process-name stderr-filter
+                 stderr-constructor-started-p stderr-constructor-before
+                 stderr-constructor-complete-p
+                 stderr-constructor-invalid-p
+                 stderr-constructor-processes))
+               (metadata
+                (anvil-host--candidate-metadata
+                 processes stderr-processes)))
+          (anvil-host--retire-resources metadata))))))
 
 ;;;; --- Layer 1: anvil-shell -----------------------------------------------
 
@@ -169,32 +1006,63 @@ OPTS is a plist:
   :max-output bytes per stream (default 16384, nil = no limit)
   :coding     coding-system for I/O (default: cp932-dos on Windows, utf-8 elsewhere)
   :cwd        working directory
+  :include-source-bytes
+              include private captured unibyte source strings for callers
+              that must preserve source-stream byte accounting
 
 Returns:
-  (:exit N :stdout STR :stderr STR :command STR :coding SYM
-   :truncated BOOL)
+  (:exit N :stdout STR :stderr STR :stdout-captured STR
+   :stderr-captured STR :stdout-total-bytes N
+   :stderr-total-bytes N :command STR :coding SYM :truncated BOOL
+   [:stdout-captured-source-bytes UNIBYTE-STR
+    :stderr-captured-source-bytes UNIBYTE-STR])
 
-Note: this is synchronous from the caller's perspective but uses
-`make-process' under the hood, so the Emacs server can still service
-other connections via accept-process-output yields."
+The public stdout/stderr fields carry presentation truncation sentinels.
+The captured fields are undecorated, bounded decoded text.  When requested,
+the source fields are exact bounded source-stream bytes and are the only
+fields suitable for source-encoding byte accounting.
+
+Note: this is synchronous and fail-closed against overlapping or reentrant
+host submissions.  Its process waits keep ordinary timers responsive, but
+Emacs may dispatch a ready foreign process filter; use a dedicated daemon plus
+bridge watchdog for hard containment from arbitrary callback hangs."
   (let* ((timeout    (or (plist-get opts :timeout) anvil-host--default-timeout))
          (max-output (if (plist-member opts :max-output)
                          (plist-get opts :max-output)
                        anvil-host--default-max-output))
          (coding     (or (plist-get opts :coding) (anvil-host--default-coding)))
          (cwd        (plist-get opts :cwd))
-         (result     (anvil-host--run command coding cwd timeout))
-         (exit       (nth 0 result))
-         (stdout     (nth 1 result))
-         (stderr     (nth 2 result))
-         (truncated  (or (and max-output (> (length stdout) max-output))
-                         (and max-output (> (length stderr) max-output)))))
-    (list :exit exit
-          :stdout (if max-output (anvil-host--truncate stdout max-output) stdout)
-          :stderr (if max-output (anvil-host--truncate stderr max-output) stderr)
-          :command command
-          :coding coding
-          :truncated (and truncated t))))
+         (include-source-bytes
+          (plist-get opts :include-source-bytes)))
+    (unless (or (null max-output)
+                (and (integerp max-output) (>= max-output 0)))
+      (error "anvil-host: :max-output must be a nonnegative integer or nil"))
+    (let* ((result
+            (anvil-host--run command coding cwd timeout max-output))
+           (exit (nth 0 result))
+           (stdout (nth 1 result))
+           (stderr (nth 2 result))
+           (stdout-total (or (nth 3 result) (string-bytes stdout)))
+           (stderr-total (or (nth 4 result) (string-bytes stderr)))
+           (truncated
+            (or (and max-output (> stdout-total max-output))
+                (and max-output (> stderr-total max-output)))))
+      (append
+       (list :exit exit
+             :stdout (anvil-host--truncate
+                      stdout max-output stdout-total)
+             :stderr (anvil-host--truncate
+                      stderr max-output stderr-total)
+             :stdout-captured stdout
+             :stderr-captured stderr
+             :stdout-total-bytes stdout-total
+             :stderr-total-bytes stderr-total
+             :command command
+             :coding coding
+             :truncated (and truncated t))
+       (when include-source-bytes
+         (list :stdout-captured-source-bytes (nth 5 result)
+               :stderr-captured-source-bytes (nth 6 result)))))))
 
 (defun anvil-shell-by-os (spec &optional opts)
   "Run an OS-dispatched shell command. SPEC is a plist:

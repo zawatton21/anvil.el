@@ -263,7 +263,7 @@ Keep this list tight (~15); items here dominate every system prompt.")
             "org-index-rebuild"
             "elisp-byte-compile-file" "elisp-ert-run"
             "emacs-eval" "emacs-eval-async" "emacs-eval-result"
-            "emacs-eval-jobs"
+            "emacs-eval-jobs" "emacs-eval-cancel"
             "buffer-save"
             "bisect-test" "bisect-cancel" "bisect-last-result"
             "git-commit-message" "git-pr-body"

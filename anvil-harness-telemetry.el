@@ -626,9 +626,9 @@ Returns =(:rows ROWS)=."
 (defun anvil-harness-telemetry--dispatcher-hook (err &optional tool-name source)
   "Hook function added to `anvil-server-tool-error-hook'.
 
-ERR is the raw error condition cell, TOOL-NAME is the active tool
-id (nil when the macro fires without a dispatcher tool name in
-scope), SOURCE is the call-site hint documented on
+ERR is a newly constructed condition cell containing only an allowlisted
+symbol and bounded text.  TOOL-NAME is the fixed-grammar active tool id or
+`<oversized-tool-id>'.  SOURCE is the call-site hint documented on
 `anvil-harness-telemetry--classify'."
   (anvil-harness-telemetry-record-from-error
    err

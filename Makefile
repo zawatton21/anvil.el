@@ -8,7 +8,8 @@ export TEMP   ?= /tmp
 export TMP    ?= /tmp
 
 test:
-	eask test ert tests/anvil-test.el
+	eask emacs --batch -Q -L . -L tests -l ert -l tests/anvil-test.el \
+		-f ert-run-tests-batch-and-exit
 
 test-all:
 	emacs --batch --eval '(setq load-prefer-newer t)' -L . -l anvil-dev -f anvil-dev-test-run-all-batch
