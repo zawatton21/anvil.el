@@ -63,9 +63,12 @@
                 ((symbol-function 'delete-process)
                  (lambda (p) (setq deleted p))))
         (catch 'abort
-          (anvil-eval--server-execute-cleanup-advice
-           (lambda (&rest _) (throw 'abort nil))
-           proc nil nil nil t nil nil)))   ; dontkill = t
+          (let ((args (if (>= emacs-major-version 30)
+                          (list proc nil nil nil nil t nil)
+                        (list proc nil nil nil t nil nil))))
+            (apply #'anvil-eval--server-execute-cleanup-advice
+                   (lambda (&rest _) (throw 'abort nil))
+                   args))))
       (should-not sent)
       (should-not deleted))))
 

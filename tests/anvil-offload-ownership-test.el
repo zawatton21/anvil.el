@@ -1189,6 +1189,10 @@
              (anvil-offload-ownership-test--idle-process
               "anvil-ownership-abort-cleanup")))
            (anvil-offload--pool (vector proc))
+           ;; `cl-letf' deliberately replaces the subr below with a throwing
+           ;; closure.  Emacs 30's native subr trampoline compilation invokes
+           ;; that closure before the surrounding catch is active.
+           (native-comp-enable-subr-trampolines nil)
            (real-puthash (symbol-function 'puthash))
            (process-key-calls 0)
            (pending-key-calls 0)
