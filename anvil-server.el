@@ -396,6 +396,7 @@ empty), so the cache round-trips purely through string ops + `load'
           (make-directory dir t))
         (write-region
          (concat
+          ";;; -*- lexical-binding: t; no-byte-compile: t -*-\n"
           "(setq anvil-server--schema-cache-file-data '"
           (anvil-server--prin1-to-string
            (list :version anvil-server--schema-cache-version
