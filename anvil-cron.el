@@ -184,7 +184,7 @@ ENABLED defaults to t."
 
 (defun anvil-cron--record-result (id status result start-time)
   "Record execution result for task ID."
-  (when-let ((task (gethash id anvil-cron--tasks)))
+  (when-let* ((task (gethash id anvil-cron--tasks)))
     (let ((elapsed (- (float-time) start-time)))
       (plist-put task :last-status status)
       (plist-put task :last-result result)
@@ -212,7 +212,7 @@ ENABLED defaults to t."
   (let ((task (gethash id anvil-cron--tasks)))
     (when (and task (plist-get task :enabled))
       ;; Cancel existing timer
-      (when-let ((old (plist-get task :timer)))
+      (when-let* ((old (plist-get task :timer)))
         (when (timerp old) (cancel-timer old)))
       (let* ((interval (plist-get task :interval))
              (time-str (plist-get task :time))
@@ -227,8 +227,8 @@ ENABLED defaults to t."
 
 (defun anvil-cron--stop-task (id)
   "Stop the timer for task ID."
-  (when-let ((task (gethash id anvil-cron--tasks)))
-    (when-let ((timer (plist-get task :timer)))
+  (when-let* ((task (gethash id anvil-cron--tasks)))
+    (when-let* ((timer (plist-get task :timer)))
       (when (timerp timer) (cancel-timer timer)))
     (plist-put task :timer nil)))
 

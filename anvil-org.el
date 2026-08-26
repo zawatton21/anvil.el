@@ -335,7 +335,7 @@ Two execution paths:
 BODY can access FILE-PATH, OPERATION, and RESPONSE-ALIST as
 variables."
   (declare (indent 3) (debug (form form form body)))
-  `(if-let ((viable (anvil--buffer-first-viable-p ,file-path)))
+  `(if-let* ((viable (anvil--buffer-first-viable-p ,file-path)))
        ;; Buffer-first path
        (let ((buf (car viable))
              (was-modified (cdr viable)))

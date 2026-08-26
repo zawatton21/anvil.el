@@ -573,7 +573,7 @@ stability stable) is assumed."
 
 (defun anvil-manifest--attention-row-score (query row query-embedding)
   "Return (SCORE . BACKEND) for QUERY against summary ROW."
-  (if-let ((sim (and query-embedding
+  (if-let* ((sim (and query-embedding
                      (anvil-manifest--cosine
                       query-embedding
                       (plist-get row :embedding)))))
