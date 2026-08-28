@@ -45,12 +45,20 @@
   (let* ((body "{\"x\":\"ąあ\"}")
          (frame (anvil-server-mcp-frame-encode body))
          ;; 8 ASCII bytes ({"x":"" + "}) + 2 (ą) + 3 (あ) = 13 bytes
-         (expected-byte-len (length (encode-coding-string body 'utf-8 t))))
+         (expected-byte-len (string-bytes body)))
+    (should-not (multibyte-string-p frame))
     (should (string-match
              "\\`Content-Length: \\([0-9]+\\)\r\n\r\n"
              frame))
     (should (= expected-byte-len
                (string-to-number (match-string 1 frame))))))
+
+(ert-deftest anvil-mcp-framing-test-utf8-helper-cjk-byte-count ()
+  "The runtime-specific UTF-8 helper returns three bytes for one CJK char."
+  (let ((bytes (anvil-server--string-to-utf8-bytes "あ")))
+    (should-not (multibyte-string-p bytes))
+    (should (= 3 (length bytes)))
+    (should (equal '(227 129 130) (append bytes nil)))))
 
 (ert-deftest anvil-mcp-framing-test-encode-rejects-non-string ()
   "Encode signals `wrong-type-argument' for non-string input."
@@ -64,7 +72,10 @@
 (ert-deftest anvil-mcp-framing-test-header-parse-basic ()
   "Parse Content-Length integer from header block."
   (should (= 42 (anvil-server-mcp-parse-content-length-header
-                 "Content-Length: 42"))))
+                 "Content-Length: 42")))
+  (should (= 42 (anvil-server-mcp-parse-content-length-header
+                 (anvil-server--string-to-utf8-bytes
+                  "Content-Length: 42")))))
 
 (ert-deftest anvil-mcp-framing-test-header-parse-case-insensitive ()
   "Header name match is case-insensitive (RFC 7230)."
@@ -92,7 +103,7 @@
          (parsed (anvil-server-mcp-frame-parse-string frame)))
     (should (plist-get parsed :body))
     (should (equal body (plist-get parsed :body)))
-    (should (= (length (encode-coding-string frame 'utf-8 t))
+    (should (= (string-bytes frame)
                (plist-get parsed :consumed)))))
 
 (ert-deftest anvil-mcp-framing-test-frame-parse-multiline-body ()
@@ -108,6 +119,16 @@
          (frame (anvil-server-mcp-frame-encode body))
          (parsed (anvil-server-mcp-frame-parse-string frame)))
     (should (equal body (plist-get parsed :body)))))
+
+(ert-deftest anvil-mcp-framing-test-frame-parse-utf8-byte-boundary ()
+  "A byte Content-Length stops before trailing data after a CJK body."
+  (let* ((body "{\"msg\":\"あ\"}")
+         (header (format "Content-Length: %d\r\n\r\n" (string-bytes body)))
+         (frame (concat header body "TAIL"))
+         (parsed (anvil-server-mcp-frame-parse-string frame)))
+    (should (equal body (plist-get parsed :body)))
+    (should (= (+ (string-bytes header) (string-bytes body))
+               (plist-get parsed :consumed)))))
 
 (ert-deftest anvil-mcp-framing-test-frame-parse-incomplete-header ()
   "Returns nil when CRLFCRLF separator not yet seen."
@@ -136,7 +157,7 @@
          (combined (concat frame1 frame2))
          (parsed (anvil-server-mcp-frame-parse-string combined)))
     (should (equal body (plist-get parsed :body)))
-    (should (= (length (encode-coding-string frame1 'utf-8 t))
+    (should (= (string-bytes frame1)
                (plist-get parsed :consumed)))
     ;; The remainder is exactly frame2.
     (let* ((rest (substring combined (plist-get parsed :consumed)))

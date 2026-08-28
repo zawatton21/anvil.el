@@ -674,7 +674,8 @@ Pipeline order under test:
      :tail-lines 5
      :max-lines 3
      :on-empty "EMPTY")
-    (let* ((raw (concat "\x1b[31mFOO line\x1b[0m\n"
+    (let* ((esc (char-to-string 27))
+           (raw (concat esc "[31mFOO line" esc "[0m\n"
                         "noise line drop\n"
                         "keep one\n"
                         "this is a very long keep line\n"
@@ -684,7 +685,7 @@ Pipeline order under test:
            (out (anvil-shell-filter-apply 'pipeline-order raw))
            (lines (split-string out "\n")))
       ;; strip-ansi + replace ran and were observable in the output.
-      (should-not (string-match-p "\x1b" out)) ; ANSI stripped
+      (should-not (string-match-p (regexp-quote esc) out)) ; ANSI stripped
       (should-not (string-match-p "FOO" out))  ; replaced FOO → FUU
       (should-not (string-match-p "noise" out)) ; strip-lines dropped it
       ;; truncate to 12 chars produced at least one trimmed line.
@@ -700,8 +701,9 @@ Pipeline order under test:
   (skip-unless (anvil-shell-filter-test--supported-p 'register))
   (anvil-shell-filter-test--with-clean-registry
     (anvil-shell-filter-register 'ansi-only :strip-ansi t)
-    (let ((out (anvil-shell-filter-apply
-                'ansi-only "\x1b[1;31merror:\x1b[0m bad")))
+    (let* ((esc (char-to-string 27))
+           (raw (concat esc "[1;31merror:" esc "[0m bad"))
+           (out (anvil-shell-filter-apply 'ansi-only raw)))
       (should (equal out "error: bad")))))
 
 (ert-deftest anvil-shell-filter-test/register-replace-multiple ()

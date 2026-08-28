@@ -151,8 +151,13 @@ nil for production (silent).")
 
 (defun anvil-runtime-shell--frame (body)
   "Return BODY as a Content-Length MCP frame."
-  (let ((n (if (fboundp 'string-bytes) (string-bytes body) (length body))))
-    (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
+  (let* ((bytes (if (multibyte-string-p body)
+                    (if (fboundp 'nelisp--write-stderr-line)
+                        (string-as-unibyte body)
+                      (encode-coding-string body 'utf-8 t))
+                  body))
+         (n (length bytes)))
+    (concat "Content-Length: " (number-to-string n) "\r\n\r\n" bytes)))
 
 (defun anvil-runtime-shell--stdout (s)
   "Write S to stdout using the standalone byte writer when present."
@@ -165,6 +170,8 @@ nil for production (silent).")
   (let ((chunk (and (fboundp 'read-stdin-bytes)
                     (read-stdin-bytes 4096))))
     (when (and (stringp chunk) (> (length chunk) 0))
+      (when (multibyte-string-p chunk)
+        (setq chunk (string-as-unibyte chunk)))
       (setq anvil-runtime-shell--fast-stdin-buffer
             (concat anvil-runtime-shell--fast-stdin-buffer chunk))
       t)))
@@ -436,6 +443,21 @@ nil for production (silent).")
   (load stdio-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] stdio-el done"))
+  ;; Measured 2026-08-28 on NeLisp v1.1.0+1: `read-stdin-bytes'
+  ;; returned "日本語" as multibyte with length 3 and string-bytes 9.
+  ;; Normalize every refill so the stdio reader's length and substring
+  ;; arithmetic stays in MCP wire bytes.
+  (defun emacs-stdio--refill ()
+    "Read stdin into `emacs-stdio--buffer' as unibyte wire bytes."
+    (let ((chunk (read-stdin-bytes emacs-stdio--chunk-size)))
+      (cond
+       ((null chunk) nil)
+       ((and (stringp chunk) (= (length chunk) 0)) nil)
+       (t
+        (when (multibyte-string-p chunk)
+          (setq chunk (string-as-unibyte chunk)))
+        (setq emacs-stdio--buffer (concat emacs-stdio--buffer chunk))
+        t))))
   (when (boundp 'emacs-stdio--buffer)
     (setq emacs-stdio--buffer
           (concat anvil-runtime-shell--fast-stdin-buffer
@@ -553,13 +575,9 @@ case-insensitively, returns the integer value or nil."
   (defun anvil-server-mcp-frame-encode (body)
     "Phase B5 Stage 1b override — emit `Content-Length: N\r\n\r\nBODY'.
 N is the UTF-8 byte length of BODY."
-    (let* ((bytes (if (fboundp 'encode-coding-string)
-                      (encode-coding-string body 'utf-8 t)
-                    body))
-           (n (if (fboundp 'string-bytes)
-                  (string-bytes bytes)
-                (length bytes))))
-      (concat "Content-Length: " (number-to-string n) "\r\n\r\n" body)))
+    (let* ((bytes (anvil-server--string-to-utf8-bytes body))
+           (n (length bytes)))
+      (concat "Content-Length: " (number-to-string n) "\r\n\r\n" bytes)))
 
   ;; Override the framed-with-prefix reader entirely.  The original uses
   ;; `replace-regexp-in-string' for trailing-CR strip, which is a no-op
