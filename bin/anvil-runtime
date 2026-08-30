@@ -140,9 +140,21 @@ case "$1" in
             # driver can read them before `emacs-init.el' polyfills
             # `getenv'.  (Standalone NeLisp's `getenv' is nil until
             # `emacs-callproc.el' loads — chicken-and-egg with init load.)
-            case "${ANVIL_RUNTIME_FAST_HANDSHAKE:-}" in
-                1) anvil_fast_handshake_elisp=t ;;
-                *) anvil_fast_handshake_elisp=nil ;;
+            # Fast handshake is ON by default as of NeLisp v1.1.1.  It was
+            # gated off because every fast-path run died after 2-20 s; the
+            # cause was fourteen precise-root defects in the standalone GC,
+            # fixed there, and with a NeLisp carrying those fixes the path
+            # returns all 5,208 bytes and exits 0 -- 3/3 with address
+            # randomisation disabled and 3/3 with it on.  Without it every
+            # `mcp serve' pays the ~100 s cold start before answering
+            # `initialize'.
+            #
+            # It DOES depend on the runtime underneath: an older NeLisp will
+            # crash on this path.  `ANVIL_RUNTIME_FAST_HANDSHAKE=0' turns it
+            # back off for exactly that case.
+            case "${ANVIL_RUNTIME_FAST_HANDSHAKE:-1}" in
+                0|no|off|false) anvil_fast_handshake_elisp=nil ;;
+                *) anvil_fast_handshake_elisp=t ;;
             esac
             BOOTSTRAP_DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
             mkdir -p "$BOOTSTRAP_DIR"

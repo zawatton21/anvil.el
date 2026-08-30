@@ -640,15 +640,15 @@ Otherwise return a short string describing the problem."
   ;; The re-enable criterion this comment used to state -- repeated plain
   ;; runs exiting 0 with ASLR both enabled and disabled -- is met against a
   ;; NeLisp built at or after that fix: 3/3 with `setarch -R' and 3/3 plain,
-  ;; each returning the full 5,208 bytes.  It is NOT met against an older
-  ;; binary, which is why this stays opt-in: turning it on is safe only
-  ;; if the deployed `target/nelisp' carries the GC fix.
+  ;; each returning the full 5,208 bytes.  `bin/anvil-runtime' now defaults
+  ;; the gate ON for that reason, and writes the decision into the bootstrap
+  ;; it generates.
   ;;
-  ;; To turn it on, set `anvil-runtime-bootstrap-fast-handshake-enabled' in
-  ;; the bootstrap `bin/anvil-runtime' generates.  ANVIL_RUNTIME_FAST_
-  ;; HANDSHAKE=1 does NOT work under standalone NeLisp: the `defvar' above
-  ;; runs before `emacs-callproc.el' provides `getenv', so the env channel
-  ;; is host-Emacs only.
+  ;; It is NOT met against an older binary, which is what
+  ;; `ANVIL_RUNTIME_FAST_HANDSHAKE=0' exists for.  Note the env var reaches
+  ;; the runtime only through that generated bootstrap: reading it here would
+  ;; not work, because this `defvar' runs before `emacs-callproc.el' provides
+  ;; `getenv', so the env channel is host-Emacs only.
   (when (and anvil-runtime-shell--fast-handshake-enabled
              (not anvil-server--debug-trace)
              (fboundp 'read-stdin-bytes)
