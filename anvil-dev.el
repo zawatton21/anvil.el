@@ -31,6 +31,16 @@
 ;;       with standard headers, enable/disable stubs, and a passing
 ;;       smoke test so a new module compiles + runs out of the box.
 ;;
+;;   - `anvil-codex-efficiency-check'
+;;     — inspect a Codex setup for the token-saving baseline:
+;;       Serena / Context7 MCP server entries, required executables,
+;;       local Codex skills, and the project-side Serena config /
+;;       recovery reference note.
+;;
+;;   - `anvil-claude-limits-analyze'
+;;     — turn Claude Code's "what's contributing to your limits usage?"
+;;       text into metrics + Anvil-focused mitigation actions.
+;;
 ;; Enable via `(add-to-list 'anvil-optional-modules 'dev)' in init.
 
 ;;; Code:
@@ -65,6 +75,15 @@ and the core aggregator `anvil-test.el'."
 
 (defconst anvil-dev--server-id "emacs-eval"
   "Server ID for the dev-* MCP tools.")
+
+(defconst anvil-dev--codex-efficiency-required-skills
+  '("anvil-memory-worklog"
+    "notes-org-editing"
+    "notes-development"
+    "nelisp-development"
+    "web-article-archive"
+    "notes-report-pipeline")
+  "Codex skill directories expected by the Notes efficiency setup.")
 
 ;;;; --- internal ------------------------------------------------------------
 
@@ -160,6 +179,238 @@ MCP Parameters: none.  Returns a printed plist comparing the
 installed anvil clone's git HEAD with `anvil-dev-source-path'."
   (anvil-server-with-error-handling
    (format "%S" (anvil-self-sync-check))))
+
+;;;; --- codex efficiency check ---------------------------------------------
+
+(defun anvil-dev--codex-home ()
+  "Return the effective Codex home directory."
+  (or (getenv "CODEX_HOME")
+      (expand-file-name "~/.codex")))
+
+(defun anvil-dev--read-file-string (file)
+  "Return FILE contents as a string, or nil when unreadable."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (buffer-string))))
+
+(defun anvil-dev--toml-has-section-p (content section)
+  "Return non-nil when TOML CONTENT has a top-level SECTION table."
+  (and content
+       (string-match-p
+        (format "^\\[mcp_servers\\.%s\\][ \t]*$"
+                (regexp-quote section))
+        content)))
+
+(defun anvil-dev--skill-present-p (skills-dir skill)
+  "Return non-nil when SKILLS-DIR contains SKILL with a readable SKILL.md."
+  (file-readable-p (expand-file-name (format "%s/SKILL.md" skill)
+                                     skills-dir)))
+
+(defun anvil-dev--plist-bool-alist (items predicate)
+  "Return an alist mapping ITEMS to t/nil according to PREDICATE."
+  (mapcar (lambda (item) (cons item (and (funcall predicate item) t)))
+          items))
+
+;;;###autoload
+(defun anvil-codex-efficiency-check (&optional codex-home project-root)
+  "Inspect the local Codex token-saving setup.
+
+CODEX-HOME defaults to `$CODEX_HOME' or `~/.codex'.  PROJECT-ROOT
+defaults to `default-directory'.  The check is read-only and
+validates the baseline used by this workspace:
+  - `~/.codex/config.toml' is readable;
+  - `emacs-eval', `serena', and `context7' MCP server sections exist;
+  - `uvx' and `npx' executables resolve;
+  - required local Codex skill directories contain `SKILL.md';
+  - project-side `.serena/project.yml' and the recovery reference
+    note exist.
+
+Returns a plist with :ok and :warnings so callers can fail fast
+without reading every config file by hand."
+  (let* ((home (file-name-as-directory
+                (expand-file-name (or codex-home (anvil-dev--codex-home)))))
+         (root (file-name-as-directory
+                (expand-file-name (or project-root default-directory))))
+         (config-file (expand-file-name "config.toml" home))
+         (config-content (anvil-dev--read-file-string config-file))
+         (skills-dir (expand-file-name "skills" home))
+         (required-mcp '("emacs-eval" "serena" "context7"))
+         (mcp-present
+          (anvil-dev--plist-bool-alist
+           required-mcp
+           (lambda (server)
+             (anvil-dev--toml-has-section-p config-content server))))
+         (executables
+          (list (cons "uvx" (executable-find "uvx"))
+                (cons "npx" (executable-find "npx"))))
+         (skills-present
+          (anvil-dev--plist-bool-alist
+           anvil-dev--codex-efficiency-required-skills
+           (lambda (skill)
+             (anvil-dev--skill-present-p skills-dir skill))))
+         (serena-project (expand-file-name ".serena/project.yml" root))
+         (reference-file
+          (expand-file-name ".claude/reference/codex-efficiency-setup.md"
+                            root))
+         warnings)
+    (unless config-content
+      (push (format "Codex config is not readable: %s" config-file)
+            warnings))
+    (dolist (server mcp-present)
+      (unless (cdr server)
+        (push (format "Missing MCP server section: %s" (car server))
+              warnings)))
+    (dolist (exe executables)
+      (unless (cdr exe)
+        (push (format "Missing executable on exec-path: %s" (car exe))
+              warnings)))
+    (dolist (skill skills-present)
+      (unless (cdr skill)
+        (push (format "Missing Codex skill: %s" (car skill))
+              warnings)))
+    (unless (file-readable-p serena-project)
+      (push (format "Missing Serena project config: %s" serena-project)
+            warnings))
+    (unless (file-readable-p reference-file)
+      (push (format "Missing Codex recovery reference: %s" reference-file)
+            warnings))
+    (list :ok (null warnings)
+          :codex-home home
+          :project-root root
+          :config-file config-file
+          :mcp-servers mcp-present
+          :executables executables
+          :skills-dir skills-dir
+          :skills skills-present
+          :serena-project serena-project
+          :reference-file reference-file
+          :warnings (nreverse warnings))))
+
+(defun anvil-dev--tool-codex-efficiency-check (&optional codex-home project-root)
+  "MCP wrapper for `anvil-codex-efficiency-check'.
+
+MCP Parameters:
+  codex-home   - Optional Codex home directory.  Empty string uses
+                 `$CODEX_HOME' or `~/.codex'.
+  project-root - Optional project root containing `.serena/' and
+                 `.claude/reference/'.  Empty string uses
+                 `default-directory'."
+  (anvil-server-with-error-handling
+   (let ((home (and codex-home (stringp codex-home)
+                    (not (string-empty-p codex-home))
+                    codex-home))
+         (root (and project-root (stringp project-root)
+                    (not (string-empty-p project-root))
+                    project-root)))
+     (format "%S" (anvil-codex-efficiency-check home root)))))
+
+;;;; --- Claude limits report analysis --------------------------------------
+
+(defun anvil-dev--limits-percent-after (report marker)
+  "Return the first integer percent before MARKER in REPORT.
+Matches lines like \"91% of your usage was at >150k context\"."
+  (when (and (stringp report) (stringp marker)
+             (string-match
+              (format "\\([0-9]+\\)%%[^\n]*%s" (regexp-quote marker))
+              report))
+    (string-to-number (match-string 1 report))))
+
+(defun anvil-dev--limits-table-percent (report label)
+  "Return integer percent from a simple LABEL table row in REPORT.
+Matches lines like \"emacs-eval                     73%\"."
+  (when (and (stringp report) (stringp label))
+    (catch 'found
+      (dolist (line (split-string report "\n"))
+        (let ((trimmed (string-trim-left line)))
+          (when (and (string-prefix-p label trimmed)
+                     (or (= (length trimmed) (length label))
+                         (member (aref trimmed (length label))
+                                 '(?\s ?\t))))
+            (when (string-match "\\([0-9]+\\)%" trimmed)
+              (throw 'found (string-to-number (match-string 1 trimmed))))))))))
+
+(defun anvil-dev--limits-metric (report key)
+  "Extract metric KEY from Claude limits REPORT."
+  (pcase key
+    ('high-context
+     (anvil-dev--limits-percent-after report ">150k context"))
+    ('subagent-heavy
+     (anvil-dev--limits-percent-after report "subagent-heavy sessions"))
+    ('long-sessions
+     (anvil-dev--limits-percent-after report "sessions active for 8+ hours"))
+    ('loop
+     (or (anvil-dev--limits-percent-after report "came from /loop")
+         (anvil-dev--limits-table-percent report "/loop")))
+    ('emacs-eval
+     (or (anvil-dev--limits-percent-after report "mcp server \"emacs-eval\"")
+         (anvil-dev--limits-table-percent report "emacs-eval")))))
+
+(defun anvil-dev--limits-severity (percent)
+  "Return severity symbol for PERCENT."
+  (cond
+   ((null percent) 'unknown)
+   ((>= percent 70) 'critical)
+   ((>= percent 40) 'high)
+   ((>= percent 20) 'medium)
+   ((> percent 0) 'low)
+   (t 'none)))
+
+(defun anvil-dev--limits-action (metric percent)
+  "Return an action plist for METRIC at PERCENT."
+  (let ((severity (anvil-dev--limits-severity percent)))
+    (pcase metric
+      ('high-context
+       (list :metric metric :percent percent :severity severity
+             :action "Trigger /compact mid-task and /clear when switching tasks; prefer session-context packs over carrying raw history."))
+      ('subagent-heavy
+       (list :metric metric :percent percent :severity severity
+             :action "Gate subagent spawning; use Serena/context tools first and route simple exploration to cheaper or local helpers."))
+      ('long-sessions
+       (list :metric metric :percent percent :severity severity
+             :action "Add session-age/context-pressure checks to Stop/UserPrompt hooks; warn after long background loops."))
+      ('loop
+       (list :metric metric :percent percent :severity severity
+             :action "Scope /loop skills down, cap iterations, and emit a compact reminder before loop continuation."))
+      ('emacs-eval
+       (list :metric metric :percent percent :severity severity
+             :action "Reduce emacs-eval result size: prefer outline/symbol tools, filtered shell output, minimal modes, and disable unused MCP surfaces.")))))
+
+;;;###autoload
+(defun anvil-claude-limits-analyze (report)
+  "Analyze Claude Code limits REPORT and return Anvil mitigation guidance.
+
+REPORT is the pasted text from Claude Code's \"what's contributing
+to your limits usage?\" screen.  The parser is intentionally
+tolerant of copied TUI corruption: it looks for stable percent
+markers and table rows, then returns the extracted metrics plus
+ranked actions.
+
+Returns a plist with :metrics, :actions, and :top-actions."
+  (unless (and (stringp report) (not (string-empty-p report)))
+    (user-error "anvil-claude-limits-analyze: REPORT must be non-empty text"))
+  (let* ((metrics (mapcar (lambda (key)
+                            (cons key (anvil-dev--limits-metric report key)))
+                          '(high-context subagent-heavy long-sessions
+                            loop emacs-eval)))
+         (actions (mapcar (lambda (cell)
+                            (anvil-dev--limits-action (car cell) (cdr cell)))
+                          metrics))
+         (ranked (sort (copy-sequence actions)
+                       (lambda (a b)
+                         (> (or (plist-get a :percent) -1)
+                            (or (plist-get b :percent) -1))))))
+    (list :metrics metrics
+          :actions actions
+          :top-actions (cl-subseq ranked 0 (min 3 (length ranked))))))
+
+(defun anvil-dev--tool-claude-limits-analyze (report)
+  "MCP wrapper for `anvil-claude-limits-analyze'.
+
+MCP Parameters:
+  report - Text copied from Claude Code's limits usage breakdown."
+  (anvil-server-with-error-handling
+   (format "%S" (anvil-claude-limits-analyze report))))
 
 ;;;; --- test-run-all --------------------------------------------------------
 
@@ -1545,6 +1796,32 @@ CI only exercises the smoke suite — use this for pre-commit
 verification across every test file."
    :read-only t)
   (anvil-server-register-tool
+   #'anvil-dev--tool-codex-efficiency-check
+   :id "anvil-codex-efficiency-check"
+   :intent '(dev audit codex)
+   :layer 'dev
+   :server-id anvil-dev--server-id
+   :description
+   "Check the local Codex token-saving setup in one read-only call:
+Codex config readability, emacs-eval / Serena / Context7 MCP
+server entries, uvx / npx executables, required local Codex
+skills, project-side Serena config, and the recovery reference
+note.  Returns :ok plus actionable :warnings."
+   :read-only t)
+  (anvil-server-register-tool
+   #'anvil-dev--tool-claude-limits-analyze
+   :id "anvil-claude-limits-analyze"
+   :intent '(dev audit claude usage)
+   :layer 'dev
+   :server-id anvil-dev--server-id
+   :description
+   "Parse Claude Code's limits usage breakdown text and return
+Anvil-focused mitigation guidance for high-context sessions,
+subagent-heavy use, 8h+ sessions, /loop usage, and emacs-eval MCP
+result pressure.  Read-only; useful after copying the day/week
+limits screen from Claude Code."
+   :read-only t)
+  (anvil-server-register-tool
    #'anvil-dev--tool-scaffold-module
    :id "anvil-scaffold-module"
    :intent '(dev scaffold)
@@ -1584,6 +1861,10 @@ hash-table-vs-alist pattern).  Returns a formatted report;
   (anvil-server-unregister-tool "anvil-self-sync-check"
                                 anvil-dev--server-id)
   (anvil-server-unregister-tool "anvil-test-run-all"
+                                anvil-dev--server-id)
+  (anvil-server-unregister-tool "anvil-codex-efficiency-check"
+                                anvil-dev--server-id)
+  (anvil-server-unregister-tool "anvil-claude-limits-analyze"
                                 anvil-dev--server-id)
   (anvil-server-unregister-tool "anvil-scaffold-module"
                                 anvil-dev--server-id)

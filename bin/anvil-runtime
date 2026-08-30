@@ -4,9 +4,9 @@
 # Loads anvil-server.el modules under a standalone NeLisp interpreter
 # and enters the MCP Content-Length stdio loop via the elisp driver in
 # `scripts/anvil-runtime-shell-loop.el'.  Migrated 2026-05-14 from
-# `nelisp/bin/anvil-runtime' + `nelisp-emacs/scripts/anvil-runtime-*'
+# `nelisp/bin/anvil-runtime' + `nelisp-emacs-lib/scripts/anvil-runtime-*'
 # so the entire deployment surface lives in this repo; `nelisp' and
-# `nelisp-emacs' supply only the language runtime and Emacs C → elisp
+# `nelisp-emacs-lib' supply only the language runtime and Emacs C → elisp
 # substrate respectively.
 #
 # Required env / paths:
@@ -14,17 +14,17 @@
 #                         repo root, i.e. `$script_dir/..').
 #   NELISP_BIN          — nelisp standalone binary.  Default: walks the
 #                         sibling-checkout convention
-#                         `$ANVIL_EL_DIR/../nelisp/target/release/nelisp'.
-#   NELISP_EMACS_DIR    — nelisp-emacs checkout root.  Default: walks
+#                         `$ANVIL_EL_DIR/../nelisp/target/nelisp'.
+#   NELISP_EMACS_DIR    — nelisp-emacs-lib checkout root.  Default: walks
 #                         the sibling-checkout convention
-#                         `$ANVIL_EL_DIR/../nelisp-emacs'.
+#                         `$ANVIL_EL_DIR/../nelisp-emacs-lib'.
 #   ANVIL_SERVER_ID     — server-id (default: "default")
 #
 # Sibling-checkout convention assumed at default:
 #   <parent>/
 #     ├── anvil.el          (this repo)
 #     ├── nelisp            (Layer 1 NeLisp runtime)
-#     └── nelisp-emacs      (Layer 2 Emacs C → elisp port)
+#     └── nelisp-emacs-lib  (Layer 2 Emacs C → elisp port)
 # Set the env vars above to override when the layout differs.
 
 set -euo pipefail
@@ -40,8 +40,11 @@ ANVIL_EL_DIR="${ANVIL_EL_DIR:-$(cd "$script_dir/.." && pwd)}"
 # discovery when set.
 discover_nelisp_bin() {
     local candidates=(
+        "$ANVIL_EL_DIR/../nelisp/target/nelisp"
         "$ANVIL_EL_DIR/../nelisp/target/release/nelisp"
+        "$HOME/Cowork/Notes/dev/nelisp/target/nelisp"
         "$HOME/Cowork/Notes/dev/nelisp/target/release/nelisp"
+        "$HOME/Notes/dev/nelisp/target/nelisp"
         "$HOME/Notes/dev/nelisp/target/release/nelisp"
     )
     local p resolved_dir
@@ -58,8 +61,11 @@ discover_nelisp_bin() {
 
 discover_nelisp_emacs_dir() {
     local candidates=(
+        "$ANVIL_EL_DIR/../nelisp-emacs-lib"
         "$ANVIL_EL_DIR/../nelisp-emacs"
+        "$HOME/Cowork/Notes/dev/nelisp-emacs-lib"
         "$HOME/Cowork/Notes/dev/nelisp-emacs"
+        "$HOME/Notes/dev/nelisp-emacs-lib"
         "$HOME/Notes/dev/nelisp-emacs"
     )
     local p
@@ -72,14 +78,29 @@ discover_nelisp_emacs_dir() {
     return 1
 }
 
-NELISP_BIN="${NELISP_BIN:-$(discover_nelisp_bin || echo /target/release/nelisp)}"
+NELISP_BIN="${NELISP_BIN:-$(discover_nelisp_bin || echo /target/nelisp)}"
 NELISP_EMACS_DIR="${NELISP_EMACS_DIR:-$(discover_nelisp_emacs_dir || echo "")}"
-# Derive nelisp's lisp/ dir from NELISP_BIN (= sibling of target/release/).
+# Derive nelisp's lisp/ dir by locating the checkout root.  This supports
+# binaries in both target/ and target/release/ without assuming a depth.
 # Used by the alist-get override workaround in shell-loop / server-loop
 # until Doc 98 §98.2 (elisp-complete frozen-heap baker) ships.
+discover_nelisp_lisp_dir() {
+    local dir
+    dir="$(cd "$(dirname "$NELISP_BIN")" && pwd -P)"
+    while :; do
+        if [ -d "$dir/lisp" ] && [ -f "$dir/VERSION" ]; then
+            echo "$dir/lisp"
+            return 0
+        fi
+        if [ "$dir" = "/" ]; then
+            return 1
+        fi
+        dir="$(dirname "$dir")"
+    done
+}
+
 if [ -z "${NELISP_LISP_DIR:-}" ] && [ -x "$NELISP_BIN" ]; then
-    _nelisp_top="$(cd "$(dirname "$NELISP_BIN")/../.." && pwd -P)"
-    NELISP_LISP_DIR="$_nelisp_top/lisp"
+    NELISP_LISP_DIR="$(discover_nelisp_lisp_dir || true)"
 fi
 NELISP_LISP_DIR="${NELISP_LISP_DIR:-}"
 LOOP_EL="${LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-shell-loop.el}"
@@ -119,6 +140,22 @@ case "$1" in
             # driver can read them before `emacs-init.el' polyfills
             # `getenv'.  (Standalone NeLisp's `getenv' is nil until
             # `emacs-callproc.el' loads — chicken-and-egg with init load.)
+            # Fast handshake is ON by default as of NeLisp v1.1.1.  It was
+            # gated off because every fast-path run died after 2-20 s; the
+            # cause was fourteen precise-root defects in the standalone GC,
+            # fixed there, and with a NeLisp carrying those fixes the path
+            # returns all 5,208 bytes and exits 0 -- 3/3 with address
+            # randomisation disabled and 3/3 with it on.  Without it every
+            # `mcp serve' pays the ~100 s cold start before answering
+            # `initialize'.
+            #
+            # It DOES depend on the runtime underneath: an older NeLisp will
+            # crash on this path.  `ANVIL_RUNTIME_FAST_HANDSHAKE=0' turns it
+            # back off for exactly that case.
+            case "${ANVIL_RUNTIME_FAST_HANDSHAKE:-1}" in
+                0|no|off|false) anvil_fast_handshake_elisp=nil ;;
+                *) anvil_fast_handshake_elisp=t ;;
+            esac
             BOOTSTRAP_DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
             mkdir -p "$BOOTSTRAP_DIR"
             BOOTSTRAP="$BOOTSTRAP_DIR/mcp-bootstrap.el"
@@ -127,9 +164,10 @@ case "$1" in
 (setq anvil-runtime-bootstrap-anvil-el-dir "$ANVIL_EL_DIR")
 (setq anvil-runtime-bootstrap-nelisp-emacs-dir "$NELISP_EMACS_DIR")
 (setq anvil-runtime-bootstrap-nelisp-lisp-dir "$NELISP_LISP_DIR")
+(setq anvil-runtime-bootstrap-fast-handshake-enabled $anvil_fast_handshake_elisp)
 (load "$LOOP_EL" nil t)
 EOF
-            exec "$NELISP_BIN" exec "$BOOTSTRAP"
+            exec "$NELISP_BIN" "$BOOTSTRAP"
         fi
         usage
         ;;
@@ -157,7 +195,7 @@ EOF
 (setq anvil-runtime-bootstrap-nelisp-lisp-dir "$NELISP_LISP_DIR")
 (load "$SERVER_LOOP_EL" nil t)
 EOF
-        exec "$NELISP_BIN" exec "$BOOTSTRAP"
+        exec "$NELISP_BIN" "$BOOTSTRAP"
         ;;
     *)
         usage

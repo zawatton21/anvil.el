@@ -2114,6 +2114,54 @@ ROOT-VAR is the temp memory root.  Binds `port' (int) and `info'
     (should-error (anvil-memory-add "feedback_dup_rule" 'feedback "second"))))
 
 
+;;;; --- Phase 5: DB-direct update --------------------------------------
+
+(ert-deftest anvil-memory-test/update-replaces-body-and-fts ()
+  "memory-update swaps the body and the FTS row in one call."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)
+                    (anvil-memory-test--supported-p 'search)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_rule" 'feedback
+                      "old_keyword_alpha body")
+    (let ((res (anvil-memory-update "feedback_upd_rule"
+                                    :body "new_keyword_beta body")))
+      (should (equal '(:body) (plist-get res :updated)))
+      (should (stringp (plist-get res :digest))))
+    (should-not (anvil-memory-search "old_keyword_alpha"))
+    (let ((hits (anvil-memory-search "new_keyword_beta")))
+      (should hits))
+    (let ((entry (anvil-memory-get "feedback_upd_rule")))
+      (should (string-match-p "new_keyword_beta"
+                              (plist-get entry :body))))))
+
+(ert-deftest anvil-memory-test/update-meta-fields ()
+  "memory-update rewrites type / tags / ttl_policy independently."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_meta" 'feedback "body")
+    (let ((res (anvil-memory-update "feedback_upd_meta"
+                                    :type 'project
+                                    :tags '("a" "b"))))
+      (should (equal '(:type :tags) (plist-get res :updated))))
+    (let ((entry (anvil-memory-get "feedback_upd_meta")))
+      (should (eq 'project (plist-get entry :type)))
+      (should (equal "a,b" (plist-get entry :tags))))))
+
+(ert-deftest anvil-memory-test/update-rejects-bad-input ()
+  "memory-update signals on unknown names, scan rows, and no-op calls."
+  (skip-unless (and (anvil-memory-test--supported-p 'update)
+                    (anvil-memory-test--supported-p 'add)))
+  (anvil-memory-test--with-env
+    (anvil-memory-add "feedback_upd_guard" 'feedback "body")
+    (should-error (anvil-memory-update "feedback_upd_guard"))
+    (should-error (anvil-memory-update "feedback_no_such" :body "x"))
+    (should-error (anvil-memory-update "/abs/path/row.md" :body "x"))
+    (should-error (anvil-memory-update "feedback_upd_guard"
+                                       :type 'not-a-type))))
+
+
 ;;;; --- Phase 5: prune skips synthetic ---------------------------------
 
 (ert-deftest anvil-memory-test/prune-skips-synthetic-paths ()

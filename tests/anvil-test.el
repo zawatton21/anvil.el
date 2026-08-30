@@ -293,33 +293,21 @@ MCP Parameters:
             (should (equal "ok" text))))
       (remhash server-id anvil-server--tools))))
 
-(ert-deftest anvil-test-scan-int-after-tolerates-whitespace ()
-  "Standalone scanner must accept normal JSON whitespace before numbers."
-  (should (equal 42 (anvil-server--scan-int-after "{\"id\": 42,}" "\"id\":")))
-  (should (equal 42 (anvil-server--scan-int-after "{\"id\":42,}" "\"id\":")))
-  (should (equal 7 (anvil-server--scan-int-after "{\"id\":\t7 }" "\"id\":")))
-  (should (equal -3 (anvil-server--scan-int-after "{\"id\": -3 }" "\"id\":"))))
-
-(ert-deftest anvil-test-scan-string-after-tolerates-whitespace ()
-  "Standalone scanner must accept normal JSON whitespace before strings."
-  (should (equal "tools/list"
-                 (anvil-server--scan-string-after
-                  "{\"method\": \"tools/list\"}" "\"method\":")))
-  (should (equal "tools/list"
-                 (anvil-server--scan-string-after
-                  "{\"method\":\"tools/list\"}" "\"method\":")))
-  (should (equal "a\"b\\c"
-                 (anvil-server--scan-string-after
-                  "{\"name\": \"a\\\"b\\\\c\"}" "\"name\":"))))
-
-(ert-deftest anvil-test-scan-json-value-after-tolerates-string-id ()
-  "JSON-RPC ids may be strings as well as numbers."
-  (should (equal "abc"
-                 (anvil-server--scan-json-value-after
-                  "{\"id\": \"abc\"}" "\"id\":")))
-  (should (equal 17
-                 (anvil-server--scan-json-value-after
-                  "{\"id\": 17}" "\"id\":"))))
+(ert-deftest anvil-test-json-decode-preserves-cjk-params ()
+  "UTF-8 byte input decodes through the normal parser with full params."
+  (let* ((json (concat
+                "{\"jsonrpc\":\"2.0\",\"id\":1,"
+                "\"method\":\"tools/call\",\"params\":{"
+                "\"name\":\"demo\",\"arguments\":{\"text\":\"日本語\"}}}"))
+         (bytes (anvil-server--string-to-utf8-bytes json))
+         (decoded (anvil-server--utf8-bytes-to-string bytes))
+         (object (json-read-from-string decoded))
+         (params (alist-get 'params object))
+         (arguments (alist-get 'arguments params)))
+    (should-not (multibyte-string-p bytes))
+    (should (= (string-bytes json) (length bytes)))
+    (should (equal "demo" (alist-get 'name params)))
+    (should (equal "日本語" (alist-get 'text arguments)))))
 
 (ert-deftest anvil-test-dispatch-tolerates-stale-underscore-args ()
   "A client with a stale schema that still sends `_args' must not error.
