@@ -83,7 +83,10 @@ These are not loaded by default.  Available modules:
 - `org-index' — Persistent SQLite index of org files (requires Emacs 29+)
 - `buffer'    — Explicit buffer-* MCP tools (read/save/list-modified)
 - `dev'       — Developer helpers: `anvil-self-sync-check' for dev/installed
-                git HEAD mismatch detection
+                git HEAD mismatch detection, `anvil-codex-efficiency-check'
+                for Codex token-saving setup audits, and
+                `anvil-claude-limits-analyze' for Claude Code limits
+                report triage
 - `offload'   — Future-based API for running heavy elisp in a batch
                 subprocess (Doc 03 Phase 1)
 - `browser'   — agent-browser CLI wrapper: fetch / interact / capture
@@ -112,9 +115,9 @@ These are not loaded by default.  Available modules:
                 Claude Code's hardcoded ~83.5% auto-compact with a
                 user-tunable earlier trigger for long autonomous
                 sessions.  Requires `state' and integrates with
-                `session' (Stop event).  Five MCP tools: compact-
+                `session' (Stop event).  Seven MCP tools: compact-
                 estimate / -should-trigger / -snapshot / -restore /
-                -hook.
+                -hook / -stats / -pressure-report.
 - `harness-telemetry' — Doc 46 Phase 1 runtime-harness failure
                 classifier + 4-class SQLite telemetry (no-exec /
                 contract-violation / stall / reasoning).  Hooks

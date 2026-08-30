@@ -29,6 +29,31 @@
 (require 'anvil-server)
 (require 'anvil-server-commands)
 
+(defconst anvil-mcp-framing-test--repo-root
+  (file-name-directory
+   (directory-file-name
+    (file-name-directory (or load-file-name buffer-file-name))))
+  "Repository root used to load the standalone fast-handshake helpers.")
+
+(defun anvil-mcp-framing-test--load-fast-handshake-helpers ()
+  "Load definitions through the standalone fast-handshake entry point."
+  (unless (fboundp 'anvil-runtime-shell--fast-handshake)
+    (let ((file (expand-file-name "scripts/anvil-runtime-shell-loop.el"
+                                  anvil-mcp-framing-test--repo-root)))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (catch 'done
+          (condition-case nil
+              (while t
+                (let ((form (read (current-buffer))))
+                  (when (memq (car-safe form) '(defun defvar))
+                    (eval form))
+                  (when (and (eq (car-safe form) 'defun)
+                             (eq (nth 1 form)
+                                 'anvil-runtime-shell--fast-handshake))
+                    (throw 'done t))))
+            (end-of-file nil)))))))
+
 ;;;; --- Encode -----------------------------------------------------------
 
 (ert-deftest anvil-mcp-framing-test-encode-basic ()
@@ -59,6 +84,13 @@
     (should-not (multibyte-string-p bytes))
     (should (= 3 (length bytes)))
     (should (equal '(227 129 130) (append bytes nil)))))
+
+(ert-deftest anvil-mcp-framing-test-utf8-helper-rejects-invalid-bytes ()
+  "The UTF-8 decoder rejects malformed wire bytes before JSON parsing."
+  (should-error
+   (anvil-server--utf8-bytes-to-string
+    (unibyte-string #xC3 #x28 #xFF #x41))
+   :type 'json-error))
 
 (ert-deftest anvil-mcp-framing-test-encode-rejects-non-string ()
   "Encode signals `wrong-type-argument' for non-string input."
@@ -178,6 +210,50 @@
                "{\"jsonrpc\":\"2.0\",\"id\":1}"))
   (should-not (anvil-server-mcp-detect-framing-p ""))
   (should-not (anvil-server-mcp-detect-framing-p "[1,2,3]")))
+
+;;;; --- Standalone fast tools cache --------------------------------------
+
+(ert-deftest anvil-mcp-framing-test-fast-tools-json-rejects-bad-shapes ()
+  "Fast tools cache validation rejects malformed or implausible results."
+  (anvil-mcp-framing-test--load-fast-handshake-helpers)
+  (should (anvil-runtime-shell--fast-tools-json-problem "not JSON"))
+  (should (anvil-runtime-shell--fast-tools-json-problem "{}"))
+  (should (anvil-runtime-shell--fast-tools-json-problem
+           "{\"tools\":{}}"))
+  (should (anvil-runtime-shell--fast-tools-json-problem
+           "{\"tools\":[]}"))
+  (should-not
+   (anvil-runtime-shell--fast-tools-json-problem
+    "{\"tools\":[{\"name\":\"one\"}]}")))
+
+(ert-deftest anvil-mcp-framing-test-empty-fast-tools-cache-is-not-served ()
+  "An empty tools array falls through without consuming or writing frames."
+  (anvil-mcp-framing-test--load-fast-handshake-helpers)
+  (let ((cache-file (make-temp-file "anvil-empty-fast-tools-"))
+        (read-called nil)
+        (stdout-called nil)
+        (warnings nil))
+    (unwind-protect
+        (progn
+          (write-region
+           "(setq anvil-runtime-shell--fast-tools-json \"{\\\"tools\\\":[]}\")\n"
+           nil cache-file)
+          (cl-letf (((symbol-function
+                      'anvil-runtime-shell--fast-read-frame)
+                     (lambda () (setq read-called t) nil))
+                    ((symbol-function 'anvil-runtime-shell--stdout)
+                     (lambda (_frame) (setq stdout-called t)))
+                    ((symbol-function 'nelisp--write-stderr-line)
+                     (lambda (line) (push line warnings))))
+            (should-not
+             (anvil-runtime-shell--fast-handshake cache-file)))
+          (should-not read-called)
+          (should-not stdout-called)
+          (should
+           (seq-some (lambda (line)
+                       (string-match-p "tools array is empty" line))
+                     warnings)))
+      (delete-file cache-file))))
 
 ;;;; --- Sanity: define-error symbol present -----------------------------
 

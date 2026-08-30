@@ -165,6 +165,145 @@ Non-git `call-process' calls still signal exit-status 1."
                 (should (null (plist-get res :warning)))))))
       (delete-directory installed t))))
 
+;;;; --- codex efficiency check --------------------------------------------
+
+(defun anvil-dev-test--write-codex-efficiency-fixtures (codex-home root)
+  "Create a complete Codex efficiency fixture under CODEX-HOME and ROOT."
+  (make-directory codex-home t)
+  (make-directory (expand-file-name "skills" codex-home) t)
+  (with-temp-file (expand-file-name "config.toml" codex-home)
+    (insert "[mcp_servers.emacs-eval]\n"
+            "command = \"/tmp/anvil\"\n\n"
+            "[mcp_servers.serena]\n"
+            "command = \"/tmp/uvx\"\n\n"
+            "[mcp_servers.context7]\n"
+            "command = \"/tmp/npx\"\n"))
+  (dolist (skill anvil-dev--codex-efficiency-required-skills)
+    (let ((dir (expand-file-name (format "skills/%s" skill) codex-home)))
+      (make-directory dir t)
+      (with-temp-file (expand-file-name "SKILL.md" dir)
+        (insert "---\nname: " skill "\ndescription: test\n---\n"))))
+  (make-directory (expand-file-name ".serena" root) t)
+  (with-temp-file (expand-file-name ".serena/project.yml" root)
+    (insert "project_name: Test\n"))
+  (make-directory (expand-file-name ".claude/reference" root) t)
+  (with-temp-file (expand-file-name ".claude/reference/codex-efficiency-setup.md" root)
+    (insert "# Codex Efficiency Setup\n")))
+
+(ert-deftest anvil-dev-test-codex-efficiency-check-all-green ()
+  "A complete fixture reports :ok t and no warnings."
+  (let ((codex-home (anvil-dev-test--make-dir))
+        (root (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (anvil-dev-test--write-codex-efficiency-fixtures codex-home root)
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (name)
+                       (cond
+                        ((equal name "uvx") "/bin/uvx")
+                        ((equal name "npx") "/bin/npx")
+                        (t nil)))))
+            (let ((r (anvil-codex-efficiency-check codex-home root)))
+              (should (plist-get r :ok))
+              (should (null (plist-get r :warnings)))
+              (should (equal t (cdr (assoc "serena"
+                                           (plist-get r :mcp-servers)))))
+              (should (equal t (cdr (assoc "notes-development"
+                                           (plist-get r :skills))))))))
+      (delete-directory codex-home t)
+      (delete-directory root t))))
+
+(ert-deftest anvil-dev-test-codex-efficiency-check-warns-on-missing-parts ()
+  "Missing MCP sections, executable, skill, and project files are warned."
+  (let ((codex-home (anvil-dev-test--make-dir))
+        (root (anvil-dev-test--make-dir)))
+    (unwind-protect
+        (progn
+          (make-directory codex-home t)
+          (with-temp-file (expand-file-name "config.toml" codex-home)
+            (insert "[mcp_servers.emacs-eval]\ncommand = \"/tmp/anvil\"\n"))
+          (make-directory (expand-file-name "skills/anvil-memory-worklog"
+                                            codex-home)
+                          t)
+          (with-temp-file (expand-file-name
+                           "skills/anvil-memory-worklog/SKILL.md"
+                           codex-home)
+            (insert "---\nname: anvil-memory-worklog\n---\n"))
+          (cl-letf (((symbol-function 'executable-find)
+                     (lambda (name)
+                       (and (equal name "npx") "/bin/npx"))))
+            (let* ((r (anvil-codex-efficiency-check codex-home root))
+                   (warnings (plist-get r :warnings))
+                   (joined (mapconcat #'identity warnings "\n")))
+              (should-not (plist-get r :ok))
+              (should (string-match-p "Missing MCP server section: serena"
+                                      joined))
+              (should (string-match-p "Missing MCP server section: context7"
+                                      joined))
+              (should (string-match-p "Missing executable.*uvx" joined))
+              (should (string-match-p "Missing Codex skill: notes-development"
+                                      joined))
+              (should (string-match-p "Missing Serena project config"
+                                      joined))
+              (should (string-match-p "Missing Codex recovery reference"
+                                      joined)))))
+      (delete-directory codex-home t)
+      (delete-directory root t))))
+
+;;;; --- Claude limits report analysis --------------------------------------
+
+(defconst anvil-dev-test--claude-limits-sample
+  "what's contributing to your limits usage?
+
+91% of your usage was at >150k context
+ longer sessions are more expensive even when cached. /compact mid-task, /clear
+ when switching to new tasks.
+
+56% of your usage came from subagent-heavy sessions
+ each subagent runs its own requests.
+
+42% of your usage came from sessions active for 8+ hours
+ these are often background/loop sessions.
+
+16% of your usage came from /loop
+
+73% of your usage came from mcp server \"emacs-eval\"
+ mcp tool results stay in context for the rest of the session.
+
+skills                  % of usage
+/loop                          16%
+
+mcp servers             % of usage
+emacs-eval                     73%
+"
+  "Stable sample of Claude Code limits output.")
+
+(ert-deftest anvil-dev-test-claude-limits-analyze-extracts-main-metrics ()
+  "The analyzer extracts the day-level metrics from copied limits text."
+  (let* ((r (anvil-claude-limits-analyze
+             anvil-dev-test--claude-limits-sample))
+         (metrics (plist-get r :metrics))
+         (top (plist-get r :top-actions)))
+    (should (equal 91 (cdr (assq 'high-context metrics))))
+    (should (equal 56 (cdr (assq 'subagent-heavy metrics))))
+    (should (equal 42 (cdr (assq 'long-sessions metrics))))
+    (should (equal 16 (cdr (assq 'loop metrics))))
+    (should (equal 73 (cdr (assq 'emacs-eval metrics))))
+    (should (eq 'high-context (plist-get (car top) :metric)))
+    (should (eq 'critical (plist-get (car top) :severity)))))
+
+(ert-deftest anvil-dev-test-claude-limits-analyze-falls-back-to-table-rows ()
+  "When prose is TUI-corrupted, table rows still recover key metrics."
+  (let* ((r (anvil-claude-limits-analyze
+             "skills % of usage\n/loop 28%\n\nmcp servers % of usage\nemacs-eval 34%\n"))
+         (metrics (plist-get r :metrics)))
+    (should (null (cdr (assq 'high-context metrics))))
+    (should (equal 28 (cdr (assq 'loop metrics))))
+    (should (equal 34 (cdr (assq 'emacs-eval metrics))))))
+
+(ert-deftest anvil-dev-test-claude-limits-analyze-rejects-empty-report ()
+  (should-error (anvil-claude-limits-analyze "") :type 'user-error))
+
 ;;;; --- parse-ert-summary --------------------------------------------------
 
 (ert-deftest anvil-dev-test-parse-ert-summary-unskipped ()

@@ -1841,10 +1841,49 @@ See also: `anvil-server-tool-throw'"
         (string-as-unibyte string)
       (encode-coding-string string 'utf-8 t))))
 
+(defun anvil-server--valid-utf8-bytes-p (string)
+  "Return non-nil when unibyte STRING is well-formed UTF-8."
+  (let ((i 0)
+        (n (length string))
+        (valid t))
+    (while (and valid (< i n))
+      (let ((b0 (aref string i)))
+        (cond
+         ((< b0 #x80)
+          (setq i (1+ i)))
+         ((and (>= b0 #xC2) (<= b0 #xDF)
+               (< (1+ i) n)
+               (>= (aref string (1+ i)) #x80)
+               (<= (aref string (1+ i)) #xBF))
+          (setq i (+ i 2)))
+         ((and (>= b0 #xE0) (<= b0 #xEF)
+               (< (+ i 2) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xE0) (>= b1 #xA0) (>= b1 #x80))
+                      (if (= b0 #xED) (<= b1 #x9F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF))
+          (setq i (+ i 3)))
+         ((and (>= b0 #xF0) (<= b0 #xF4)
+               (< (+ i 3) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xF0) (>= b1 #x90) (>= b1 #x80))
+                      (if (= b0 #xF4) (<= b1 #x8F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF)
+               (>= (aref string (+ i 3)) #x80)
+               (<= (aref string (+ i 3)) #xBF))
+          (setq i (+ i 4)))
+         (t
+          (setq valid nil)))))
+    valid))
+
 (defun anvil-server--utf8-bytes-to-string (string)
   "Decode unibyte UTF-8 STRING while preserving multibyte input."
   (if (multibyte-string-p string)
       string
+    (unless (anvil-server--valid-utf8-bytes-p string)
+      (signal 'json-error '("Invalid UTF-8 in JSON input")))
     ;; Measured 2026-08-28 with UTF-8 bytes for "日本語": NeLisp
     ;; v1.1.0+1 `string-as-multibyte' => (26085 26412 35486);
     ;; Emacs 30.1 `decode-coding-string' => (26085 26412 35486).

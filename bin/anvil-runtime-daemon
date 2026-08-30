@@ -4,8 +4,8 @@
 # K2 (= 2026-05-11) rewrite: replaces the G v1 FIFO-based scheme
 # (mkfifo + Linux O_RDWR keep-alive + `dd bs=1' bridge hacks) with a
 # proper UNIX domain socket listener.  Powered by the
-# `make-network-process' polyfill in nelisp-emacs/src/emacs-*.el
-# (commit `b662671' on nelisp-emacs main).
+# `make-network-process' polyfill in nelisp-emacs-lib/src/emacs-*.el
+# (commit `b662671' on nelisp-emacs-lib main).
 #
 # Lifecycle:
 #   start    — cold-load `anvil-runtime server' once, leave it listening

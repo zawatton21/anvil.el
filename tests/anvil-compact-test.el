@@ -14,6 +14,8 @@
 (require 'anvil-state)
 (require 'anvil-compact)
 
+(defvar anvil-state--cached-db)
+
 (defun anvil-compact-test--make-db-path ()
   "Return a fresh temp SQLite path for anvil-state in a test."
   (make-temp-file "anvil-compact-test-" nil ".db"))
@@ -135,6 +137,44 @@
         (anvil-compact-cooldown-percent 0))
     (let ((r (anvil-compact-should-trigger :percent 15)))
       (should (plist-get r :trigger)))))
+
+
+;;;; --- pressure report ----------------------------------------------------
+
+(ert-deftest anvil-compact-test-pressure-report-high-context-critical ()
+  "High context pressure should surface a critical compact action."
+  (let ((p (make-temp-file "anvil-compact-")))
+    (unwind-protect
+        (progn
+          (with-temp-file p
+            (insert (make-string 800 ?x)))
+          (let ((anvil-compact-trigger-percent 45)
+                (anvil-compact-pressure-high-percent 75)
+                (anvil-compact-context-tokens-max 1000)
+                (anvil-compact-bytes-per-token 1))
+            (let ((r (anvil-compact-pressure-report
+                      :transcript-path p
+                      :task-in-progress 0
+                      :last-compact-percent 0)))
+              (should (eq :critical (plist-get r :severity)))
+              (should (plist-get (plist-get r :compact-decision)
+                                 :trigger))
+              (should (cl-some
+                       (lambda (s)
+                         (string-match-p "high-pressure" s))
+                       (plist-get r :actions))))))
+      (ignore-errors (delete-file p)))))
+
+(ert-deftest anvil-compact-test-pressure-report-long-session-high ()
+  "A long-running session should recommend a checkpoint boundary."
+  (let ((r (anvil-compact-pressure-report
+            :transcript-path nil
+            :session-age-hours 8.5)))
+    (should (eq :high (plist-get r :severity)))
+    (should (cl-some
+             (lambda (s)
+               (string-match-p "8[+] hours" s))
+             (plist-get r :actions)))))
 
 
 ;;;; --- snapshot ------------------------------------------------------------
@@ -327,6 +367,12 @@ so the shell hook wrapper can forward it verbatim."
 (ert-deftest anvil-compact-test-tool-hook-unknown-stage-returns-empty ()
   (anvil-compact-test--with-fresh-state
     (should (equal "" (anvil-compact--tool-hook "sid" "unknown" "")))))
+
+(ert-deftest anvil-compact-test-tool-pressure-report-accepts-strings ()
+  "MCP transport may deliver optional numeric args as strings."
+  (let ((r (anvil-compact--tool-pressure-report "" "" "9" "0" "0")))
+    (should (eq :high (plist-get r :severity)))
+    (should (> (plist-get r :session-age-hours) 8))))
 
 
 ;;;; --- Phase 2: restore-queue --------------------------------------------

@@ -37,6 +37,49 @@ nil for production (silent).")
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
+(defvar anvil-runtime-server--primitive-load nil
+  "Standalone `load' function saved before stdlib-misc replaces it.")
+
+(defvar anvil-runtime-server--primitive-hash-functions nil
+  "Standalone hash functions saved before stdlib-misc replaces them.")
+
+(defvar anvil-runtime-server--skip-load-files nil
+  "Absolute source files intentionally skipped by the runtime loader.")
+
+(defun anvil-runtime-server--compat-load
+    (file &optional noerror nomessage _nosuffix _must-suffix)
+  "Load FILE with Emacs load context and the standalone native reader."
+  (let ((resolved
+         (if (and (> (length file) 0) (eq (aref file 0) ?/))
+             (cond
+              ((file-exists-p file) file)
+              ((file-exists-p (concat file ".el")) (concat file ".el"))
+              (t nil))
+           (locate-library file))))
+    (if (null resolved)
+        (if noerror nil
+          (signal 'file-error (list "Cannot open load file" file)))
+      (if (member resolved anvil-runtime-server--skip-load-files)
+          t
+        (let ((prior-lfn (and (boundp 'load-file-name) load-file-name))
+              (prior-dd (and (boundp 'default-directory) default-directory))
+              (value nil)
+              (err nil))
+          (setq load-file-name resolved)
+          (setq default-directory (file-name-directory resolved))
+          (condition-case caught
+              (setq value
+                    (funcall anvil-runtime-server--primitive-load
+                             resolved noerror nomessage))
+            (error (setq err caught)))
+          (when (fboundp 'garbage-collect)
+            (garbage-collect))
+          (setq load-file-name prior-lfn)
+          (setq default-directory prior-dd)
+          (cond
+           ((null err) value)
+           (t (signal (car err) (cdr err)))))))))
+
 ;; Path resolution — same chain as shell-loop.el §path-resolution.
 ;; The primary channel is `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir'
 ;; set by `bin/anvil-runtime' before loading us; `getenv' is unreliable
@@ -60,6 +103,12 @@ nil for production (silent).")
              (concat (file-name-directory
                       (directory-file-name anvil-el-dir))
                      "nelisp-emacs"))))
+       (nelisp-lisp-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                 (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
+                 anvil-runtime-bootstrap-nelisp-lisp-dir)
+            (concat (file-name-directory (directory-file-name anvil-el-dir))
+                    "nelisp/lisp")))
        (server-id
         (anvil-runtime-server--env "ANVIL_SERVER_ID" "emacs-eval"))
        (socket-path
@@ -80,7 +129,9 @@ nil for production (silent).")
        (eventloop-el (concat nelisp-emacs-dir "/src/emacs-eventloop.el"))
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
-       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el")))
+       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
+       (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el"))
+       (bootstrap-skip-features '(nelisp-coding-jis-tables calendar)))
 
   ;; --- substrate bootstrap (same as shell-loop.el) ---
   ;; emacs-init.el gates its vendor load-path setup on
@@ -95,29 +146,32 @@ nil for production (silent).")
   ;; UTF-8 only and never exercises JIS codec paths, so the tables are
   ;; deadweight for the server-loop.  Remove once the nelisp regression
   ;; is fixed upstream.
-  (provide 'nelisp-coding-jis-tables)
+  (dolist (feature bootstrap-skip-features)
+    (provide feature))
+  (setq load-prefer-newer t)
+  ;; Load before emacs-init for the measured `load-file-name' behavior.
+  ;; See shell-loop.el for the 2026-08-28 JSON timing and call-count data.
+  (setq anvil-runtime-server--primitive-load (symbol-function 'load))
+  (setq anvil-runtime-server--primitive-hash-functions
+        (mapcar (lambda (name) (cons name (symbol-function name)))
+                '(maphash hash-table-keys hash-table-values hash-table-count)))
+  (load stdlib-misc nil t)
+  ;; Retain the working native hash traversal functions; see shell-loop.el
+  ;; for the measured missing-`nelisp--hash-pairs' failure.
+  (let ((saved anvil-runtime-server--primitive-hash-functions))
+    (while saved
+      (fset (car (car saved)) (cdr (car saved)))
+      (setq saved (cdr saved))))
+  ;; Install the same 2026-08-29 measured native-reader compatibility
+  ;; layer and exact vendor-calendar skip documented in shell-loop.el.
+  (setq anvil-runtime-server--skip-load-files
+        (list (concat nelisp-emacs-dir
+                      "/vendor/emacs-lisp/calendar/calendar.el")))
+  (fset 'load #'anvil-runtime-server--compat-load)
+  (dolist (feature bootstrap-skip-features)
+    (provide feature))
   (load init-el nil t)
   (load stub-el nil t)
-
-  ;; --- TEMPORARY alist-get override (= Doc 98 §98.2 workaround) ---
-  ;; See shell-loop.el for the full rationale.  Remove this block once
-  ;; the elisp-complete baker (= Doc 98 §98.2) ships and the .image
-  ;; carries the fixed alist-get.
-  (let* ((nelisp-lisp-dir
-          (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
-                   (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
-                   anvil-runtime-bootstrap-nelisp-lisp-dir)
-              (concat (file-name-directory (directory-file-name anvil-el-dir))
-                      "nelisp/lisp")))
-         (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el")))
-    (when (file-exists-p stdlib-misc)
-      (condition-case err
-          (load stdlib-misc nil t)
-        (error
-         (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
-           (nelisp--write-stderr-line
-            (concat "[server-loop] nelisp-stdlib-misc override load ERR: "
-                    (format "%S" err))))))))
 
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside the
