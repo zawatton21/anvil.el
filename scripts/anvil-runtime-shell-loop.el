@@ -28,10 +28,17 @@
 ;;   NELISP_EMACS_DIR — directory containing this file's siblings
 ;;                      `src/emacs-init.el' / `src/emacs-stub.el'
 ;;                      (= the nelisp-emacs checkout root).
+;;   ANVIL_RUNTIME_DAEMON_DIR — state dir for the fast-handshake cache
+;;                      and anvil-server's schema cache (bootstrap
+;;                      `anvil-runtime-bootstrap-state-dir' wins).
 ;;
-;; Once tested end-to-end, the Rust crate `anvil-runtime/' can be
-;; deleted in Final B Stage 2 along with the bin/anvil-runtime symlink
-;; rewire.
+;; The Rust crate `anvil-runtime/' was deleted in Final B Stage 2
+;; (2026-05-10); since NeLisp v1.2.0 (2026-09-04) the reader this file
+;; runs under is the pure-elisp standalone binary (`target/nelisp' /
+;; `target/nelisp.exe', started as `nelisp --load BOOTSTRAP' by
+;; bin/anvil-runtime).  Everything below keeps working on both the
+;; legacy and the v1.2.0 reader: overrides that the newer prelude made
+;; redundant are gated on a functional probe rather than removed.
 
 ;;; Code:
 
@@ -43,6 +50,15 @@
   "When non-nil, emit `[STDIO]/[PJ]/[VAD]/[JR]/[TL]/[REG-*]/[STEP]'
 diagnostic trace lines via `nelisp--write-stderr-line'.  Default
 nil for production (silent).")
+
+;; NeLisp v1.2.0: the pure-elisp standalone reader does not `(provide
+;; 'nelisp)' the way the retired Rust bootstrap did, yet anvil's runtime
+;; detection (`anvil-config-active-p', README "NeLisp standalone" config
+;; path) is contractually `(featurep 'nelisp)'.  Restore the marker here,
+;; gated on the stdin primitive only the standalone reader ships, so host
+;; Emacs loading this file for tests stays untouched.
+(when (and (fboundp 'read-stdin-bytes) (not (featurep 'nelisp)))
+  (provide 'nelisp))
 
 (defun anvil-runtime-shell--env (name default)
   (let ((val (and (fboundp 'getenv) (getenv name))))
@@ -313,7 +329,17 @@ nil for production (silent).")
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
        (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
-       (fast-tools-file "/tmp/anvil-runtime/anvil-fast-tools.el"))
+       ;; State dir: bin/anvil-runtime creates it (default ~/.anvil-runtime)
+       ;; and passes it through the bootstrap.  The old fixed
+       ;; "/tmp/anvil-runtime" stays as the last-resort default for
+       ;; host-Emacs test loads; it does not exist for the native
+       ;; windows-x86_64 reader (NeLisp v1.2.0).
+       (state-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-state-dir)
+                 anvil-runtime-bootstrap-state-dir)
+            (anvil-runtime-shell--env "ANVIL_RUNTIME_DAEMON_DIR"
+                                      "/tmp/anvil-runtime")))
+       (fast-tools-file (concat state-dir "/anvil-fast-tools.el")))
 
   (when (and (not anvil-server--debug-trace)
              (fboundp 'read-stdin-bytes)
@@ -366,6 +392,24 @@ nil for production (silent).")
   ;; anvil.el/ silently override their .el siblings and explode after
   ;; stdlib-misc loads.
   (setq load-prefer-newer t)
+  ;; `temporary-file-directory': nelisp-emacs's emacs-vars.el falls back
+  ;; to "/tmp/", which does not exist for the native windows-x86_64
+  ;; reader, so anvil-server's schema cache could never be written there
+  ;; and every start paid the eager schema path.  Bind it under the
+  ;; launcher's state dir (bin/anvil-runtime creates `<state>/tmp')
+  ;; before emacs-vars.el's `unless boundp' guard runs.  Only when the
+  ;; substrate left it unbound — a reader that ships its own value wins.
+  (unless (boundp 'temporary-file-directory)
+    (defvar temporary-file-directory (concat state-dir "/tmp/")))
+  ;; NeLisp v1.2.0: the reader's `load' does not bind `load-file-name'
+  ;; for the file it is loading, so emacs-init.el's "put my own src/ on
+  ;; load-path" step (which keys on `load-file-name') is a no-op and its
+  ;; first `(require 'nelisp-emacs)' dies with file-missing.  Surface
+  ;; the Layer 2 src/ dir explicitly; harmless where the reader already
+  ;; binds the variable.
+  (let ((src-dir (concat nelisp-emacs-dir "/src")))
+    (unless (and (boundp 'load-path) (member src-dir load-path))
+      (setq load-path (cons src-dir (and (boundp 'load-path) load-path)))))
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] pre-init"))
   (load init-el nil t)
@@ -393,23 +437,34 @@ nil for production (silent).")
   ;; degrade ~300x on strings > 75 bytes (bisected 2026-05-24).  By
   ;; inlining just this one defun we get the alist-get fix without
   ;; clobbering the Rust-fast primitives the rest of anvil needs.
-  (defun alist-get (key alist &optional default _remove testfn)
-    (let ((cur alist) (found nil) (result default))
-      (while (and cur (not found))
-        (let ((pair (car cur)))
-          (cond
-           ((not (consp pair)) (setq cur (cdr cur)))
-           ((cond
-             ((null testfn) (equal (car pair) key))
-             ((eq testfn 'eq) (eq (car pair) key))
-             ((eq testfn 'equal) (equal (car pair) key))
-             ((or (eq testfn 'string=) (eq testfn 'string-equal))
-              (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
-             (t (funcall testfn (car pair) key)))
-            (setq result (cdr pair))
-            (setq found t))
-           (t (setq cur (cdr cur))))))
-      result))
+  ;;
+  ;; NeLisp v1.2.0: the prelude ships a correct `alist-get', so the
+  ;; override is gated on a functional probe — it only lands when the
+  ;; running definition is missing or answers wrong (= the legacy
+  ;; baked-image case this block was written for).
+  (unless (and (fboundp 'alist-get)
+               (condition-case nil
+                   (and (equal (alist-get 'b '((a . 1) (b . 2))) 2)
+                        (eq (alist-get 'z '((a . 1)) 'dflt) 'dflt)
+                        (equal (alist-get "k" '(("k" . 3)) nil nil #'equal) 3))
+                 (error nil)))
+    (defun alist-get (key alist &optional default _remove testfn)
+      (let ((cur alist) (found nil) (result default))
+        (while (and cur (not found))
+          (let ((pair (car cur)))
+            (cond
+             ((not (consp pair)) (setq cur (cdr cur)))
+             ((cond
+               ((null testfn) (equal (car pair) key))
+               ((eq testfn 'eq) (eq (car pair) key))
+               ((eq testfn 'equal) (equal (car pair) key))
+               ((or (eq testfn 'string=) (eq testfn 'string-equal))
+                (and (stringp (car pair)) (stringp key) (equal (car pair) key)))
+               (t (funcall testfn (car pair) key)))
+              (setq result (cdr pair))
+              (setq found t))
+             (t (setq cur (cdr cur))))))
+        result)))
 
   ;; Put `anvil-el-dir' on `load-path' so any `(require 'anvil-orchestrator-routing)'
   ;; / `(require 'anvil-orchestrator-presets)' / etc. inside tool-module
@@ -426,6 +481,11 @@ nil for production (silent).")
   (load server-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] server-el done"))
+  ;; Keep the schema cache next to the fast-handshake cache so one state
+  ;; dir holds every persisted artefact of a standalone deployment.
+  (when (boundp 'anvil-server-schema-cache-file)
+    (setq anvil-server-schema-cache-file
+          (concat state-dir "/anvil-schema-cache.el")))
   (load server-commands-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] server-commands-el done"))
@@ -758,6 +818,13 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
       (anvil-server--batch-emit-response resp t))
     (anvil-server-stop)
     (setq anvil-runtime-shell--fast-pending-body nil))
+  ;; NeLisp v1.2.0: the reader has no process-exit primitive (Layer 2's
+  ;; `kill-emacs' returns without exiting), and `nelisp --load FILE'
+  ;; prints the value of FILE's last form to stdout on return -- a stray
+  ;; `t' behind the final MCP frame.  bin/anvil-runtime therefore starts
+  ;; the reader as bare `nelisp BOOTSTRAP', where the last form's value is
+  ;; the exit status instead, and ends the bootstrap with `0'.  Nothing to
+  ;; do here but return.
   (anvil-server-run-batch-stdio server-id))
 
 ;;; anvil-runtime-shell-loop.el ends here

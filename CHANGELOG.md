@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`bin/anvil-runtime` follows NeLisp v1.2.0** — the standalone
+  launcher now discovers the pure-elisp reader at `target/nelisp` /
+  `target/nelisp.exe` (windows-x86_64 is a full standalone target as of
+  NeLisp v1.2.0) and starts it as bare `nelisp BOOTSTRAP`, whose last
+  form's value is the exit status (the `--load` form prints it, which
+  left a stray `t` behind the final MCP frame).  The retired Rust-era
+  `target/release/nelisp exec` path stays as a fallback
+  (`NELISP_LOAD_MODE=exec`).  Under MSYS2 every path embedded in the
+  bootstrap is converted with `cygpath -m` so the native `nelisp.exe`
+  can read it; the driver's fast-handshake and schema caches move from
+  `/tmp/anvil-runtime` to `$ANVIL_RUNTIME_DAEMON_DIR` (default
+  `~/.anvil-runtime`); `ANVIL_RUNTIME_DEBUG=1` turns on the `[STEP]`
+  trace; `anvil-runtime doctor` reports the resolved layout and probes
+  the reader.  Measured on windows-x86_64: initialize → tools/list →
+  tools/call round-trip in 36 s cold (no schema cache), 23 s warm; the
+  May-2026 daemon needed 35-40 min.
+- **`scripts/anvil-runtime-shell-loop.el`** puts `nelisp-emacs/src` on
+  `load-path` itself (the v1.2.0 reader's `load` never binds
+  `load-file-name`, so emacs-init.el's own-directory step was a no-op),
+  re-provides the `nelisp` feature (anvil's documented standalone
+  marker, no longer supplied by the runtime), gates the `alist-get`
+  override on a functional probe now that the prelude ships a correct
+  one, and binds `temporary-file-directory` under the state dir when
+  the substrate leaves it unbound.
+- Requires the matching nelisp-emacs fixes (2026-09-04): `locate-library`
+  and the `file-exists-p` / `file-readable-p` / `file-directory-p` ports
+  no longer override a runtime definition that verifiably works,
+  `write-region` accepts a string START, the `backquote-*-symbol`
+  constants are defined, and the `src/cl-lib.el` shim is loaded by path
+  when the reader provides `cl-lib` natively but lacks `cl-member-if`.
+
 ## [1.3.0] - 2026-06-26
 
 Develop-line release focused on broader AI maintainer workflows: codebase
