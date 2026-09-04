@@ -489,6 +489,22 @@ nil for production (silent).")
   (load server-commands-el nil t)
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
     (nelisp--write-stderr-line "[STEP] server-commands-el done"))
+  ;; User config (`$ANVIL_CONFIG_DIR/config.el', XDG fallback).  README
+  ;; documents it as THE config source of the standalone path, but only
+  ;; anvil-host pulls anvil-config in, so this chain never read it.  Load
+  ;; it here, after anvil-server is real so the shim layer anvil-config
+  ;; requires stays inert, and before the tool modules so machine-specific
+  ;; pins such as `anvil-worklog-db-path' / `anvil-memory-db-path' are in
+  ;; place when their `defcustom's run.  A missing file is silent; a broken
+  ;; one is reported by anvil-config itself and never aborts the server.
+  (condition-case err
+      (require 'anvil-config nil t)
+    (error
+     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+       (nelisp--write-stderr-line
+        (concat "[shell-loop] anvil-config load ERR: " (format "%S" err))))))
+  (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
+    (nelisp--write-stderr-line "[STEP] anvil-config done"))
 
   ;; stdin shim — anvil-server-run-batch-stdio reads frames via
   ;; `read-from-minibuffer'; emacs-stdio.el's installer overrides the
@@ -672,22 +688,83 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
         (setq line (ignore-errors (read-from-minibuffer ""))))
       line))
 
+  ;; Module -> tool-id map learned from real registrations.  The static
+  ;; table below only knows the three original modules; anything else
+  ;; (anvil-state / anvil-memory / anvil-worklog once the reader has a
+  ;; sqlite backend, 2026-09-04) used to be silently skipped on the lazy
+  ;; path because no loader could be attributed to its tools.  Each eager
+  ;; load now records which ids a module added and persists the map
+  ;; under the state dir, so the next start can serve those tools lazily
+  ;; from the schema cache like the original three.
+  (defvar anvil-runtime-shell--module-tools-learned nil
+    "Alist (MODULE-NAME . TOOL-IDS) learned from eager module loads.")
+  (defvar anvil-runtime-shell--module-tools-file
+    (concat state-dir "/anvil-module-tools.el")
+    "Self-loading `(setq ...)' file persisting the learned map.")
+  (condition-case nil
+      (load anvil-runtime-shell--module-tools-file t t)
+    (error nil))
+
   (defun anvil-runtime-shell--module-tool-ids (module-name)
-    "Return the default MCP tool ids registered by MODULE-NAME."
-    (cond
-     ((string= module-name "anvil-discovery")
-      '("anvil-tools-by-intent" "anvil-tools-usage-report"))
-     ((string= module-name "anvil-sqlite")
-      '("sqlite-query"))
-     ((string= module-name "anvil-bench")
-      '("bench-compare" "bench-profile-expr" "bench-last"))
-     (t nil)))
+    "Return the MCP tool ids registered by MODULE-NAME, or nil if unknown."
+    (or (cdr (assoc module-name anvil-runtime-shell--module-tools-learned))
+        (cond
+         ((string= module-name "anvil-discovery")
+          '("anvil-tools-by-intent" "anvil-tools-usage-report"))
+         ((string= module-name "anvil-sqlite")
+          '("sqlite-query"))
+         ((string= module-name "anvil-bench")
+          '("bench-compare" "bench-profile-expr" "bench-last"))
+         (t nil))))
+
+  (defun anvil-runtime-shell--registered-tool-ids ()
+    "Return the tool ids currently registered under `server-id'."
+    (let ((bucket (and (boundp 'anvil-server--tools)
+                       (gethash server-id anvil-server--tools))))
+      (if bucket (hash-table-keys bucket) nil)))
+
+  (defun anvil-runtime-shell--tools-list-json ()
+    "Return the tools/list result object as JSON for `server-id'.
+Same concat of per-tool `:json-fragment's the real handler performs;
+rebuilt here because the handler deliberately does not populate its
+request cache on standalone, and the fast-handshake file must carry
+the cached placeholders AND whatever was eagerly registered."
+    (let ((bucket (and (boundp 'anvil-server--tools)
+                       (gethash server-id anvil-server--tools)))
+          (frags nil))
+      (when bucket
+        (maphash (lambda (_id tool)
+                   (let ((f (plist-get tool :json-fragment)))
+                     (when (stringp f) (push f frags))))
+                 bucket))
+      (and frags
+           (concat "{\"tools\":["
+                   (mapconcat #'identity (nreverse frags) ",")
+                   "]}"))))
+
+  (defun anvil-runtime-shell--remember-module-tools (module-name ids)
+    "Record that MODULE-NAME registered IDS and persist the map."
+    (when ids
+      (setq anvil-runtime-shell--module-tools-learned
+            (cons (cons module-name ids)
+                  (assoc-delete-all module-name
+                                    anvil-runtime-shell--module-tools-learned)))
+      (when (fboundp 'write-region)
+        (condition-case nil
+            (write-region
+             (concat ";; anvil-runtime module -> tool ids (auto-generated)\n"
+                     "(setq anvil-runtime-shell--module-tools-learned '"
+                     (prin1-to-string anvil-runtime-shell--module-tools-learned)
+                     ")\n")
+             nil anvil-runtime-shell--module-tools-file)
+          (error nil)))))
 
   (defun anvil-runtime-shell--load-tool-module (module-name)
     "Load MODULE-NAME from `anvil-el-dir' and call its enable function."
     (anvil-runtime-shell--ensure-polyfills-loaded)
     (let* ((file (concat anvil-el-dir "/" module-name ".el"))
-           (enable-sym (intern (concat module-name "-enable"))))
+           (enable-sym (intern (concat module-name "-enable")))
+           (before (anvil-runtime-shell--registered-tool-ids)))
       (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
         (nelisp--write-stderr-line
          (concat "[shell-loop] loading " file)))
@@ -697,7 +774,14 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
          (concat "[shell-loop] " (symbol-name enable-sym)
                  " fboundp=" (if (fboundp enable-sym) "t" "nil"))))
       (when (fboundp enable-sym)
-        (funcall enable-sym))
+        (funcall enable-sym)
+        ;; Only ids that appeared during this load, minus placeholders
+        ;; the lazy path registered earlier for the same module.
+        (let ((added nil))
+          (dolist (id (anvil-runtime-shell--registered-tool-ids))
+            (unless (member id before)
+              (push id added)))
+          (anvil-runtime-shell--remember-module-tools module-name added)))
       ;; Post-load substrate patches (= anvil-sqlite regex compat etc).
       ;; In lazy mode modules load one at a time, so run the patches after
       ;; each successful module load instead of once after an eager chain.
@@ -746,11 +830,18 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
                (if (> (length modules-env) 0) modules-env "<empty>"))))
     (when (> (length modules-env) 0)
       (let ((module-names nil)
-            (lazy-loaders nil))
+            (lazy-loaders nil)
+            (eager-names nil))
         (dolist (name (split-string modules-env "," t))
-          (let ((trimmed (if (fboundp 'string-trim) (string-trim name) name)))
+          (let* ((trimmed (if (fboundp 'string-trim) (string-trim name) name))
+                 (ids (anvil-runtime-shell--module-tool-ids trimmed)))
             (push trimmed module-names)
-            (dolist (tool-id (anvil-runtime-shell--module-tool-ids trimmed))
+            ;; A module whose tool ids are not known yet cannot be served
+            ;; lazily; load it eagerly so its tools still exist, and so
+            ;; the load records its ids for next time.
+            (unless ids
+              (push trimmed eager-names))
+            (dolist (tool-id ids)
               (let ((module-name trimmed))
                 (push
                  (cons tool-id
@@ -758,15 +849,28 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
                          (anvil-runtime-shell--load-tool-module module-name)))
                  lazy-loaders)))))
         (setq module-names (nreverse module-names))
+        (setq eager-names (nreverse eager-names))
         (let ((lazy-count
                (and (fboundp 'anvil-server-register-cached-tool-fragments)
                     (anvil-server-register-cached-tool-fragments
                      server-id lazy-loaders))))
           (cond
            ((and lazy-count (> lazy-count 0))
-            (let ((tools-json
-                   (and (boundp 'anvil-server--tools-list-cache)
-                        (gethash server-id anvil-server--tools-list-cache))))
+            (dolist (trimmed eager-names)
+              (condition-case err
+                  (anvil-runtime-shell--load-tool-module trimmed)
+                (error
+                 (when (and anvil-server--debug-trace
+                            (fboundp 'nelisp--write-stderr-line))
+                   (nelisp--write-stderr-line
+                    (concat "[shell-loop] " trimmed
+                            " eager load/enable ERR: "
+                            (format "%S" err)))))))
+            ;; The fast-handshake file must advertise the FULL list:
+            ;; the cached fragments plus whatever the eager loads above
+            ;; registered.  Rebuild it through the real tools/list
+            ;; handler rather than the fragments-only cache entry.
+            (let ((tools-json (anvil-runtime-shell--tools-list-json)))
               (when (and (stringp tools-json)
                          (fboundp 'write-region))
                 (condition-case nil
@@ -780,8 +884,8 @@ Uses CR-strip to recognise lines that are CRLF artefacts as blank."
             (when (and anvil-server--debug-trace
                        (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
-               (format "[shell-loop] lazy cached tool fragments=%d"
-                       lazy-count))))
+               (format "[shell-loop] lazy cached tool fragments=%d eager=%S"
+                       lazy-count eager-names))))
            (t
             ;; Cache missing or empty: fall back to the old eager path so a
             ;; first-ever run can still generate and persist schema cache.

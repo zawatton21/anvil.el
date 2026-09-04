@@ -421,10 +421,13 @@ filesystem primitive is available."
 ;; --- sqlite FFI wire-up via emacs-sqlite-ffi + vendor sqlite.el ------
 
 ;; Standalone NeLisp ships:
-;;   - `emacs-sqlite-ffi.el' (in nelisp-emacs/src/) — uses the in-process
-;;     `nl-ffi-call' primitive against `libnelisp_runtime.so' to provide
-;;     real `sqlite-available-p' / `sqlite-open' / `sqlite-close' /
-;;     `sqlite-execute' / `sqlite-select' / `sqlitep' implementations.
+;;   - `emacs-sqlite-ffi.el' (in nelisp-emacs/src/) — since 2026-09-04
+;;     (NeLisp v1.2.0 + Doc 138 SQLite arm) builds the Emacs `sqlite-*'
+;;     API on the reader's name-dispatch `nl-ffi-call' sqlite3 rows
+;;     (winsqlite3.dll on windows-x86_64, libsqlite3.so.0 on the dynamic
+;;     Linux reader), including a real `set' cursor with
+;;     `sqlite-next' / `sqlite-more-p' / `sqlite-finalize'.  Before
+;;     that it spoke to the retired `libnelisp_runtime.so'.
 ;;   - `vendor/emacs-lisp/sqlite.el' — upstream Emacs sqlite.el, ships
 ;;     the `with-sqlite-transaction' macro and `(provide 'sqlite)' so
 ;;     `(require 'sqlite)' from anvil-* downstreams resolves.
@@ -497,19 +500,21 @@ filesystem primitive is available."
 ;;       (let ((row (sqlite-next stmt))) ...))
 ;;     (when stmt (sqlite-finalize stmt)))
 ;;
-;; emacs-sqlite-ffi.el's `sqlite-select' returns the full row list
-;; directly regardless of RETURN-TYPE.  We capture that FFI implementation
-;; into a defvar (= done AFTER the require above runs), then redefine
-;; `sqlite-select' with a cursor-aware wrapper that delegates to the
-;; captured FFI function and tags the row list as a
-;; `(:anvil-sqlite-cursor . REMAINING-ROWS)' cons when RETURN-TYPE is
-;; `set' or `full'.
+;; The retired emacs-sqlite-ffi.el returned the full row list regardless
+;; of RETURN-TYPE, so the wrapper below re-shaped it into a list-backed
+;; cursor.  The 2026-09-04 adapter implements the Emacs cursor protocol
+;; itself (`sqlite-more-p' is defined), in which case the wrapper and the
+;; list-backed helpers must stay out of the way: they only install when
+;; the substrate's `sqlite-select' comes without `sqlite-more-p'.
 
 (defvar anvil-runtime-polyfills--sqlite-select-impl
-  (and (fboundp 'sqlite-select) (symbol-function 'sqlite-select))
-  "Captured emacs-sqlite-ffi `sqlite-select' implementation.
-Used by the cursor-aware override below so the wrapper delegates
-to the real FFI without infinite recursion.")
+  (and (fboundp 'sqlite-select)
+       (not (fboundp 'sqlite-more-p))
+       (symbol-function 'sqlite-select))
+  "Captured legacy emacs-sqlite-ffi `sqlite-select' implementation.
+Nil when the substrate already speaks the Emacs cursor protocol.  Used
+by the cursor-aware override below so the wrapper delegates to the real
+FFI without infinite recursion.")
 
 (when anvil-runtime-polyfills--sqlite-select-impl
   (defun sqlite-select (db query &optional values return-type)

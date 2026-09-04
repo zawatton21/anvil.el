@@ -39,6 +39,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `write-region` accepts a string START, the `backquote-*-symbol`
   constants are defined, and the `src/cl-lib.el` shim is loaded by path
   when the reader provides `cl-lib` natively but lacks `cl-member-if`.
+- **DB-backed tools on the standalone reader** — with NeLisp's SQLite
+  arm (Doc 138: `sqlite3_*` rows over the inbox `winsqlite3.dll` /
+  `libsqlite3.so.0`, plus `ptr-read-bytes` / `ptr-write-bytes`) and the
+  rewritten nelisp-emacs `emacs-sqlite-ffi.el`, `sqlite-query`,
+  `memory-*` and `worklog-*` now run under `bin/anvil-runtime`.  The
+  driver learns which tool ids each module registers
+  (`<state>/anvil-module-tools.el`) so modules beyond the original three
+  are served lazily from the schema cache on later starts, and modules
+  without a learned map are loaded eagerly instead of being skipped; the
+  fast-handshake file is rebuilt from the live registry so it advertises
+  every tool.  `anvil-config` (`$ANVIL_CONFIG_DIR/config.el`, XDG
+  fallback) is loaded by the driver, which is where machine-specific
+  pins such as `anvil-worklog-db-path` belong.  The legacy list-backed
+  sqlite cursor polyfill now steps aside when the substrate provides
+  `sqlite-more-p`.  Measured on windows-x86_64 with six modules: first
+  ever start 534 s (schema generation for ~40 tools), warm start 26 s,
+  fast handshake 1.2 s to the initialize response.
+
+### Changed (standalone driver defaults)
+
+- `ANVIL_TOOL_MODULES` still defaults to the three original modules;
+  set it to
+  `anvil-discovery,anvil-sqlite,anvil-bench,anvil-state,anvil-memory,anvil-worklog`
+  to expose the DB-backed tools (the canonical DB paths come from
+  `config.el` or `ANVIL_WORKLOG_DB` / `ANVIL_MEMORY_DB`).
 
 ## [1.3.0] - 2026-06-26
 
