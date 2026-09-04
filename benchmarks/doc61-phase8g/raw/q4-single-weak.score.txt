@@ -1,0 +1,1 @@
+q4 score=3/6 required=4/6 traps=1

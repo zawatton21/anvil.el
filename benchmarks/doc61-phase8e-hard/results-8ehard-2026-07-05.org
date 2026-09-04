@@ -1,0 +1,182 @@
+#+title: Doc 61 Phase 8e-HARD -- de-saturation end-to-end eval results
+#+date: 2026-07-05
+#+author: zawatton + Claude
+
+* Setup
+
+- Worktree: isolated detached checkout at =72e2aed= (never the main
+  =dev/anvil.el= repo, which another process was editing concurrently).
+  Modules read-only for this eval; harness lives entirely in scratch
+  space (=scratchpad/doc61-phase8e-hard-eval/=), archived copies of
+  =run.el= / =run_one.sh= alongside this file's raw/ siblings are NOT
+  committed (per spec, no commit was made).
+- Runner: =anvil-fusion-longrun-run=, adapted from the proven
+  =benchmarks/doc61-phase8e/raw/harness-run.el= pattern -- one run at a
+  time, fresh =fixtures/hardN= copy + throwaway =git init= per run in a
+  non-repo scratch cwd, standalone batch Emacs with sandboxed
+  =anvil-state-db-path= / =anvil-orchestrator-work-dir=.
+- Arms (both get the Phase 8f =:agentic 'force= permission enablement,
+  no global =anvil-orchestrator-permission-mode= override needed this
+  time -- the per-quest kwarg was sufficient):
+  - baseline :: =(anvil-fusion-longrun-run GOAL :provider 'claude
+    :max-steps 12 :timeout-sec 300 :cwd TASKDIR :agentic 'force)=
+  - full :: same + =:step-panel 'opus-solo :step-panel-mode 'hard-only
+    :verify-steps t=
+- GOAL = fixture =TASK.md= prefixed with exactly the spec's Japanese
+  work-dir instruction ("作業ディレクトリは TASKDIR。ファイルを直接編集
+  してよい。作業ディレクトリ内で make check 等のコマンドを実行して自分
+  の変更を検証すること。完了条件は make check が通ること。").
+- Scoring: visible = =make check= in the post-run task dir; hidden =
+  =score.sh TASKDIR N= (ground-truth completion metric, hidden suite is
+  larger than the visible suite for every task -- 7 hidden tests vs
+  5/4/5 visible tests for hard1/hard2/hard3).
+- Caps honored: max-steps 12, 300s per-step timeout, 30-min wall kill
+  (=timeout 1800= around the batch Emacs) -- never triggered, one run at
+  a time, sequential (task-major: hard1 baseline+full, hard2
+  baseline+full, hard3 baseline+full).
+
+* Smoke result
+
+hard1/baseline ran end-to-end on the *first* attempt (no retry needed):
+completed in 2 steps, 160s wall, $0.81, visible PASS, hidden PASS.
+Unlike the original 8e smoke (which hit a permission blocker on attempt
+1 and needed the harness fix + 1 retry), the Phase 8f =:agentic 'force=
+kwarg worked correctly out of the box for the step-function path. Per
+protocol this cleared the smoke gate and the run proceeded straight to
+the full 6-run battery.
+
+* Per-run results
+
+All numbers from =raw/hardN-<arm>.meta.sexp= (cost = sum of
+=:cost-usd= across every orchestrator extract-result in the quest's
+dynamic extent + panel candidate costs; wall = outer wall from
+=run_one.sh=, matching in-process quest wall to within ~1s in every
+run).
+
+| task  | arm      | visible | hidden | steps | panel-steps | gate-failures | wall (s) | cost (USD) |
+|-------+----------+---------+--------+-------+-------------+---------------+----------+------------|
+| hard1 | baseline | PASS    | PASS   |     2 |           0 |             0 |      160 |     0.8138 |
+| hard1 | full     | PASS    | PASS   |     1 |           0 |             0 |      222 |     0.7942 |
+| hard2 | baseline | PASS    | PASS   |     1 |           0 |             0 |      218 |     1.0051 |
+| hard2 | full     | PASS    | PASS   |     1 |           0 |             0 |      230 |     0.8784 |
+| hard3 | baseline | PASS    | PASS   |     1 |           0 |             0 |      125 |     0.6259 |
+| hard3 | full     | PASS    | PASS   |     1 |           0 |             0 |      158 |     0.6954 |
+
+Gate column detail: every full-arm run's single verify gate reported
+=:gate pass= on the first attempt (see each run's
+=trace= in =raw/hardN-full.meta.sexp=). Zero gate retries fired anywhere
+in this battery, so there are no refuted claims to quote.
+
+* Aggregate comparison
+
+| arm      | hidden completion | visible completion | mean steps | mean wall (s) | mean cost | total cost |
+|----------+-------------------+--------------------+------------+---------------+-----------+------------|
+| baseline | 3/3               | 3/3                |       1.33 |         167.7 |   $0.8149 |    $2.4448 |
+| full     | 3/3               | 3/3                |       1.00 |         203.3 |   $0.7893 |    $2.3680 |
+
+- Total battery spend: *$4.81* (well inside the $20-40 estimate -- the
+  step agent again resolved almost every task in a single step).
+- Total wall across all 6 runs: 1,113s (~18.5 min); no run approached
+  the 300s step timeout or the 1800s (30 min) hard wall kill.
+- Gate events: 3 verify gates evaluated (one per full-arm run, since
+  every full run finished at step 1), all =pass= on the first
+  attempt. *Zero* =gate-failures= anywhere -- no retry ever fired, so
+  no case exists where a gate retry changed an outcome.
+- Panel events: =:panel-steps= 0 in every full run, identical to the
+  original 8e result. Under =hard-only= mode, step 1 is never eligible
+  for the panel (the gate reads the *previous* step's distilled
+  =NEXT-HARD:= signal, and there is no step 0) -- every full-arm quest
+  here again finished at step 1, so the =opus-solo= panel was never
+  invoked even once across the whole battery.
+
+* Honest interpretation
+
+1. *The de-saturation battery also saturated.* Despite fixtures
+   deliberately built with a naive visible-passing/hidden-failing gap
+   (confirmed structurally: each hidden suite runs 7 tests against 4-5
+   visible tests, and the unpatched fixture fails both), the baseline
+   single-provider agent solved all three hard tasks correctly on the
+   *first* real attempt, passing both the visible suite and the larger
+   hidden suite every time. It did not take the naive-patch bait in any
+   of the three tasks. With baseline already at 3/3 hidden, the full
+   harness (panel + verify gate) had nothing to rescue and produced an
+   identical 3/3 hidden outcome -- this run still cannot answer whether
+   panel+verify improves completion, only that it adds overhead when
+   completion is already saturated.
+2. *The overhead of the full arm this time is directionally the same as
+   8e but noisier*: full arm's mean wall was +35.6s (+21%) over
+   baseline, but mean cost was *lower* ($0.7893 vs $0.8149) -- the
+   opposite sign from 8e's finding (there, full cost slightly more).
+   This is most likely explained by baseline's hard1 run needing 2
+   steps (extra distill-call cost) while every full run converged in
+   1 step; it is not evidence that verify-gate overhead is negative,
+   just that step-count variance at n=1 swamps the true per-step verify
+   tax.
+3. *A real architectural boundary surfaced in the digests, harmless
+   here but worth flagging*: in 3 of 6 final digests (hard1-full,
+   hard2-baseline, hard3-full) -- plus hard1-baseline's intermediate
+   step-1 digest, self-corrected by step 2 -- the model's own
+   step/distill narrative reports that a *second* attempt to re-run
+   `make check` (as a self-check before finalizing) was blocked by
+   "sandbox approval" -- e.g. hard2-baseline's digest: 「`make check`
+   は全4テスト通過（このセッションでは対話承認が必要なため再実行未確認、
+   次ステップで再検証推奨）」. Root cause: `:agentic` extras
+   (`bypassPermissions`) are threaded into the step-function's/panel
+   member's orchestrator task via `anvil-fusion--agentic-extras`, but
+   `anvil-fusion-longrun--default-distill-fn` builds its
+   `anvil-fusion-longrun--run-one` call with **no member-extras
+   argument at all** -- the distill call always runs under the
+   orchestrator's plain default (`acceptEdits`), never inheriting
+   `:agentic`. In every run here this only affected a *redundant*
+   self-re-verification the agent attempted after already having run
+   `make check` successfully in the same step, so no run's correctness
+   was harmed and the bash harness's own post-hoc `make check`/`score.sh`
+   scoring (unaffected by any of this) still passed. But it means: if a
+   future quest design relies on the *distill* phase (or the verify-gate's
+   claim-extraction phase, which is a similarly bare orchestrator call)
+   to independently re-run build/tests, it will hit the same silent
+   permission wall the original 8e smoke hit in the step phase. This is
+   a gap in the Phase 8f fix's coverage, not a bug in this eval's
+   harness.
+4. Cost accounting caveat (same as 8e): per-run `:cost-usd` sums every
+   `anvil-orchestrator-extract-result` in the quest's dynamic extent
+   (steps + distills + verify sub-calls) plus fusion-ask candidate
+   costs (none fired, panel-steps=0 everywhere). Figures are lower
+   bounds where a sub-call reported no numeric cost.
+
+* Limitations
+
+- n=1 per (task, arm): no variance estimate; a single sample per cell,
+  same caveat as 8e.
+- Ceiling effect persists even in the harder battery -- to discriminate
+  the arms empirically, tasks need to defeat a modern Claude
+  Code-driven step agent with real Bash/build access at a measurable
+  rate. These fixtures defeat a *naive one-shot patch* (per the
+  README's verification contract) but not an agent that can actually
+  run `make check`, read its own failures, and iterate -- which is
+  exactly what both arms here were granted via `:agentic 'force`.
+- The panel path (opus-solo, hard-only gating) and the gate-retry path
+  (REFUTED-claim feedback loop) were structurally reachable but never
+  triggered in this battery either -- this eval does not validate their
+  end-to-end behavior on a genuinely-hard case, only that they add
+  bounded overhead and never fire spuriously.
+- The distill-phase permission gap (finding #3 above) was observed as a
+  narrated self-report inside the model's own digest text, not
+  independently instrumented by this harness (no separate log of the
+  distill call's raw stderr/permission-denial event) -- treat it as a
+  strong qualitative signal, not a hard-instrumented count.
+- Both arms again had full local build/test execution rights via
+  `:agentic 'force`; results under the orchestrator's shipped default
+  permission mode (`acceptEdits`, no override) would look categorically
+  different, per the original 8e attempt-1 evidence.
+
+* Artifacts
+
+- =raw/hardN-<arm>.digest.txt= -- final carried digest per run
+- =raw/hardN-<arm>.score.txt= -- visible + hidden outcomes + meta dump
+- =raw/hardN-<arm>.checkpoint.sexp= -- last per-step checkpoint
+- =raw/hardN-<arm>.meta.sexp= -- steps/stopped/panel/gate/wall/cost/trace
+- Harness scripts (=run.el=, =run_one.sh=) live only in scratch space
+  (=/tmp/.../scratchpad/doc61-phase8e-hard-eval/=), not copied into the
+  worktree/repo, per the "do NOT commit" instruction; this results file
+  and =raw/= are the only artifacts left under the worktree.

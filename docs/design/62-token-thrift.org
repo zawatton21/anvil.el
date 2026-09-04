@@ -49,7 +49,7 @@ patterns (test runs, re-reads) return unbounded text.
 | 4     | verdict cache (SQLite, TTL) for verified claims        | verify  | SHIPPED (anvil-state KV; decisive-only; skeptic-skip on hit) |
 | 5     | sequential (early-exit) skeptics                       | verify  | SHIPPED (1 skeptic first; escalate on unverified / KB-conflict / weak reason) |
 | 6     | KB numeric-match mechanical checker                    | verify  | SHIPPED (zero-LLM confirms for :kind number; opt-in checker) |
-| 7     | judge-input dedup (representative + delta for agreeing candidates) | fusion | SHIPPED (opt-in; 2-cand fixture 13.3K -> 7.1K = 53.5%) |
+| 7     | judge-input dedup (representative + delta for agreeing candidates) | fusion | SHIPPED (opt-in; 2-cand fixture 13.3K -> 7.1K = 53.5%)— default-ON check 2026-07-04: no degradation on the one comparable live case (b03 2/2 both arms, cost -21%) but lens-diversified panels rarely produce >=0.9-jaccard candidates, so the dedup-FIRED path stays unexercised; remains opt-in |
 | 8     | diff-first re-read tool (session content-hash cache)   | file    | SHIPPED 13adeb2 (40K file, 3-line edit: 40,128 -> 318 chars) |
 | 9     | disclosure budget as repo-wide default for heavy tools | server  | SHIPPED 9408e79 + b8c9f3b (search clamps: 28.5K -> 3.7K per 10-hit search; generic budget ships disabled, file-read exempt) |
 

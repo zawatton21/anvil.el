@@ -1,0 +1,3 @@
+Created `q4.org` with the full OCR tap-setting derivation (this directory isn't actually a git repo, so no commit was made — no SHA to report).
+
+**Result:** I1 (6.6kV換算) ≒96.7A → I2 (CT二次換算, CT比100/5) ≒4.84A → 直近上位タップ **5A**。機器名:過電流継電器(OCR)、制御器具番号:**51**。根拠:JEAC 8011 保護協調の考え方+電気事業法第42条の保安規程。

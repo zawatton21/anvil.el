@@ -1,0 +1,13 @@
+(:id "q3"
+ :required ((:key "省令第5?8条" :desc "低圧絶縁抵抗の根拠条文" :points 1)
+            (:key "第1?7条" :desc "接地抵抗の根拠条文" :points 1)
+            (:key "0\\.1\\s-*MΩ" :desc "低圧絶縁抵抗の法定値0.1MΩ" :points 1)
+            (:key "0\\.2\\s-*MΩ" :desc "低圧絶縁抵抗の法定値0.2MΩ" :points 1)
+            (:key "0\\.4\\s-*MΩ" :desc "低圧絶縁抵抗の法定値0.4MΩ" :points 1)
+            (:key "100\\s-*V" :desc "100V回路の値に触れる" :points 1)
+            (:key "200\\s-*V" :desc "200V三相回路の値に触れる" :points 1)
+            (:key "B種\\|C種" :desc "接地種別に触れる" :points 1))
+ :traps ((:key "30\\s-*MΩ" :desc "JIS/JEM目安値30MΩを法定値扱い" :penalty 1)
+         (:key "5\\s-*MΩ" :desc "高圧回路目安値5MΩを法定値扱い" :penalty 1)
+         (:key "20\\s-*MΩ" :desc "高圧回路目安値20MΩを法定値扱い" :penalty 1))
+ :max-score 8)

@@ -1,0 +1,17 @@
+**状態: strutil ライブラリ補完タスク**
+
+対象: `strutil-core.el`, `strutil-format.el`（作業ディレクトリ: fixtures-work/task1-baseline）
+
+## 完了した修正
+1. **`strutil-truncate`**: 省略記号 `...` を含めた合計が N 文字以内になるように修正（N文字以内なら元のまま返す挙動は維持）。
+2. **`strutil-display-width`**: 全角文字（`strutil-wide-char-p` が non-nil を返す文字）を2カラム、それ以外を1カラムとして幅を計算するよう修正（単純な `length` 依存を解消）。
+3. **`strutil-join-nonempty`**: 新規実装。リストから `nil` および空文字列を除外し、残りを SEP で連結する関数（シグネチャ: `(strutil-join-nonempty strings sep)`）。
+
+## 検証結果
+`make check` 実行 → 7件のテスト全てpass。
+
+## スコープ
+上記3関数以外の変更なし。新規ファイル追加なし。コミットは未依頼のため未実施（作業ツリーに変更が残っている状態）。
+
+## 残作業
+なし。完了条件（`make check` が通ること）は満たされている。

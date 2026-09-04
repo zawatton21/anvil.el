@@ -1,0 +1,1 @@
+q1 score=1/5 required=3/5 traps=2

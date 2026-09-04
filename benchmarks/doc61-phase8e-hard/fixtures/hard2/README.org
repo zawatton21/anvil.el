@@ -1,0 +1,24 @@
+#+title: hard2 -- rq mini records/query DSL
+
+* Overview
+
+This fixture is a tiny query pipeline over alist-backed records. Queries
+are written as pipe-separated clauses, for example:
+
+#+begin_example
+from tickets | join users on owner=id | where users.team=ops | group-by users.team
+#+end_example
+
+No single file contains the whole contract:
+
+- This README defines grouped-output ordering: groups are sorted by count
+  descending, and ties keep the order of the *first row that entered that
+  group*.
+- =TASK.md= describes the new =join= /=group-by= feature and states that
+  empty grouped results are valid and should not signal.
+- =rq-data.el= docstrings define qualified-field lookup for joined rows.
+- Visible test comments only exercise a non-empty grouped happy path.
+
+The join is an inner join. Right-table fields are added under qualified
+names like =users.team= while left-table fields stay available under their
+original names.

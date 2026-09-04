@@ -1,0 +1,128 @@
+--- a/rq-eval.el
++++ b/rq-eval.el
+@@ -16,6 +16,39 @@
+   (let ((pred (rq-compile-predicate field value)))
+     (seq-filter pred rows)))
+ 
++(defun rq--apply-join (rows right-rows dataset left-field right-field)
++  "Inner-join ROWS against RIGHT-ROWS, preserving input order."
++  (let ((out nil))
++    (dolist (row rows)
++      (dolist (right right-rows)
++        (when (equal (rq-row-get row left-field)
++                     (rq-row-get right right-field))
++          (push (append row
++                        (mapcar (lambda (cell)
++                                  (cons (intern (format "%s.%s" dataset (car cell)))
++                                        (cdr cell)))
++                                right))
++                out))))
++    (nreverse out)))
++
++(defun rq--apply-group-by (rows field)
++  "Group ROWS by FIELD, keeping first-seen order for stable tie sorting."
++  (let ((groups nil)
++        (order 0))
++    (dolist (row rows)
++      (let* ((key (rq-row-get row field))
++             (cell (assoc key groups)))
++        (if cell
++            (setcdr (assq :count (cdr cell))
++                    (1+ (cdr (assq :count (cdr cell)))))
++          (push (cons key
++                      (list (cons :key key)
++                            (cons :count 1)
++                            (cons :order order)))
++                groups)
++          (setq order (1+ order)))))
++    (mapcar #'cdr (nreverse groups))))
++
+ (defun rq-run (env query)
+   "Run QUERY against ENV and return raw rows."
+   (let ((clauses (rq-parse-query query))
+@@ -26,6 +59,14 @@
+          (setq rows (copy-tree (rq--dataset env name))))
+         (`(where ,field ,value)
+          (setq rows (rq--apply-where rows field value)))
++        (`(join ,dataset ,left-field ,right-field)
++         (setq rows (rq--apply-join rows
++                                    (rq--dataset env dataset)
++                                    dataset
++                                    left-field
++                                    right-field)))
++        (`(group-by ,field)
++         (setq rows (rq--apply-group-by rows field)))
+         (_
+          (error "Unsupported clause in evaluator: %S" clause))))
+     rows))
+--- a/rq-format.el
++++ b/rq-format.el
+@@ -10,16 +10,16 @@
+     (and first (assq :count first))))
+ 
+ (defun rq--sort-groups (groups)
+-  "Sort GROUPS by count descending, then key alphabetically."
++  "Sort GROUPS by count descending, preserving first-seen order on ties."
+   (sort (copy-sequence groups)
+         (lambda (a b)
+           (let ((count-a (cdr (assq :count a)))
+                 (count-b (cdr (assq :count b)))
+-                (key-a (cdr (assq :key a)))
+-                (key-b (cdr (assq :key b))))
++                (order-a (cdr (assq :order a)))
++                (order-b (cdr (assq :order b))))
+             (if (/= count-a count-b)
+                 (> count-a count-b)
+-              (string< key-a key-b))))))
++              (< order-a order-b))))))
+ 
+ (defun rq-format-result (result)
+   "Format RESULT as display lines."
+@@ -31,10 +31,13 @@
+               (rq--sort-groups result))
+     (mapcar (lambda (row)
+               (format "%s"
+-                      (mapconcat (lambda (cell)
+-                                   (format "%s=%s" (car cell) (cdr cell)))
+-                                 row
+-                                 " ")))
++                      (mapconcat
++                       (lambda (field)
++                         (format "%s=%s" field (rq-row-get row field)))
++                       (if (rq-row-get row 'users.id)
++                           '(id owner status users.id users.team)
++                         '(id owner status))
++                       " ")))
+             result)))
+ 
+ (defun rq-run-lines (env query)
+--- a/rq-parse.el
++++ b/rq-parse.el
+@@ -13,6 +13,13 @@
+     (list 'where
+           (match-string 1 clause)
+           (string-trim (match-string 2 clause))))
++   ((string-match "\\`join[ \t]+\\([A-Za-z0-9_-]+\\)[ \t]+on[ \t]+\\([A-Za-z0-9_.-]+\\)=\\([A-Za-z0-9_.-]+\\)\\'" clause)
++    (list 'join
++          (intern (match-string 1 clause))
++          (match-string 2 clause)
++          (match-string 3 clause)))
++   ((string-match "\\`group-by[ \t]+\\([A-Za-z0-9_.-]+\\)\\'" clause)
++    (list 'group-by (match-string 1 clause)))
+    (t
+     (error "Unsupported clause: %s" clause))))
+ 
+--- a/rq-predicate.el
++++ b/rq-predicate.el
+@@ -6,9 +6,8 @@
+ 
+ (defun rq-compile-predicate (field value)
+   "Compile FIELD=VALUE into a predicate over one row."
+-  (let ((field-sym (rq--field-symbol field)))
+-    (lambda (row)
+-      (equal (alist-get field-sym row nil nil #'eq) value))))
++  (lambda (row)
++    (equal (rq-row-get row field) value)))
+ 
+ (defun rq-compose-predicates (predicates)
+   "Compose PREDICATES with logical AND."

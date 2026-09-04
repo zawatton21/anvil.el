@@ -1,0 +1,242 @@
+#+title: Doc 61 Phase 8e -- agentic-fusion end-to-end eval fixtures (no live LLM calls)
+#+date: 2026-07-04
+#+author: zawatton + Claude
+
+* Purpose
+
+Doc 61 (=docs/design/61-fusion-verify.org=) Phase 8 ("Agentic fusion --
+deep x wide") shipped plan fusion (8a), longrun step = fusion panel
+(8b), and the inter-step verify gate (8c). Those phases were validated
+by unit-level ERT + the Phase 6/6e judge-behavior benchmarks
+(=benchmarks/doc61-phase6a/=, =benchmarks/doc61-phase6e/=), but none of
+those exercise the *whole stack together* against a real multi-step
+coding task: an autonomous agent editing files, running a build/test
+command, iterating, and finishing -- with an *objective, hidden*
+pass/fail at the end.
+
+This directory is that missing piece: three small, self-contained
+"task repos" with a visible Makefile =check= target and a
+natural-language =TASK.md=, plus a hidden acceptance-test set kept
+*outside* each task repo so a scored agent run cannot read its own
+grading criteria. This directory is *fixtures + scoring script only* --
+no live LLM calls, no orchestrator invocation. A future runner drives
+=anvil-fusion-longrun-run= (see =anvil-fusion-longrun.el=) with
+=:cwd= pointed at a task repo and then calls =score.sh= against the
+result.
+
+* Eval design
+
+** Arms
+
+Two conditions, both run as an =anvil-fusion-longrun-run= quest whose
+goal text is the task repo's =TASK.md= plus an instruction to run
+=make check= before declaring the step done:
+
+- *Arm A -- baseline*: =anvil-fusion-longrun-run= with a single
+  provider/model (no =:step-panel=, no =:verify-steps=) -- one model,
+  one voice, per step. This is the Doc 55 longrun as shipped before
+  Phase 8.
+- *Arm B -- full harness*: the same longrun quest with
+  =:step-panel 'opus-solo=, =:step-panel-mode 'hard-only= (panel only
+  fires on steps the previous distill flagged =NEXT-HARD: yes=, per
+  =anvil-fusion-longrun.el='s =anvil-fusion-longrun--panel-step-p=),
+  and =:verify-steps t= (Phase 6 verifier gate between every step,
+  =anvil-fusion-longrun--gate-result= / one feedback retry on a
+  REFUTED claim before surfacing, per Doc 61 8c).
+
+Arm B is strictly more expensive per hard step (k=3 opus-solo members
++ judge, Doc 61 7's "~4x single ask" note) but should show fewer
+wasted steps on the harder tasks (2 and 3) where a superficial
+single-pass fix is easy to produce and easy for the verify gate /
+panel judge to catch as incomplete.
+
+** Metrics
+
+For each (arm, task) run, record:
+
+- *completion* -- did the *hidden* acceptance tests pass (see
+  =score.sh=)? This is the only ground-truth correctness signal; the
+  visible =make check= passing is necessary but not sufficient (a
+  fixture can pass visible tests via a superficial/overfit patch --
+  see "Verification" below).
+- *steps* -- =:steps= from the longrun result plist (budget consumed).
+- *gate events* -- =:gate-failures= from the longrun result (Arm B
+  only; always 0 for Arm A since =verify-steps= is off), plus per-step
+  =:gate= values (=pass= / =retried-pass= / =failed=) from =:trace=.
+- *panel steps* -- =:panel-steps= (Arm B only) -- how many steps
+  actually consumed panel budget vs. fell back to single-provider
+  (budget is =anvil-fusion-longrun-max-panel-steps=, default 3).
+- *cost* -- sum of provider-call cost for the run (orchestrator
+  per-call cost accounting, same source as the =$15.01= figure quoted
+  in Doc 61's Phase 6e measurement) -- Arm B's panel/judge calls must
+  be counted in full, not amortized.
+- *wall* -- wall-clock seconds for the whole quest (step time +
+  distill time + any panel/verify overhead).
+
+** Scoring procedure
+
+1. Runner initializes a fresh git repo at a scratch copy of
+   =fixtures/taskN/= (=git init= + commit; this directory intentionally
+   ships the fixture *content* only, not a =.git/=, so every run starts
+   from an identical clean state).
+2. Runner drives the longrun quest with =:cwd= = that scratch repo,
+   goal = =TASK.md= contents + "run =make check= and stop when it
+   passes" (or the arm's own termination/convergence logic).
+3. After the quest stops (=:stopped= = =done= / =converged= /
+   =budget=), the runner calls:
+   #+begin_src shell
+   ./score.sh <scratch-repo-path> <task-number>
+   #+end_src
+   =score.sh= copies the matching =hidden/taskN-hidden-test.el= into a
+   throwaway copy of the repo's top-level =*.el= sources (never the
+   agent's own =tests/=) and runs it batch-style; prints =PASS= or
+   =FAIL= plus a one-line ERT summary; exit code 0/1 accordingly.
+4. *completion* = the =score.sh= exit code. Visible =make check=
+   passing is logged separately as a secondary signal (distinguishes
+   "agent gave up without a green build" from "agent shipped a build
+   that passes visible tests but not the real spec").
+
+** Cost caps (both arms, all tasks)
+
+- =max-steps 8= (=:max-steps= to =anvil-fusion-longrun-run=) -- every
+  task is calibrated for 3-6 focused steps (see below), so 8 is
+  slack, not headroom to explore.
+- =step timeout 240s= (=:timeout-sec=) per step/distill call -- each
+  task's own =make check= finishes in under 20s, so 240s is
+  generous for a step that also edits files and reasons before
+  running it.
+- These caps bound worst-case Arm B cost: 8 steps x up to
+  =anvil-fusion-longrun-max-panel-steps= (default 3) hard-panel steps
+  x (k=3 members + judge) plus non-panel single-provider steps for the
+  remainder, well inside a single-eval budget comparable to Phase 6e's
+  =$15.01= full-battery run.
+
+* Task difficulty calibration
+
+Each task is sized for a competent agent at *3-6 focused steps*: read
+=TASK.md= + source, form a plan, make 1-2 edits, run =make check=,
+iterate once on a missed edge case, confirm green. None is a one-shot
+trivial fix (each bundles 2-3 distinct issues) and none is
+open-ended (scope is explicitly bounded in =TASK.md=). All three are
+pure Elisp, zero external dependencies, and =make check= finishes in
+well under 20s (all three fixtures were timed at ~0.001-0.2s on this
+machine).
+
+| Task | Library                              | Issue shape                                                             |
+|------+---------------------------------------+--------------------------------------------------------------------------|
+|    1 | string/parsing (=strutil-*.el=)      | off-by-one truncation bug + CJK display-width (encoding) bug + a function referenced by tests but never defined |
+|    2 | state machine (=flow.el=)            | a transition documented in the file's own spec comment but missing from the transition table, plus a subtle regression (one existing transition silently targets the wrong state) |
+|    3 | data-transform pipeline (=agg-*.el=) | =TASK.md= specifies NA-exclusion + a =:skipped= counter + 2-decimal rounding + a no-crash-on-empty-input requirement, of which the visible tests only exercise the NA-free happy path |
+
+* Fixtures layout
+
+#+begin_example
+benchmarks/doc61-phase8e/
+  README.org                     -- this file
+  score.sh                       -- hidden-test scorer (see above)
+  fixtures/
+    task1/  strutil-core.el strutil-format.el tests/visible-test.el Makefile TASK.md
+    task2/  flow.el flow-report.el             tests/visible-test.el Makefile TASK.md
+    task3/  agg-parse.el agg-summarize.el agg-format.el tests/visible-test.el Makefile TASK.md
+  hidden/
+    task1-hidden-test.el  task1-solution.patch
+    task2-hidden-test.el  task2-solution.patch
+    task3-hidden-test.el  task3-solution.patch
+#+end_example
+
+=fixtures/taskN/= is exactly what an agent run sees (plus whatever
+=TASK.md= says it may assume, e.g. =emacs= being on =PATH=). Nothing
+under =hidden/= is copied into a task repo except transiently, by
+=score.sh=, at scoring time.
+
+* Verification (fail-before / pass-after, both test sets)
+
+Per Doc 61 8c discipline (verify before trusting), each task's hidden
+test set and reference solution were checked by hand, batch, before
+being treated as ground truth:
+
+1. Unpatched fixture (as shipped in =fixtures/taskN/=) is run against
+   *both* =tests/visible-test.el= (=make check=) and
+   =hidden/taskN-hidden-test.el= (via =score.sh= / direct batch ERT)
+   -- expected: visible has at least one failure (documents the
+   gap/bug the task asks the agent to close) and hidden fails harder
+   (the bug/gap is exercised by more edge cases than the visible
+   suite reaches).
+2. =hidden/taskN-solution.patch= (a unified diff, =patch -p1=
+   applicable from the task repo root) is applied to a scratch copy of
+   the unpatched fixture, then the *same* two test runs are repeated
+   -- expected: both suites 100% pass.
+
+Both steps were run for all three tasks; the observed outputs are
+below (task2/3 truncated to the summary line -- see git history /
+rerun locally for full ERT backtraces).
+
+** Task 1 -- strutil
+
+| Condition        | =make check= (visible)                          | hidden (=score.sh=)                              |
+|------------------+---------------------------------------------------+------------------------------------------------------|
+| unpatched         | =Ran 7 tests, 5 results as expected, 2 unexpected= | =Ran 8 tests, 2 results as expected, 6 unexpected=    |
+| +patch (=task1-solution.patch=) | =Ran 7 tests, 7 results as expected, 0 unexpected= | =Ran 8 tests, 8 results as expected, 0 unexpected=    |
+
+Unpatched visible failures: =visible-strutil-truncate-length= (returns
+11 chars, not 8), =visible-strutil-join-nonempty= (void-function --
+never defined). Unpatched hidden failures additionally catch the CJK
+display-width bug (=hidden-strutil-display-width-japanese=,
+=hidden-strutil-pad-display-width-mixed=) and the exact-content
+truncation shape (=hidden-strutil-truncate-exact-content=,
+=hidden-strutil-truncate-small-width=) that the visible suite's
+length-only assertion cannot distinguish from a shallow fix (e.g. an
+agent that special-cases =(length s) 8= without reserving room for the
+ellipsis would pass the visible test and fail
+=hidden-strutil-truncate-exact-content=).
+
+** Task 2 -- flow
+
+| Condition        | =make check= (visible)                          | hidden (=score.sh=)                              |
+|------------------+---------------------------------------------------+------------------------------------------------------|
+| unpatched         | =Ran 4 tests, 3 results as expected, 1 unexpected= | =Ran 5 tests, 1 results as expected, 4 unexpected=    |
+| +patch (=task2-solution.patch=) | =Ran 4 tests, 4 results as expected, 0 unexpected= | =Ran 5 tests, 5 results as expected, 0 unexpected=    |
+
+Unpatched visible failure: =visible-flow-reopen-after-resolve= (the
+missing =resolved -> reopened= transition, signals
+=flow-invalid-transition=). The visible happy-path test walks
+=open -> approve -> resolved=, so it never touches the
+=pending -> approve= regression (silently targets =closed= instead of
+=resolved=); the hidden suite's =hidden-flow-pending-approve-goes-to-resolved=,
+=hidden-flow-pending-path-then-close= and
+=hidden-flow-reopen-then-resume-cycle= catch it. An agent that adds
+only the missing =reopen= entry (satisfying the one visible failure)
+without diffing the rest of the spec-vs-table would pass =make check=
+and still fail 3/5 hidden tests.
+
+** Task 3 -- agg
+
+| Condition        | =make check= (visible)                          | hidden (=score.sh=)                              |
+|------------------+---------------------------------------------------+------------------------------------------------------|
+| unpatched         | =Ran 6 tests, 5 results as expected, 1 unexpected= | =Ran 6 tests, 0 results as expected, 6 unexpected=    |
+| +patch (=task3-solution.patch=) | =Ran 6 tests, 6 results as expected, 0 unexpected= | =Ran 6 tests, 6 results as expected, 0 unexpected=    |
+
+Unpatched visible failure: =visible-agg-format-summary-basic= (errors
+formatting the missing =:skipped= key). Note
+=visible-agg-summarize-no-na= *passes* even on unpatched code -- it
+uses an NA-free input, so it cannot detect that NA readings are
+wrongly folded into the count/average as zeros. All 6 hidden tests
+fail unpatched (NA exclusion, 2-decimal rounding, all-NA =nil= average,
+empty-input safety, and per-sensor independent =:skipped= counts); all
+6 pass after the patch, alongside the now-fully-green visible suite.
+
+* Non-goals / deviations
+
+- No live orchestrator/LLM run is included here -- this is the fixture
+  + scorer half only, per the task scope. A follow-up phase should
+  point =anvil-fusion-longrun-run= at these fixtures for the two arms
+  above and report the metrics table.
+- Task repos are shipped as plain directories, not git repos (no
+  =.git/= committed) -- the eventual runner is expected to =git init=
+  its own scratch copy per run so every attempt starts from byte-identical
+  state.
+- =score.sh= intentionally ignores any =tests/= an agent might add or
+  modify inside the task repo when scoring -- only top-level =*.el=
+  library sources are loaded against the hidden test, so an agent
+  cannot make the hidden gate pass by editing =tests/visible-test.el=
+  or adding a permissive test file.

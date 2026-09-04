@@ -1,0 +1,28 @@
+#+title: hard3 -- tt text table renderer
+
+* Overview
+
+This fixture renders plain-text tables from column specs and row data.
+The full rendering contract is intentionally split across files:
+
+- This README defines alignment semantics and the odd-padding rule for
+  centered cells: when the padding count is odd, the extra space goes on
+  the *right*.
+- =TASK.md= describes the new =:align= feature and the need to handle
+  Japanese/CJK width.
+- =tt-width.el= docstrings describe the width helper every renderer path
+  is supposed to use.
+- Visible test comments only check ASCII and an easy happy-path render.
+
+Column specs are plists:
+
+#+begin_example
+'((:key name  :title "Name"  :align left)
+  (:key score :title "Score" :align right))
+#+end_example
+
+Width rules:
+
+- ASCII chars count as 1 column.
+- Characters that satisfy =tt-wide-char-p= count as 2 columns.
+- Header and body cells both use the same alignment logic.

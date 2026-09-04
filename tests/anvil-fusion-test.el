@@ -246,5 +246,32 @@
     (should (stringp p))
     (should (string-match-p "(no candidates)" p))))
 
+(ert-deftest anvil-fusion-test-build-debate-prompt-structure ()
+  "Debate prompt includes question, own answer, deduped others, claims, and the refuted-claim ban."
+  (let* ((others
+          `((:provider claude :status done :summary ,anvil-fusion-test--dedup-seed)
+            (:provider gemini :status done :summary ,anvil-fusion-test--dedup-near)
+            (:provider qwen :status done :summary ,anvil-fusion-test--dedup-different)))
+         (prompt
+          (let ((anvil-fusion-judge-dedup-threshold 0.9))
+            (anvil-fusion-build-debate-prompt
+             "原問テスト"
+             "自分の前回回答"
+             others
+             "1. 主張: DGR を使う\n   VERDICT: refuted"))))
+    (should (string-match-p "# 原問\n原問テスト" prompt))
+    (should (string-match-p "# あなたの前回の回答\n自分の前回回答" prompt))
+    (should (string-match-p "# 他の回答者の回答（要点）" prompt))
+    (should (string-match-p "差分のみ" prompt))
+    (should (string-match-p "VERDICT: refuted" prompt))
+    (should (string-match-p "REFUTED" prompt))))
+
+(ert-deftest anvil-fusion-test-build-debate-prompt-empty-sections-safe ()
+  "Empty others/claims render as explicit none markers without crashing."
+  (let ((prompt (anvil-fusion-build-debate-prompt "Q" nil nil nil)))
+    (should (string-match-p "# あなたの前回の回答\n" prompt))
+    (should (string-match-p "# 他の回答者の回答（要点）\n(なし)" prompt))
+    (should (string-match-p "# 検証済み主張表\n(なし)" prompt))))
+
 (provide 'anvil-fusion-test)
 ;;; anvil-fusion-test.el ends here

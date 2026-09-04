@@ -1,0 +1,38 @@
+#+title: q4 reference answer
+
+機器は *過電流継電器(OCR)*、制御器具番号は *51*。
+
+まず低圧 210V 側合計電流 ΣI=3040A を高圧一次側へ換算する。
+
+#+begin_example
+3040 × (210 / 6600) = 96.727...A
+#+end_example
+
+次に CT 比 100/5 を掛けて CT 二次側電流に直す。
+
+#+begin_example
+96.727... × (5 / 100) = 4.836...A
+#+end_example
+
+よって、限時整定タップは *直近上位の 5A*。
+根拠条文は *第34条*。
+
+* KB citations
+
+- 第34条:
+  =/home/madblack-21/Cowork/Notes/node/20250320165344-51_過電流継電器_ocr.org:224-225=
+- 210/6600, ΣI=3040, CT 比 100/5, 4.836..., 5A:
+  =/home/madblack-21/Cowork/Notes/node/20250320165344-51_過電流継電器_ocr.org:263-307=
+- 制御器具番号 51:
+  =/home/madblack-21/Cowork/Notes/node/20251116074733-各デバイス毎の制御器具番号(デバイス番号)まとめ.org:8=
+
+* Self recomputation
+
+- 一次換算: =3040 × (210 / 6600) = 96.727272...A=
+- CT二次換算: =96.727272... × (5 / 100) = 4.836363...A=
+- したがってタップは =5A=
+
+* Anti-triviality
+
+The worked setting calculation is in =51_過電流継電器_ocr.org=, while the
+explicit control-device-number leg is cited from =各デバイス毎の制御器具番号...org=.

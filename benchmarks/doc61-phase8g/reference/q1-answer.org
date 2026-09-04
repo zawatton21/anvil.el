@@ -1,0 +1,41 @@
+#+title: q1 reference answer
+
+変圧器の接地種別は *B種接地工事*。
+高圧側 1線地絡電流が 6A、遮断時間が 1.2 秒なので、分岐は「1秒を超え2秒以内」である。
+したがって分子は 300 を用い、
+
+#+begin_example
+R = 300 / 6 = 50Ω
+#+end_example
+
+よって、B種接地抵抗の最大値は *50Ω*。
+根拠条文は *電技解釈 第17条*。
+
+年次点検の観点では、「接地抵抗値が電気設備の技術基準の解釈第17条に規定された値以下であること」を確認する。
+
+* KB citations
+
+- B種接地、電技解釈第17条、300/6 分岐:
+  =/home/madblack-21/Cowork/Notes/node/20250518222320-接地抵抗測定.org:80-118=
+- 年次点検で接地抵抗値が第17条以下であること:
+  =/home/madblack-21/Cowork/Notes/node/20250521090644-年次点検.org:164-167=
+
+* Required-key support
+
+- =B種接地=:
+  =20250518222320-接地抵抗測定.org:80=
+- =第17条=:
+  =20250518222320-接地抵抗測定.org:83=,
+  =20250521090644-年次点検.org:167=
+- =300/6=:
+  =20250518222320-接地抵抗測定.org:102-103=
+- =50Ω=:
+  derived from =20250518222320-接地抵抗測定.org:102-103= with the altered current 6A
+- =接地抵抗値...第17条...値以下=:
+  =20250521090644-年次点検.org:167=
+
+* Anti-triviality
+
+The numeric branch comes from =接地抵抗測定.org=, while the year-inspection
+leg comes from =年次点検.org=. No single file states this assembled answer for
+the altered 6A condition.

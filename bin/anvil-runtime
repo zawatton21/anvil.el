@@ -4,9 +4,9 @@
 # Loads anvil-server.el modules under the standalone NeLisp reader and
 # enters the MCP Content-Length stdio loop via the elisp driver in
 # `scripts/anvil-runtime-shell-loop.el'.  Migrated 2026-05-14 from
-# `nelisp/bin/anvil-runtime' + `nelisp-emacs/scripts/anvil-runtime-*'
+# `nelisp/bin/anvil-runtime' + `nelisp-emacs-lib/scripts/anvil-runtime-*'
 # so the entire deployment surface lives in this repo; `nelisp' and
-# `nelisp-emacs' supply only the language runtime and Emacs C → elisp
+# `nelisp-emacs-lib' supply only the language runtime and Emacs C → elisp
 # substrate respectively.
 #
 # NeLisp v1.2.0 (2026-09-04) update.  The Rust-era binary
@@ -35,8 +35,14 @@
 #                         and `~/Notes/dev' mirrors, then PATH.
 #   NELISP_HOME         — nelisp checkout root (optional; first discovery
 #                         candidate when set).
+#   ANVIL_RUNTIME_STDLIB_MISC
+#                       — set to load nelisp-stdlib-misc.el over the
+#                         runtime's own definitions.  Off by default;
+#                         see the loop scripts for why.
 #   NELISP_EMACS_DIR    — nelisp-emacs checkout root.  Default: same walk
-#                         as NELISP_BIN, for the sibling `nelisp-emacs'.
+#                         as NELISP_BIN, for the sibling `nelisp-emacs'
+#                         or `nelisp-emacs-lib' (the repository is being
+#                         renamed to the latter).
 #   NELISP_LISP_DIR     — nelisp `lisp/' dir (derived from NELISP_BIN).
 #   NELISP_LOAD_MODE    — auto (default) | file | load | exec.  `file'
 #                         runs `nelisp BOOTSTRAP' (v1.x pure-elisp
@@ -52,6 +58,11 @@
 #                         socket (default: ~/.anvil-runtime).
 #   ANVIL_RUNTIME_DEBUG — non-empty turns on the driver's [STEP] /
 #                         [shell-loop] stderr trace.
+#   ANVIL_RUNTIME_FAST_HANDSHAKE
+#                       — 0/no/off/false disables the pre-load MCP fast
+#                         handshake (default on).  Reach for it against a
+#                         NeLisp older than v1.1.1, which crashes on that
+#                         path.
 #   ANVIL_SERVER_ID     — server-id (read by the driver through `getenv';
 #                         default "emacs-eval").
 #   ANVIL_TOOL_MODULES  — comma-separated module list (driver default
@@ -61,7 +72,7 @@
 #   <parent>/
 #     ├── anvil.el          (this repo)
 #     ├── nelisp            (Layer 1 NeLisp runtime)
-#     └── nelisp-emacs      (Layer 2 Emacs C → elisp port)
+#     └── nelisp-emacs-lib  (Layer 2 Emacs C → elisp port)
 # Set the env vars above to override when the layout differs.
 #
 # Windows (MSYS2 / Git Bash): the reader is a native PE binary, so every
@@ -137,11 +148,17 @@ discover_nelisp_bin() {
 discover_nelisp_emacs_dir() {
     local candidates=() p
     if [ -n "${NELISP_HOME:-}" ]; then
-        candidates+=("$NELISP_HOME/../nelisp-emacs")
+        candidates+=("$NELISP_HOME/../nelisp-emacs"
+                     "$NELISP_HOME/../nelisp-emacs-lib")
     fi
+    # The repository is being renamed `nelisp-emacs' -> `nelisp-emacs-lib';
+    # accept both so a checkout on either side of that rename resolves.
     candidates+=(
         "$ANVIL_EL_DIR/../nelisp-emacs"
+        "$ANVIL_EL_DIR/../nelisp-emacs-lib"
+        "$HOME/Cowork/Notes/dev/nelisp-emacs-lib"
         "$HOME/Cowork/Notes/dev/nelisp-emacs"
+        "$HOME/Notes/dev/nelisp-emacs-lib"
         "$HOME/Notes/dev/nelisp-emacs"
     )
     for p in "${candidates[@]}"; do
@@ -155,19 +172,27 @@ discover_nelisp_emacs_dir() {
 
 NELISP_BIN="${NELISP_BIN:-$(discover_nelisp_bin || echo /target/nelisp)}"
 NELISP_EMACS_DIR="${NELISP_EMACS_DIR:-$(discover_nelisp_emacs_dir || echo "")}"
+# Derive nelisp's lisp/ dir by locating the checkout root.  This supports
+# binaries in both target/ and target/release/ without assuming a depth.
+# Used by the alist-get override workaround in shell-loop / server-loop
+# until Doc 98 §98.2 (elisp-complete frozen-heap baker) ships.
+discover_nelisp_lisp_dir() {
+    local dir
+    dir="$(cd "$(dirname "$NELISP_BIN")" && pwd -P)"
+    while :; do
+        if [ -d "$dir/lisp" ] && [ -f "$dir/VERSION" ]; then
+            echo "$dir/lisp"
+            return 0
+        fi
+        if [ "$dir" = "/" ]; then
+            return 1
+        fi
+        dir="$(dirname "$dir")"
+    done
+}
 
-# Derive nelisp's lisp/ dir from NELISP_BIN: `target/nelisp' sits one
-# level below the checkout root, the legacy `target/release/nelisp' two.
-# Used by the driver's stdlib-side overrides (alist-get et al.).
 if [ -z "${NELISP_LISP_DIR:-}" ] && [ -x "$NELISP_BIN" ]; then
-    _bin_dir="$(cd "$(dirname "$NELISP_BIN")" && pwd -P)"
-    case "$(basename "$_bin_dir")" in
-        release) _nelisp_top="$(cd "$_bin_dir/../.." && pwd -P)" ;;
-        *)       _nelisp_top="$(cd "$_bin_dir/.." && pwd -P)" ;;
-    esac
-    if [ -d "$_nelisp_top/lisp" ]; then
-        NELISP_LISP_DIR="$_nelisp_top/lisp"
-    fi
+    NELISP_LISP_DIR="$(discover_nelisp_lisp_dir || true)"
 fi
 NELISP_LISP_DIR="${NELISP_LISP_DIR:-}"
 LOOP_EL="${LOOP_EL:-$ANVIL_EL_DIR/scripts/anvil-runtime-shell-loop.el}"
@@ -205,6 +230,12 @@ write_bootstrap() {  # $1 = file, $2.. = extra elisp lines
         printf '(setq anvil-runtime-bootstrap-state-dir "%s")\n' "$(native_path "$STATE_DIR")"
         if [ -n "${ANVIL_RUNTIME_DEBUG:-}" ]; then
             echo "(setq anvil-server--debug-trace t)"
+        fi
+        # Opt-in: load nelisp-stdlib-misc.el over the runtime's own
+        # definitions.  Needed by pre-v1.2 runtimes, harmful on v1.2.1
+        # (see the loop scripts for the 2026-09-04 measurement).
+        if [ -n "${ANVIL_RUNTIME_STDLIB_MISC:-}" ]; then
+            echo "(setq anvil-runtime-bootstrap-stdlib-misc t)"
         fi
         local line
         for line in "$@"; do
@@ -313,8 +344,24 @@ case "$1" in
         if [ "$#" -ge 2 ] && [ "$2" = "serve" ]; then
             require_runtime "$LOOP_EL"
             mkdir -p "$STATE_DIR/tmp"
+            # Fast handshake is ON by default as of NeLisp v1.1.1.  It was
+            # gated off because every fast-path run died after 2-20 s; the
+            # cause was fourteen precise-root defects in the standalone GC,
+            # fixed there, and with a NeLisp carrying those fixes the path
+            # returns all of its output and exits 0.  Without it every
+            # `mcp serve' pays the full cold start before answering
+            # `initialize'.  It DOES depend on the runtime underneath: an
+            # older NeLisp will crash on this path, and
+            # `ANVIL_RUNTIME_FAST_HANDSHAKE=0' turns it back off for exactly
+            # that case.  The env var has to travel through the generated
+            # bootstrap: the driver's own `defvar' runs before
+            # `emacs-callproc.el' provides `getenv'.
+            case "${ANVIL_RUNTIME_FAST_HANDSHAKE:-1}" in
+                0|no|off|false) anvil_fast_handshake_elisp=nil ;;
+                *)              anvil_fast_handshake_elisp=t ;;
+            esac
             BOOTSTRAP="$STATE_DIR/mcp-bootstrap.el"
-            write_bootstrap "$BOOTSTRAP" "(load \"$(native_path "$LOOP_EL")\" nil t)"
+            write_bootstrap "$BOOTSTRAP"                 "(setq anvil-runtime-bootstrap-fast-handshake-enabled $anvil_fast_handshake_elisp)"                 "(load \"$(native_path "$LOOP_EL")\" nil t)"
             run_nelisp "$BOOTSTRAP"
         fi
         usage

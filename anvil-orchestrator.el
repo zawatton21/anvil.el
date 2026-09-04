@@ -4427,15 +4427,215 @@ Response plist includes :events / :last-seq / :task-status."
   ;; callable without a manual `require'.  MCP tool registration
   ;; lands with Phase 2.
   (require 'anvil-orchestrator-presets)
-  (anvil-orchestrator--ensure-pump-timer))
+  (anvil-orchestrator--ensure-pump-timer)
+  (anvil-orchestrator--ensure-watchdog-timer))
 
 (defun anvil-orchestrator-disable ()
   "Disable the module: unregister tools, cancel the pump timer."
   (interactive)
   (anvil-orchestrator--cancel-pump-timer)
+  (anvil-orchestrator--cancel-watchdog-timer)
   (anvil-orchestrator--unregister-tools)
   (when (featurep 'anvil-orchestrator-routing)
     (anvil-orchestrator-routing--unregister-tools)))
+
+(defcustom anvil-orchestrator-watchdog-interval-sec 300
+  "Seconds between liveness watchdog ticks.
+Nil disables the watchdog entirely, including timer registration."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-watchdog-grace-sec 120
+  "Minimum task age in seconds before orphan PID checks may fail it.
+This avoids racing a just-started task whose process bookkeeping has
+not been registered yet."
+  :type 'number
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-watchdog-notify t
+  "When non-nil, send desktop notifications for watchdog failures.
+Hook dispatch and the minibuffer `message' are always attempted."
+  :type 'boolean
+  :group 'anvil-orchestrator)
+
+(defcustom anvil-orchestrator-watchdog-max-silence-sec nil
+  "Optional silent-process wedge detector in seconds.
+When non-nil, a task in `anvil-orchestrator--running' whose
+`anvil-last-output-at' is older than this limit is treated as wedged,
+killed with SIGTERM then SIGKILL 2 seconds later, and marked failed.
+
+This ships disabled because silent long-running tasks can be healthy,
+so enabling it carries a false-kill risk.  The existing per-task
+`:heartbeat-timeout-sec' and
+`anvil-orchestrator-heartbeat-timeout-sec-default' provide the safer
+opt-in path when callers know a task should keep talking."
+  :type '(choice (const :tag "Disabled" nil) number)
+  :group 'anvil-orchestrator)
+
+(defvar anvil-orchestrator-watchdog-functions nil
+  "Abnormal hook run for each task the watchdog flips to failed.
+Each function receives one argument: the task plist after the watchdog
+status change.")
+
+(defvar anvil-orchestrator--watchdog-timer nil
+  "Timer running the independent watchdog liveness scan.")
+
+(defun anvil-orchestrator--watchdog-state-tasks ()
+  "Return every persisted orchestrator task plist from `anvil-state'."
+  (anvil-state-enable)
+  (condition-case _err
+      (cl-loop for row in (sqlite-select
+                           (anvil-state--db)
+                           "SELECT k, v FROM kv WHERE ns = ?1"
+                           (list anvil-orchestrator--state-ns))
+               for task = (ignore-errors
+                            (anvil-state--deserialize (cadr row)))
+               when (and (listp task) (plist-get task :id))
+               collect task)
+    (error nil)))
+
+(defun anvil-orchestrator--watchdog-failure-status-p (status)
+  "Return non-nil when STATUS should trigger a watchdog notification."
+  (memq status '(failed timeout heartbeat-timeout reaped cancelled)))
+
+(defun anvil-orchestrator--pid-alive-p (pid)
+  "Return non-nil when PID currently exists.
+
+Uses `(and (integerp pid) (process-attributes pid) t)' and never
+signals.  A nil result reliably means the process is dead, so the
+watchdog can safely act.  A non-nil result is treated as \"assume
+alive\" because PID reuse could produce a benign false-negative; a
+later watchdog tick or `anvil-orchestrator--reap-dead-running' will
+catch the real task if it is gone."
+  (ignore-errors
+    (and (integerp pid) (process-attributes pid) t)))
+
+(defun anvil-orchestrator--watchdog-notify (task)
+  "Emit watchdog side effects for TASK."
+  (let* ((name (or (plist-get task :name) (plist-get task :id) "?"))
+         (provider (or (plist-get task :provider) 'unknown))
+         (detail (or (plist-get task :error)
+                     (plist-get task :status)
+                     'unknown))
+         (body (format "task %s (%s) %s" name provider detail)))
+    (message "anvil-orchestrator watchdog: %s" body)
+    (condition-case err
+        (run-hook-with-args 'anvil-orchestrator-watchdog-functions task)
+      (error
+       (message "anvil-orchestrator watchdog: hook failed: %s"
+                (error-message-string err))))
+    (when (and anvil-orchestrator-watchdog-notify
+               (fboundp 'notifications-notify))
+      (ignore-errors
+        (notifications-notify
+         :title "anvil-orchestrator"
+         :body body)))))
+
+(defun anvil-orchestrator--watchdog-tick ()
+  "One independent watchdog tick: reap, orphan scan, optional wedge kill, notify."
+  (condition-case _tick-error
+      (when anvil-orchestrator-watchdog-interval-sec
+        (let* ((tick-start (float-time))
+               (grace-sec (or anvil-orchestrator-watchdog-grace-sec 0))
+               (snap (cl-loop for task in (anvil-orchestrator--watchdog-state-tasks)
+                              when (eq (plist-get task :status) 'running)
+                              collect (plist-get task :id))))
+          (ignore-errors
+            (anvil-orchestrator--reap-dead-running))
+          (dolist (id snap)
+            (condition-case _task-error
+                (let* ((task (anvil-state-get id :ns anvil-orchestrator--state-ns))
+                       (pid (plist-get task :pid))
+                       (started-at (or (plist-get task :started-at) 0)))
+                  (when (and task
+                             (eq (plist-get task :status) 'running)
+                             (not (gethash id anvil-orchestrator--running))
+                             (integerp pid)
+                             (>= (- tick-start started-at) grace-sec)
+                             (not (anvil-orchestrator--pid-alive-p pid)))
+                    (anvil-orchestrator--task-update
+                     id
+                     :status 'failed
+                     :finished-at tick-start
+                     :error
+                     "anvil-orchestrator watchdog: subprocess died without sentinel"
+                     :watchdog-killed t)))
+              (error nil)))
+          (when anvil-orchestrator-watchdog-max-silence-sec
+            (maphash
+             (lambda (id proc)
+               (condition-case _task-error
+                   (when (process-live-p proc)
+                     (let* ((last-output (or (process-get proc 'anvil-last-output-at)
+                                             (process-get proc 'anvil-started-at)))
+                            (silence (and last-output (- tick-start last-output)))
+                            (task (anvil-orchestrator--task-get id)))
+                       (when (and (numberp silence)
+                                  (> silence anvil-orchestrator-watchdog-max-silence-sec)
+                                  task
+                                  (eq (plist-get task :status) 'running))
+                         (ignore-errors
+                           (signal-process proc 'SIGTERM))
+                         (run-at-time
+                          2 nil
+                          (lambda ()
+                            (when (process-live-p proc)
+                              (ignore-errors
+                                (signal-process proc 'SIGKILL)))))
+                         (when (eq 'running
+                                   (plist-get (anvil-orchestrator--task-get id)
+                                              :status))
+                           (anvil-orchestrator--task-update
+                            id
+                            :status 'failed
+                            :finished-at tick-start
+                            :error
+                            (format "anvil-orchestrator watchdog: no output for %ss (wedged)"
+                                    (truncate silence))
+                            :watchdog-killed t)))))
+                 (error nil)))
+             anvil-orchestrator--running))
+          (dolist (id snap)
+            (condition-case _task-error
+                (let* ((task (anvil-state-get id :ns anvil-orchestrator--state-ns))
+                       (status (plist-get task :status))
+                       (finished-at (plist-get task :finished-at)))
+                  (when (and task
+                             (anvil-orchestrator--watchdog-failure-status-p status)
+                             (or (plist-get task :watchdog-killed)
+                                 (and (numberp finished-at)
+                                      (>= finished-at tick-start))))
+                    (anvil-orchestrator--watchdog-notify task)))
+              (error nil)))))
+    (error nil)))
+
+(defun anvil-orchestrator--ensure-watchdog-timer ()
+  "Start the watchdog timer if not already running."
+  (when anvil-orchestrator-watchdog-interval-sec
+    (unless (and anvil-orchestrator--watchdog-timer
+                 (memq anvil-orchestrator--watchdog-timer timer-list))
+      (setq anvil-orchestrator--watchdog-timer
+            (run-at-time anvil-orchestrator-watchdog-interval-sec
+                         anvil-orchestrator-watchdog-interval-sec
+                         #'anvil-orchestrator--watchdog-tick)))))
+
+(defun anvil-orchestrator--cancel-watchdog-timer ()
+  "Cancel the watchdog timer, if any."
+  (when anvil-orchestrator--watchdog-timer
+    (cancel-timer anvil-orchestrator--watchdog-timer)
+    (setq anvil-orchestrator--watchdog-timer nil)))
+
+;;;###autoload
+(defun anvil-orchestrator-watchdog-start ()
+  "Start the independent orchestrator watchdog timer."
+  (interactive)
+  (anvil-orchestrator--ensure-watchdog-timer))
+
+;;;###autoload
+(defun anvil-orchestrator-watchdog-stop ()
+  "Stop the independent orchestrator watchdog timer."
+  (interactive)
+  (anvil-orchestrator--cancel-watchdog-timer))
 
 (provide 'anvil-orchestrator)
 ;;; anvil-orchestrator.el ends here

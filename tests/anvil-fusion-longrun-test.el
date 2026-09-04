@@ -449,7 +449,7 @@ tools and appends the hermetic instruction to the step prompt."
   (let (captured)
     (cl-letf (((symbol-function 'anvil-fusion-longrun--run-one)
                (lambda (_provider prompt _name &optional _model _cwd _ts _mw
-                                  allowed-tools manifest-profile)
+                                  allowed-tools manifest-profile _member-extras)
                  (push (list :prompt prompt :allowed allowed-tools
                              :mp manifest-profile)
                        captured)
@@ -467,6 +467,134 @@ tools and appends the hermetic instruction to the step prompt."
                     anvil-fusion-longrun-hermetic-manifest-profile))
         (should (string-match-p "読み取り専用" (plist-get c :prompt)))
         (should (string-match-p "file-outline" (plist-get c :prompt)))))))
+
+(ert-deftest anvil-fusion-longrun-test-single-provider-step-receives-merged-extras ()
+  "Single-provider longrun steps pass merged whitelisted extras to `--run-one'."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-fusion-longrun--run-one)
+               (lambda (_provider _prompt _name &optional _model _cwd _ts _mw
+                                  _allowed _manifest member-extras)
+                 (setq captured member-extras)
+                 "STEP-OUT")))
+      (anvil-fusion-longrun-run
+       "goal"
+       :max-steps 1
+       :cwd (expand-file-name "fusion-agentic" temporary-file-directory)
+       :agentic t
+       :member-extras '(:timeout-sec 91 :bogus "drop")
+       :distill-fn (lambda (_prompt _step) "DIGEST\nSTATUS: DONE"))
+      (should (equal "bypassPermissions" (plist-get captured :permission-mode)))
+      (should (equal "workspace-write" (plist-get captured :sandbox)))
+      (should (= 91 (plist-get captured :timeout-sec)))
+      (should-not (plist-member captured :bogus)))))
+
+(ert-deftest anvil-fusion-longrun-test-single-provider-step-nil-extras-regression-identical ()
+  "Nil extras keep the default single-provider step path unchanged."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-fusion-longrun--run-one)
+               (lambda (provider prompt name &optional model cwd timeout-sec _mw
+                                  _allowed _manifest member-extras)
+                 (setq captured (list :provider provider :prompt prompt :name name
+                                      :model model :cwd cwd :timeout-sec timeout-sec
+                                      :member-extras member-extras))
+                 "STEP-OUT")))
+      (anvil-fusion-longrun-run
+       "goal"
+       :provider 'codex
+       :model "gpt-5.5"
+       :cwd "/tmp"
+       :max-steps 1
+       :timeout-sec 30
+       :distill-fn (lambda (_prompt _step) "DIGEST\nSTATUS: DONE"))
+      (should (equal '(:provider codex
+                        :prompt nil
+                        :name "longrun-step-1"
+                        :model "gpt-5.5"
+                        :cwd "/tmp"
+                        :timeout-sec 30
+                        :member-extras nil)
+                     (plist-put captured :prompt nil))))))
+
+(ert-deftest anvil-fusion-longrun-test-distill-task-receives-merged-extras ()
+  "Default distill tasks reuse the merged member-extras machinery."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-fusion-longrun--run-one)
+               (lambda (_provider _prompt name &optional _model _cwd _ts _mw
+                                  _allowed _manifest member-extras)
+                 (when (string-match-p "^longrun-distill-" name)
+                   (setq captured member-extras))
+                 (if (string-match-p "^longrun-step-" name)
+                     "STEP-OUT"
+                   "DIGEST\nSTATUS: DONE"))))
+      (anvil-fusion-longrun-run
+       "goal"
+       :max-steps 1
+       :cwd (expand-file-name "fusion-agentic" temporary-file-directory)
+       :agentic t
+       :member-extras '(:timeout-sec 64 :bogus "drop")
+       :provider 'claude
+       :distill-provider 'claude)
+      (should (= 64 (plist-get captured :timeout-sec)))
+      (should (equal "bypassPermissions" (plist-get captured :permission-mode)))
+      (should (equal "workspace-write" (plist-get captured :sandbox)))
+      (should-not (plist-member captured :bogus)))))
+
+(ert-deftest anvil-fusion-longrun-test-distill-task-nil-extras-regression-identical ()
+  "Nil extras leave the default distill task unchanged."
+  (let (captured)
+    (cl-letf (((symbol-function 'anvil-fusion-longrun--run-one)
+               (lambda (provider prompt name &optional model cwd timeout-sec _mw
+                                  allowed-tools manifest-profile member-extras)
+                 (when (string-match-p "^longrun-distill-" name)
+                   (setq captured (list :provider provider :prompt prompt :name name
+                                        :model model :cwd cwd :timeout-sec timeout-sec
+                                        :allowed-tools allowed-tools
+                                        :manifest-profile manifest-profile
+                                        :member-extras member-extras)))
+                 (if (string-match-p "^longrun-step-" name)
+                     "STEP-OUT"
+                   "DIGEST\nSTATUS: DONE"))))
+      (anvil-fusion-longrun-run
+       "goal"
+       :provider 'codex
+       :distill-provider 'codex
+       :distill-model "gpt-5.5"
+       :cwd "/tmp"
+       :max-steps 1
+       :timeout-sec 30)
+      (should (equal '(:provider codex
+                        :prompt nil
+                        :name "longrun-distill-1"
+                        :model "gpt-5.5"
+                        :cwd "/tmp"
+                        :timeout-sec 30
+                        :allowed-tools nil
+                        :manifest-profile nil
+                        :member-extras nil)
+                     (plist-put captured :prompt nil))))))
+
+(ert-deftest anvil-fusion-longrun-test-panel-branch-forwards-member-extras-and-agentic ()
+  "Panel steps forward MEMBER-EXTRAS and AGENTIC into `anvil-fusion-ask'."
+  (let (ask-args)
+    (cl-letf (((symbol-function 'anvil-fusion-ask)
+               (lambda (prompt &rest args)
+                 (setq ask-args (cons prompt args))
+                 (list :answer "PANEL-OUT"))))
+      (anvil-fusion-longrun-run
+       "goal"
+       :max-steps 1
+       :cwd (expand-file-name "fusion-agentic" temporary-file-directory)
+       :step-panel 'quality
+       :step-panel-mode 'always
+       :agentic t
+       :member-extras '(:timeout-sec 77)
+       :distill-fn (lambda (_prompt _step) "DIGEST\nSTATUS: DONE"))
+      (should (equal 'quality (plist-get (cdr ask-args) :panel)))
+      (should (eq t (plist-get (cdr ask-args) :agentic)))
+      (let ((extras (plist-get (cdr ask-args) :member-extras)))
+        (should (= 77 (plist-get extras :timeout-sec)))
+        (should (equal "bypassPermissions" (plist-get extras :permission-mode)))
+        (should (equal "workspace-write" (plist-get extras :sandbox)))))))
 
 (provide 'anvil-fusion-longrun-test)
 ;;; anvil-fusion-longrun-test.el ends here

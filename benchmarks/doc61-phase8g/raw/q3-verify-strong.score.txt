@@ -1,0 +1,1 @@
+q3 score=8/8 required=8/8 traps=0

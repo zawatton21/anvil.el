@@ -1,0 +1,3 @@
+Confirmed this working directory has no git repo, so no commit is possible here — the edits are saved directly to `q3.org`.
+
+**Summary:** Fixed factual errors in q3.org's 解答 (annual inspection insulation/grounding resistance answer): corrected citation to 省令第58条 (was wrongly 解釈第37条), fixed 200V三相回路 判定 (対地電圧200V→0.2MΩ, not 0.1MΩ), and corrected D種接地抵抗 from 600Ω→100Ω(500Ω with fast trip). No git repo present, so no commit made.

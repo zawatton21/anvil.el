@@ -1,0 +1,25 @@
+#+title: hard1 -- calc mini calculator
+
+* Overview
+
+This fixture is a tiny expression language with integers, parentheses,
+and the binary operators =+=, =-=, =*=, and =^=. Public entry points are
+=calc-eval-string= and =calc-render-result=.
+
+The task adds *prefix unary minus*. The full rule set is deliberately
+split across files:
+
+- This README states that exponentiation binds tighter than unary minus,
+  so =-2^2= means =-(2^2)= and evaluates to =-4=.
+- =TASK.md= describes the user-visible feature and the adjacency case that
+  now matters once unary minus exists.
+- =calc-tokenize.el= docstrings describe how operator tokens are supposed
+  to be emitted.
+- Comments in =tests/visible-test.el= only cover the easier visible cases.
+
+Expected operator behavior:
+
+- =^= is right-associative.
+- Unary minus binds tighter than =*= and =+=/= -=, but *looser* than =^=.
+- Adjacent operators must still be tokenized as individual operator
+  tokens, e.g. =1--2= means =1 - -2=.

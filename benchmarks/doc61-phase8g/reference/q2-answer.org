@@ -1,0 +1,50 @@
+#+title: q2 reference answer
+
+対象は *公称6.6kVの高圧 CV ケーブル*。
+まず最大使用電圧は
+
+#+begin_example
+6600 × 1.15 / 1.1 = 6900V
+#+end_example
+
+となる。
+
+6.6kV 高圧電路の交流絶縁耐力試験電圧は
+
+#+begin_example
+6900V × 1.5 = AC 10350V
+#+end_example
+
+である。
+
+さらに、*電技解釈 第16条* 系の整理では、ケーブルを使う機械器具の接続線等は
+交流耐圧の *2倍の直流電圧* に置き換えられるため、直流試験電圧は
+
+#+begin_example
+10350V × 2 = DC 20700V
+#+end_example
+
+となる。
+
+ただし *LA 内蔵 PAS* が接続されている場合は、避雷器が放電して破損するおそれがある。
+したがって *ケーブルと PAS を切り離す* か、*交流耐電圧試験(10350V)で実施する*。
+
+補足として、竣工検査メモでも「トランスは交流、高圧ケーブルは直流でもよい」と整理されている。
+
+* KB citations
+
+- 最大使用電圧 6900V:
+  =/home/madblack-21/Cowork/Notes/node/20250520180536-絶縁耐力試験.org:1031-1041=
+- 6.6kV 高圧電路の AC 10350V:
+  =/home/madblack-21/Cowork/Notes/node/20250520180536-絶縁耐力試験.org:1097-1115=
+- 交流の2倍を直流に置換、第16条系整理:
+  =/home/madblack-21/Cowork/Notes/node/20250520180536-絶縁耐力試験.org:234-251=
+- LA 内蔵 PAS の注意、DC20700V:
+  =/home/madblack-21/Cowork/Notes/node/20250520180536-絶縁耐力試験.org:1187-1197=
+- 高圧ケーブルは直流でもよい:
+  =/home/madblack-21/Cowork/Notes/node/20250421223043-竣工検査.org:119-123=
+
+* Anti-triviality
+
+The voltage ladder and PAS caution come from =絶縁耐力試験.org=, while the
+"high-voltage cable may be tested with DC" leg is cited from =竣工検査.org=.

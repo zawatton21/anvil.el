@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # anvil-runtime-daemon — persistent daemon for `bin/anvil-runtime'.
 #
-# NeLisp v1.2.0 (2026-09-04): the daemon is `anvil-runtime server PORT',
+# NeLisp v1.2.1 (2026-09-04): the daemon is `anvil-runtime server PORT',
 # a TCP loopback listener (127.0.0.1:PORT) served by nelisp's process
 # adapter -- the same on Linux and Windows.  It replaces the K2
-# (2026-05-11) UNIX-socket listener, which was built on the Rust-era
-# `nl-ffi-call' contract the pure-elisp reader no longer has.  Bridges
-# (`anvil-runtime-stdio') relay each MCP client session to it.
+# (2026-05-11) UNIX-socket listener, itself a rewrite of the G v1
+# FIFO scheme (mkfifo + Linux O_RDWR keep-alive + `dd bs=1' hacks).
+# K2 was built on the Rust-era `nl-ffi-call' contract that the
+# pure-elisp reader no longer has, so it cannot open a socket there;
+# pass a socket path instead of a port to reach it on a runtime that
+# still supports it.  Bridges (`anvil-runtime-stdio') relay each MCP
+# client session to the listener.
 #
 # Lifecycle:
 #   start    — start `anvil-runtime server PORT' in the background.  With

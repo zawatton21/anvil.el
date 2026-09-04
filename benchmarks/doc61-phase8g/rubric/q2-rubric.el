@@ -1,0 +1,12 @@
+(:id "q2"
+ :required ((:key "6900\\s-*V" :desc "最大使用電圧6900V" :points 1)
+            (:key "10350\\s-*V" :desc "交流試験電圧10350V" :points 1)
+            (:key "20700\\s-*V" :desc "直流試験電圧20700V" :points 1)
+            (:key "2倍" :desc "直流は交流の2倍" :points 1)
+            (:key "第16条" :desc "第16条を根拠に挙げる" :points 1)
+            (:key "高圧ケーブル" :desc "対象が高圧ケーブルであることを明示" :points 1)
+            (:key "LA\\|避雷器" :desc "LAまたは避雷器に言及" :points 1)
+            (:key "切り離" :desc "PAS切り離しに言及" :points 1))
+ :traps ((:key "9900\\s-*V" :desc "最大使用電圧を飛ばした誤答" :penalty 1)
+         (:key "直流[^。\n]*10350\\s-*V\\|10350\\s-*V[^。\n]*直流" :desc "交流値をそのまま直流回答にした誤答" :penalty 1))
+ :max-score 8)

@@ -392,6 +392,20 @@ this is a hard cap on cost (`暴走防止')."
   :type 'integer
   :group 'anvil-fusion)
 
+(defcustom anvil-fusion-debate nil
+  "When non-nil, critique rounds become bounded multi-round debate.
+Nil preserves today's exact critique-loop behavior: one
+divergence-triggered re-round whose members see only the critique
+prompt.  Non-nil makes each extra round show a member its own prior
+answer, the other members' prior answers rendered with the Phase 7
+dedup formatter, and the current verified-claims table.  Cost grows
+roughly linearly with debate depth: each extra round is another member
+fan-out + judge +, when verification is enabled, incremental claim
+verification.  Doc 62's router should therefore reserve depth > 1 for
+HIGH-tier prompts."
+  :type 'boolean
+  :group 'anvil-fusion)
+
 (defcustom anvil-fusion-converge-threshold 0.5
   "Minimum pairwise candidate similarity to consider a round converged.
 When the least-similar pair of candidate answers scores below
@@ -482,6 +496,39 @@ minimum pairwise similarity is below THRESHOLD (default
 TEMPLATE overrides `anvil-fusion-critique-template' (two %s)."
   (format (or template anvil-fusion-critique-template)
           (or original "") (or draft "")))
+
+(defun anvil-fusion-build-debate-prompt
+    (original-prompt prior-answer other-candidates claims-block &optional fidelity)
+  "Build a debate-round member prompt from prior round context.
+ORIGINAL-PROMPT is the original user question.  PRIOR-ANSWER is the
+member's own answer from the previous round.  OTHER-CANDIDATES is the
+rest of the prior round's candidate plist list, rendered with
+`anvil-fusion--format-candidates-deduped' at FIDELITY.  CLAIMS-BLOCK is
+the already-rendered verified-claims table string; nil/empty renders as
+\"(なし)\".  Returns a Japanese prompt instructing the member to defend
+or revise its answer and never preserve a refuted claim."
+  (let ((others (if other-candidates
+                    (anvil-fusion--format-candidates-deduped
+                     other-candidates fidelity)
+                  "(なし)"))
+        (claims (if (and (stringp claims-block)
+                         (not (string-empty-p claims-block)))
+                    claims-block
+                  "(なし)")))
+    (format
+     (concat
+      "# 原問\n%s\n\n"
+      "# あなたの前回の回答\n%s\n\n"
+      "# 他の回答者の回答（要点）\n%s\n\n"
+      "# 検証済み主張表\n%s\n\n"
+      "# 指示\n"
+      "他の回答と検証結果を踏まえ、自分の回答を弁護するか修正せよ。"
+      "反証された主張 (REFUTED) を維持してはならない。"
+      "改善した最終回答のみを出力せよ。")
+     (or original-prompt "")
+     (or prior-answer "")
+     others
+     claims)))
 
 (provide 'anvil-fusion)
 ;;; anvil-fusion.el ends here

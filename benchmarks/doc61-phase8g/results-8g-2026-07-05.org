@@ -1,0 +1,321 @@
+#+title: Doc 61 Phase 8g -- non-code KB-grounded domain eval results
+#+date: 2026-07-05
+#+author: zawatton + Claude
+
+* Setup
+
+- Worktree: isolated detached checkout at =4383876= (never the main
+  =dev/anvil.el= repo). Modules read-only; harness lives entirely in
+  scratch space (=scratchpad/ask-one.el=, =scratchpad/run-cheap-batch.sh=),
+  not committed. This file + =raw/= are the only writes inside the
+  worktree, both uncommitted.
+- KB: =anvil-fusion-verify-kb-roots= set to
+  =("/home/madblack-21/Cowork/Notes/node")= for every verify-arm call
+  (never written to -- only =rg=/=grep= read it).
+- Runner: one =emacs -Q --batch -L <worktree> -l ask-one.el -- QID ARM
+  QFILE RAW_DIR STATE_DB CWD_DIR KB_ROOT= process per (question, arm),
+  mirroring the =benchmarks/doc61-phase8e/raw/harness-run.el= pattern
+  (sandboxed =anvil-state-db-path= / =anvil-orchestrator-work-dir=,
+  cost-capture advice on =anvil-orchestrator-extract-result= /
+  =anvil-fusion-ask=). One ask at a time, sequential, never parallel.
+  Each nested Claude call ran with =:cwd= set to an empty scratch
+  directory (never the worktree) to avoid inheriting this repo's
+  =CLAUDE.md= / hooks.
+- Four arms, exactly as specified:
+  1. *single-weak* -- =anvil-orchestrator-submit-and-collect :provider
+     'claude :model "haiku"=, plain, no verify.
+  2. *single-strong* -- same with =:model "sonnet"=.
+  3. *verify-weak* -- a harness-only =haiku-pair= panel was registered
+     at runtime (2 haiku members + haiku judge, external egress; no
+     module file touched) and called via =anvil-fusion-ask QUESTION
+     :panel 'haiku-pair :verify t :verify-args '(:provider claude
+     :model "haiku")=. This forces the ENTIRE verify pipeline
+     (extraction *and* skeptic votes, per =anvil-fusion-ask='s
+     verify-kwargs derivation) to haiku tier as well as the members/judge
+     -- the "simplest robust path" the spec anticipated; arm 3 was
+     *not* dropped.
+  4. *verify-strong* -- =anvil-fusion-ask QUESTION :panel 'sonnet-solo
+     :verify t= (defaults: haiku claim extraction per Doc 61's own
+     spike recommendation, sonnet-tier skeptics since no
+     =:verify-args= override was given).
+  - Every =anvil-fusion-ask= call used its own default =:max-rounds 1=
+    (no override) -- i.e. a critique round could and did fire when
+    candidates disagreed (observed on q1, q2; not on q3-q5).
+- Caps: =:timeout-sec 240=, =:max-wait-sec 900= (fusion arms) /
+  =:collect-timeout-sec 900= (single arms), one ask at a time, outer
+  =timeout 1220= (~20 min) wall kill per process.
+
+* Smoke result
+
+q1 single-weak completed end-to-end on the first attempt: 30s wall,
+$0.043, score =1/5= (required 1/5, traps 0) -- haiku invented a wrong
+formula (60V/6A = "10Ω") and never reached 電技解釈第17条 or the
+300-numerator branch.
+
+q1 verify-strong completed end-to-end (after switching from a naive
+foreground 10-min-capped Bash call to background+poll, since the real
+run took 938s/~15.6min -- a harness-only fix, no module touched):
+$4.04, score =3/5= (required 4/5, traps 1). The panel converged on
+50Ω/B種接地/第17条 and one claim (「解釈第17条はみなし規定、省令が
+一次的根拠」) was KB-CONFIRMED (see gate evidence below). =score.sh=
+ran cleanly against both answers. Smoke gate cleared; proceeded to the
+full 24-ask battery (all 24 ultimately produced an answer file, though
+one -- q6 verify-strong -- errored via timeout after two attempts; see
+below).
+
+* Per-(question x arm) score table
+
+All scores from =raw/<qN>-<arm>.score.txt= (=score.sh= output verbatim).
+
+| question | arm            | score | max | required | traps |
+|----------+----------------+-------+-----+----------+-------|
+| q1       | single-weak    |     1 |   5 |      1/5 |     0 |
+| q1       | single-strong  |     3 |   5 |      3/5 |     0 |
+| q1       | verify-weak    |     1 |   5 |      3/5 |     2 |
+| q1       | verify-strong  |     3 |   5 |      4/5 |     1 |
+| q2       | single-weak    |     4 |   8 |      4/8 |     0 |
+| q2       | single-strong  |     3 |   8 |      3/8 |     0 |
+| q2       | verify-weak    |     3 |   8 |      3/8 |     0 |
+| q2       | verify-strong  |     5 |   8 |      5/8 |     0 |
+| q3       | single-weak    |     4 |   8 |      4/8 |     0 |
+| q3       | single-strong  |     4 |   8 |      4/8 |     0 |
+| q3       | verify-weak    |     3 |   8 |      3/8 |     0 |
+| q3       | verify-strong  |     8 |   8 |      8/8 |     0 |
+| q4       | single-weak    |     3 |   6 |      4/6 |     1 |
+| q4       | single-strong  |     5 |   6 |      5/6 |     0 |
+| q4       | verify-weak    |     5 |   6 |      5/6 |     0 |
+| q4       | verify-strong  |     5 |   6 |      5/6 |     0 |
+| q5       | single-weak    |     3 |   7 |      4/7 |     1 |
+| q5       | single-strong  |     3 |   7 |      3/7 |     0 |
+| q5       | verify-weak    |     2 |   7 |      3/7 |     1 |
+| q5       | verify-strong  |     4 |   7 |      4/7 |     0 |
+| q6       | single-weak    |     2 |   7 |      2/7 |     1 |
+| q6       | single-strong  |     2 |   7 |      2/7 |     0 |
+| q6       | verify-weak    |     1 |   7 |      1/7 |     0 |
+| q6       | verify-strong  | ERRORED (2 timeouts, no answer produced) |     |          |       |
+
+q6 verify-strong: BOTH the initial attempt and one retry were killed by
+the outer 20-min wall timeout with zero output past the start message
+(q1-q5 verify-strong all completed normally in 4-17 min on the
+identical code path, so this looks like an unusually slow sonnet-tier
+sub-task for this specific question rather than a harness/module bug).
+Scored as =0/7= (empty answer) for the conservative aggregate below;
+also reported excluding q6 entirely for a fairer 5-question comparison.
+
+* Aggregate: mean score per arm (normalized score/max)
+
+| arm            | mean (6q, q6-verify-strong=0) | mean (5q, q6 excluded from all arms) |
+|----------------+--------------------------------+---------------------------------------|
+| single-weak    |                         0.4024 |                                0.4257 |
+| single-strong  |                         0.5038 |                                0.5474 |
+| verify-weak    |                         0.3687 |                                0.4138 |
+| verify-strong  |                         0.6050 |                                0.7260 |
+
+Key deltas:
+
+| delta                            | 6q (errored=0) | 5q (excl. q6) |
+|-----------------------------------+----------------+---------------|
+| verify-weak  minus single-weak   |        -0.0337 |       -0.0119 |
+| verify-strong minus single-strong |        +0.1012 |       +0.1786 |
+
+* Trap-value adoption (the money metric)
+
+Per-question trap hits (count of distinct rubric trap regexes matched
+in the final answer text):
+
+| arm            | q1 | q2 | q3 | q4 | q5 | q6 | sum | #questions affected |
+|----------------+----+----+----+----+----+----+-----+----------------------|
+| single-weak    |  0 |  0 |  0 |  1 |  1 |  1 |   3 |                    3 |
+| single-strong  |  0 |  0 |  0 |  0 |  0 |  0 |   0 |                    0 |
+| verify-weak    |  2 |  0 |  0 |  0 |  1 |  0 |   3 |                    2 |
+| verify-strong  |  1 |  0 |  0 |  0 |  0 |  * |   1 |                    1 |
+
+(* q6 verify-strong produced no answer, so it cannot adopt a trap
+either -- excluded from the verify-strong trap sum/count above, which
+therefore covers 5 questions, not 6.)
+
+- *Strong tier*: single-strong never adopted a trap value (0/6);
+  verify-strong shows one trap hit (q1's "25Ω" string), but reading the
+  actual q1 verify-strong answer text shows 25Ω is explicitly presented
+  as an *unadopted, hedged alternative* ("前提条件が崩れた場合の分岐と
+  して明示するに留める... 25Ωを対等な結論としては扱わない") while 50Ω
+  is clearly stated as the primary conclusion. This is a scorer
+  artifact, not a real trap adoption: =score.sh= is a plain
+  substring/regexp match over the whole answer text and cannot tell
+  "mentioned-and-rejected" from "adopted." Qualitatively, verify-strong
+  did NOT adopt a wrong value on any of the 5 completed questions.
+- *Weak tier*: verify-weak is tied with single-weak on trap sum (3=3)
+  but the *questions* differ (single-weak: q4,q5,q6; verify-weak:
+  q1,q5) -- verification did not clean up single-weak's existing traps
+  and introduced a new one on q1 (two trap hits in one answer, worse
+  than single-weak's zero there). Weak-tier verification shows no clear
+  trap-reduction benefit in this run.
+
+* Gate/verify evidence: did verification actually REFUTE a wrong value?
+
+Yes, once, cleanly, at the *weak* tier (q3 verify-weak,
+=raw/q3-verify-weak.meta.sexp=):
+
+#+begin_quote
+claim: 「低圧絶縁抵抗の測定電圧は直流750Vである」
+kind: number, candidate: fusion-member-0-claude
+verdict: REFUTED
+evidence: /home/madblack-21/Cowork/Notes/node/20260614220903_catchall_box.org:2349
+  -- "JIS C 1302（絶縁抵抗計の規格）に記載される標準定格測定電圧は 25V,
+  50V, 100V, 125V, 250V, 500V, 1000V であり、直流750Vは含まれていない。
+  また、ローカルKB（法令orgDB）でも低圧絶縁抵抗測定の標準電圧として
+  750Vの記載がない。"
+#+end_quote
+
+The final synthesized answer (=raw/q3-verify-weak.answer.txt=) honored
+the refutation explicitly: =| **測定電圧** | 直流750V | 直流500V |
+候補2が妥当。**750Vはrefuted**（JIS C 1302に記載なし...）| ...500Vは
+標準定格|= and later =**REFUTED「直流750V」**：採用不可=. This is the
+gate working exactly as designed: a haiku-tier candidate hallucinated a
+plausible-looking but wrong voltage, the KB grep found the real JIS C
+1302 rated-voltage list, the skeptic vote refuted it, and the judge
+excluded it from the final answer.
+
+A second example, KB-CONFIRMED (not refuted, but load-bearing) at the
+*strong* tier (q1 verify-strong,
+=raw/q1-verify-strong.meta.sexp=):
+
+#+begin_quote
+claim: 「解釈第17条は電気設備技術基準省令の一例としてのみなし規定であり、
+これ以外の方法でも同等の安全性を示せば適合とみなされ、省令第10条・
+第11条が一次的法的根拠である」
+verdict: CONFIRMED
+evidence: /home/madblack-21/Cowork/Notes/node/20250521090644-年次点検.org:167
+  -- ローカルKB(20250421212419-電気設備に関する技術基準を定める省令.org:16)
+  が「電技解釈そのものには法的拘束力は存在しない」と明記
+#+end_quote
+
+The judge cited this confirmation directly in its final answer's
+根拠条文 section and used it to correctly rank 省令第10条/第11条 above
+解釈第17条 as the primary legal basis, while treating the 150/300
+branch-condition dispute as UNVERIFIED (not REFUTED) and therefore
+correctly declining to treat 25Ω as an equally valid conclusion.
+
+Across all 8 verify-arm runs (weak+strong x 6q, minus the errored q6
+verify-strong): 1 REFUTED claim, 1 CONFIRMED claim, remainder
+UNVERIFIED. No wholesale extraction/verification failures (q3's two
+verify arms both produced claims; q3 itself had no contested claims at
+all in the strong arm -- "claim extraction found nothing to verify,"
+logged, harmless fallback to the plain judge template, which still
+scored 8/8).
+
+* Honest interpretation
+
+*The C-axis question is ANSWERED, and the answer is tier-dependent* --
+this run's headline finding:
+
+- *At the strong tier, verification clearly helps.* Mean score rose
+  from 0.504 to 0.605 (6q) / 0.547 to 0.726 (5q, excluding the errored
+  q6) -- a delta of +0.10 to +0.18 depending on how the one error is
+  counted. Per-question, the gains are concentrated exactly where
+  single-strong was NOT already saturated: q2 (+0.25, 3/8->5/8), q3
+  (+0.5, 4/8->8/8, perfect), q5 (+0.14, 3/7->4/7). Where single-strong
+  was already high (q1, q4), verify-strong ties rather than improves
+  -- consistent with a real saturation ceiling, not a broken
+  mechanism. Trap adoption at the strong tier stayed at effectively
+  zero either way (the one apparent hit is a scorer false positive,
+  see above). q3 in particular is a strong existence proof: an
+  under-specified strong single-shot answer (4/8, missing several
+  required legs) became a fully-correct KB-grounded synthesis (8/8)
+  purely from the verify machinery, with zero contested claims even
+  needed -- the 3-member self-consistency + judge synthesis alone
+  filled the gaps that a single sonnet call missed.
+- *At the weak tier, verification does NOT help in this run,* and may
+  be net-negative. Mean score fell slightly (0.402->0.369, or
+  0.426->0.414 excluding q6), and trap-adoption did not improve
+  (tied 3=3 by sum, and verify-weak introduced a NEW double-trap
+  failure on q1 that plain single-weak did not have). The one clean
+  REFUTED-claim gate hit in the whole battery *did* happen at the weak
+  tier (q3, 750V), so the KB-grep/skeptic mechanism itself is not
+  broken at haiku tier -- but a haiku *judge* still appears unreliable
+  enough at *synthesizing* the verdict-annotated candidates that the
+  net effect on final-answer quality is a wash or slightly negative.
+  This matches the Doc 61 code comments' own caution about haiku
+  extraction/synthesis fidelity being an open question, and matches
+  the "sovereign panel discarded a correct answer for a hallucinated
+  one" precedent cited in =anvil-fusion-verify.el='s commentary.
+- Neither tier fully saturated across all 6 questions (unlike 8e/
+  8e-hard, which is the whole point of this battery), so this run does
+  distinguish the two tiers meaningfully rather than reporting "no
+  signal because everything already maxes out."
+
+* Deviations from the spec
+
+- Arm 3 (verify-weak) was NOT dropped -- a harness-only =haiku-pair=
+  panel (2 haiku members + haiku judge) was registered at runtime via
+  =(push ... anvil-fusion-panels)= inside =ask-one.el=, no module file
+  touched, matching the spec's "simplest robust path."
+- =anvil-fusion-ask='s own default =:max-rounds 1= was left as-is for
+  every verify-arm call (no override) -- a critique round could and
+  did fire (observed q1, q2 candidate disagreement); this was a real
+  cost/time driver (verify-strong runs took 14-17 min / ~$2-4 each vs.
+  ~1-2 min / <$0.05-0.5 for the single/weak arms) but was left alone
+  rather than capped, since capping it would have changed the exact
+  mechanism the spec asked to measure.
+- One retry was spent on q6 verify-strong (spec only mandates a retry
+  during the SMOKE phase for structural errors; this was a normal
+  battery item that simply ran long twice). Given q1-q5 verify-strong
+  all completed cleanly on the identical code path, this reads as
+  question-specific variance, not a harness bug, and a second retry
+  was not attempted (time/budget discipline).
+- The initial q1 verify-strong smoke attempt was run in the foreground
+  under my own tool's ~10-min call ceiling and had to be killed and
+  relaunched via background+poll once the true wall time (938s/~15.6
+  min) became apparent -- a harness/tooling fix on my side, not a
+  module fix, and not a second "structural error" retry against the
+  fusion machinery itself (the module never errored).
+- KB roots were set once for the whole process via =(setq
+  anvil-fusion-verify-kb-roots ...)= rather than a per-call =let=,
+  functionally identical for this single-ask-per-process design (no
+  concurrent callers to isolate from).
+
+* Limitations
+
+- Single run per (question, arm) -- no repeated sampling, so the
+  deltas above are point estimates, not statistically tested.
+  Especially the strong-tier deltas (driven heavily by q3's 4/8->8/8
+  swing) could look different on a second seed.
+- 6 questions is a small battery; q6's verify-strong error further
+  thins the strong-tier N to 5 for that arm.
+- =score.sh= is a plain regexp/substring scorer with no context
+  awareness -- it cannot distinguish "adopted a trap value as the
+  answer" from "mentioned and explicitly rejected a trap value for
+  completeness" (demonstrated concretely on q1 verify-strong above).
+  The trap-adoption counts in this report should be read with that
+  caveat; a qualitative read of the actual answer text is included
+  wherever a trap was scored so the reader can judge for themselves.
+- Cost for the two failed q6 verify-strong attempts is NOT included in
+  the $22.20 recorded total below -- each attempt's in-memory
+  cost-capture list died with the hard-killed process, so real spend
+  is somewhat higher than the recorded figure (unquantifiable from
+  this side; likely a few dollars given partial member/skeptic
+  sub-task completion before each kill).
+- Both single/weak arms had full default Claude Code tool access in
+  their nested calls (no =:allowed-tools= restriction was applied) --
+  observed side effect: some panel members chose to Write their answer
+  into a file named after the question's org =#+title= inside the
+  scratch cwd, in addition to returning it as their response text.
+  Harmless (contained to a throwaway scratch dir, cleaned up after the
+  run, never read by the scoring harness) but worth noting: a "plain"
+  arm in this design is not guaranteed to be zero-tool-use, only
+  zero-verify-machinery.
+
+* Cost and wall summary
+
+- Total recorded cost: *$22.20* across 23 successfully-costed asks (of
+  24 attempted; q6 verify-strong's cost is unknown/unrecorded per the
+  limitation above). Comfortably inside the ~$15-30 budget guard.
+- Total wall (sum of per-ask =:wall-sec=, including both failed q6
+  attempts at ~1220s each): ~166 min (~2.8h) of actual subprocess wall
+  time; total session wall clock (including polling overhead) was
+  roughly 3 hours.
+- Cost/wall are dominated by the verify-strong arm (sonnet members +
+  sonnet-tier skeptics + a possible critique round): ~$2.1-4.0 / 14-17
+  min per question, vs. ~$0.02-0.05 / <35s for single-weak, ~$0.24-0.64
+  / 1.5-3 min for single-strong, and ~$0.4-1.2 / 5-6.5 min for
+  verify-weak.

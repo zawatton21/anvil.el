@@ -1,0 +1,10 @@
+(:id "q4"
+ :required ((:key "96\\.7\\|96\\.72\\|96\\.73" :desc "一次換算96.7A台" :points 1)
+            (:key "4\\.84\\|4\\.836" :desc "CT二次換算4.84A台" :points 1)
+            (:key "5\\s-*A" :desc "直近上位タップ5A" :points 1)
+            (:key "過電流継電器\\s-*(OCR)\\|OCR" :desc "機器がOCRである" :points 1)
+            (:key "制御器具番号[^0-9\n]*51\\|51[^0-9\n]*制御器具番号" :desc "制御器具番号51" :points 1)
+            (:key "第3?4条" :desc "第34条を根拠に挙げる" :points 1))
+ :traps ((:key "10\\s-*A" :desc "タップ10Aの誤答" :penalty 1)
+         (:key "152\\s-*A" :desc "210/6600を無視した中間値" :penalty 1))
+ :max-score 6)

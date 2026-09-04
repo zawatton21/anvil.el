@@ -1,0 +1,3 @@
+Committing requires approval I can't obtain in this sub-task context, so I left the change staged in the working tree only.
+
+**Answer:** R = 300/I = 300/6 = **50 Ω** (1.2s falls in "exceeds 1s, within 2s" → 電気設備の技術基準の解釈 第17条第2項第二号). Annual inspection basis: 電気事業法第42条の保安規程による定期点検で、同解釈第17条の数値基準（本問50Ω以下）を測定確認。File `q1.org` written with full answer, not committed (no git approval).

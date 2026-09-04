@@ -1,0 +1,42 @@
+#+title: q3 reference answer
+
+年次点検での根拠整理は次のとおり。
+
+- 低圧電路の絶縁抵抗:
+  *省令第58条* の値以上であること
+- 接地抵抗:
+  *電技解釈 第17条* の値以下であること
+
+低圧絶縁抵抗の法定値の数値梯子は *0.1MΩ / 0.2MΩ / 0.4MΩ*。
+
+したがって具体例では、
+
+- 100V 回路は *0.1MΩ以上*
+- 200V 三相回路は *0.2MΩ以上*
+
+と答える。
+
+接地抵抗側は、年次点検では第17条に規定された値以下であることを確認する。
+接地種別としては *B種 / C種* の整理が接地抵抗ノートにある。
+
+注意:
+KB のプレーンテキストでは =0.1/0.2/0.4MΩ= は grep できるが、
+=150V/300V= の帯域文言そのものはスクリーンショット依存である。
+このため、100V と 200V 三相への当てはめは KB ノート群からの推論として扱う。
+
+* KB citations
+
+- 年次点検の条文マップ:
+  =/home/madblack-21/Cowork/Notes/node/20250521090644-年次点検.org:164-167=
+- 低圧絶縁抵抗の法定値整理:
+  =/home/madblack-21/Cowork/Notes/node/20250518222708-絶縁抵抗測定.org:1236-1267=
+- 低圧のみ数値基準あり(0.1/0.2/0.4MΩ):
+  =/home/madblack-21/Cowork/Notes/node/20250518222708-絶縁抵抗測定.org:1284-1288=
+- B種/C種の接地種別:
+  =/home/madblack-21/Cowork/Notes/node/20250518222320-接地抵抗測定.org:75-80,119-125=
+
+* Anti-triviality
+
+The annual-inspection/legal map is in =年次点検.org=, the low-voltage
+resistance ladder is in =絶縁抵抗測定.org=, and the grounding-type labels are
+in =接地抵抗測定.org=.

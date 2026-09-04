@@ -28,8 +28,9 @@
 ;;
 ;; Doc 61 §3 adds `opus-solo': a k=3 self-consistency panel using one
 ;; strong Claude Opus 4.8 model three times under different role lenses,
-;; then judged by the same model.  This keeps the panel operational even
-;; when cross-vendor auth or wiring is unavailable.
+;; then judged by the same model.  `sonnet-solo' mirrors that structure
+;; for a lower-cost sonnet-tier ceiling measurement.  This keeps the
+;; panels operational even when cross-vendor auth or wiring is unavailable.
 ;;
 ;; This module is pure: it has no load-time dependency on
 ;; anvil-orchestrator.  `anvil-fusion-panel-tasks' produces orchestrator
@@ -88,6 +89,13 @@ additional local runtimes."
                  (claude . "claude-opus-4-8")))
      (judge   . (claude . "claude-opus-4-8"))
      (egress  . external)
+     (lenses  . (correctness completeness skeptic)))
+    (sonnet-solo
+     (members . ((claude . "claude-sonnet-5")
+                 (claude . "claude-sonnet-5")
+                 (claude . "claude-sonnet-5")))
+     (judge   . (claude . "claude-sonnet-5"))
+     (egress  . external)
      (lenses  . (correctness completeness skeptic))))
   "Named fusion panels.
 An alist NAME -> BODY where BODY is an alist with keys:
@@ -112,7 +120,10 @@ for whatever your local install pulls; see docs/design/01 §9.
 (Doc 61 Phase 7): one strong model asked k=3 times under
 different role lenses, judged by the same model -- no
 cross-vendor wiring dependency; pair with the Phase 6d `:verify'
-flag for the verifier-grounded judge."
+flag for the verifier-grounded judge.  `sonnet-solo' is the
+sonnet-tier twin of `opus-solo' for cost-sensitive
+self-consistency and for measuring harness uplift on a mid-tier
+model; pair with `:verify'."
   :type '(alist :key-type symbol :value-type sexp)
   :group 'anvil-fusion)
 
@@ -130,6 +141,11 @@ for maximum model diversity when external egress and codex/gemini
 availability are acceptable."
   :type 'symbol
   :group 'anvil-fusion)
+
+(defconst anvil-fusion--member-extras-keys
+  '(:permission-mode :allowed-tools :sandbox :no-worktree :timeout-sec)
+  "Whitelisted member task extras merged by `anvil-fusion-panel-tasks'.
+Unknown keys in MEMBER-EXTRAS are dropped.")
 
 ;;;; --- accessors -----------------------------------------------------------
 
@@ -204,7 +220,15 @@ Returns t when the panel is well-formed."
 
 ;;;; --- bridge to the orchestrator (Phase 3 consumes these) -----------------
 
-(defun anvil-fusion-panel-tasks (body prompt &optional lenses cwd)
+(defun anvil-fusion--member-extras-plist (member-extras)
+  "Return the whitelisted subset of MEMBER-EXTRAS as a plist.
+Unknown keys are ignored.  Nil returns nil."
+  (let (out)
+    (dolist (key anvil-fusion--member-extras-keys out)
+      (when (plist-member member-extras key)
+        (setq out (plist-put out key (plist-get member-extras key)))))))
+
+(defun anvil-fusion-panel-tasks (body prompt &optional lenses cwd member-extras)
   "Expand panel BODY into orchestrator task plists for PROMPT.
 Returns a list of (:provider P :prompt PROMPT [:model M] [:cwd C])
 plists, one per member, preserving duplicate providers.  Optional
@@ -215,8 +239,11 @@ unchanged).  Optional CWD sets each task's working directory — use
 a neutral dir (e.g. \"/tmp\") to keep a nested Claude Code member
 from inheriting the project's hooks / CLAUDE.md.  Pure — no
 orchestrator call; Phase 3 hands the result to
-`anvil-orchestrator-submit'."
-  (let ((i -1))
+`anvil-orchestrator-submit'.  Optional MEMBER-EXTRAS is a plist:
+only `anvil-fusion--member-extras-keys' are merged; unknown keys are
+dropped."
+  (let ((i -1)
+        (extras (anvil-fusion--member-extras-plist member-extras)))
     (mapcar (lambda (m)
               (setq i (1+ i))
               (let ((p (anvil-fusion-apply-lens prompt (nth i lenses))))
@@ -224,7 +251,8 @@ orchestrator call; Phase 3 hands the result to
                               :prompt p
                               :name (format "fusion-member-%d-%s" i (car m)))
                         (and (cdr m) (list :model (cdr m)))
-                        (and cwd (list :cwd cwd)))))
+                        (and cwd (list :cwd cwd))
+                        extras)))
             (anvil-fusion-panel-members body))))
 
 (provide 'anvil-fusion-panels)

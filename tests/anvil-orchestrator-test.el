@@ -3175,5 +3175,247 @@ next pump tick without waiting for its wall-clock cap."
                         (process-get proc 'anvil-cancel-reason))))
         (ignore-errors (signal-process proc 'SIGKILL))))))
 
+(ert-deftest anvil-orchestrator-test-watchdog-pid-alive-p ()
+  "`--pid-alive-p' is nil for non-integers / missing PIDs and t otherwise."
+  (cl-letf (((symbol-function 'process-attributes)
+             (lambda (pid)
+               (pcase pid
+                 (111 '((comm . "alive")))
+                 (222 nil)
+                 (_ nil)))))
+    (should (eq t (anvil-orchestrator--pid-alive-p 111)))
+    (should-not (anvil-orchestrator--pid-alive-p 222))
+    (should-not (anvil-orchestrator--pid-alive-p "111"))
+    (should-not (anvil-orchestrator--pid-alive-p nil))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-orphan-scan-marks-dead-pid ()
+  "Watchdog fails a persisted running task missing from `--running' when its PID is gone."
+  (anvil-orchestrator-test--with-fresh
+    (let ((started (- (float-time) 600))
+          (hook-calls nil)
+          (messages nil)
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-grace-sec 120)
+          (anvil-orchestrator-watchdog-notify nil))
+      (anvil-orchestrator--persist
+       (list :id "wd-orphan-1" :name "orphan" :provider 'test
+             :prompt "x" :status 'running :pid 999999
+             :started-at started))
+      (let ((anvil-orchestrator-watchdog-functions
+             (list (lambda (task)
+                     (push (plist-get task :id) hook-calls)))))
+        (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                   (lambda () 0))
+                  ((symbol-function 'anvil-orchestrator--pid-alive-p)
+                   (lambda (_pid) nil))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) messages))))
+          (anvil-orchestrator--watchdog-tick)))
+      (let ((task (anvil-orchestrator--task-get "wd-orphan-1")))
+        (should (eq 'failed (plist-get task :status)))
+        (should (plist-get task :watchdog-killed))
+        (should (string-match-p "subprocess died without sentinel"
+                                (or (plist-get task :error) ""))))
+      (should (equal '("wd-orphan-1") hook-calls))
+      (should (= 1 (length messages))))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-orphan-scan-keeps-live-pid ()
+  "Watchdog leaves the task alone when the missing PID still exists."
+  (anvil-orchestrator-test--with-fresh
+    (let ((started (- (float-time) 600))
+          (hook-calls nil)
+          (notifications nil)
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-grace-sec 120))
+      (anvil-orchestrator--persist
+       (list :id "wd-orphan-live" :name "orphan-live" :provider 'test
+             :prompt "x" :status 'running :pid 4242
+             :started-at started))
+      (let ((anvil-orchestrator-watchdog-functions
+             (list (lambda (task)
+                     (push (plist-get task :id) hook-calls)))))
+        (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                   (lambda () 0))
+                  ((symbol-function 'anvil-orchestrator--pid-alive-p)
+                   (lambda (_pid) t))
+                  ((symbol-function 'message)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'anvil-orchestrator--watchdog-notify)
+                   (lambda (task)
+                     (push task notifications))))
+          (anvil-orchestrator--watchdog-tick)))
+      (let ((task (anvil-orchestrator--task-get "wd-orphan-live")))
+        (should (eq 'running (plist-get task :status)))
+        (should-not (plist-get task :watchdog-killed)))
+      (should-not hook-calls)
+      (should-not notifications))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-orphan-scan-honors-grace ()
+  "Watchdog skips young tasks even when the PID is already gone."
+  (anvil-orchestrator-test--with-fresh
+    (let ((started (- (float-time) 10))
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-grace-sec 120))
+      (anvil-orchestrator--persist
+       (list :id "wd-grace-1" :name "young" :provider 'test
+             :prompt "x" :status 'running :pid 999999
+             :started-at started))
+      (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                 (lambda () 0))
+                ((symbol-function 'anvil-orchestrator--pid-alive-p)
+                 (lambda (_pid) nil))
+                ((symbol-function 'message)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'anvil-orchestrator--watchdog-notify)
+                 (lambda (&rest _args)
+                   (ert-fail "should not notify"))))
+        (anvil-orchestrator--watchdog-tick))
+      (should (eq 'running
+                  (plist-get (anvil-orchestrator--task-get "wd-grace-1")
+                             :status))))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-notify-fallback-without-dbus ()
+  "Tick still messages and runs the hook when desktop notifications are unavailable."
+  (anvil-orchestrator-test--with-fresh
+    (let ((started (- (float-time) 600))
+          (messages nil)
+          (hook-calls nil)
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-grace-sec 120)
+          (anvil-orchestrator-watchdog-notify t))
+      (anvil-orchestrator--persist
+       (list :id "wd-notify-1" :name "notify" :provider 'test
+             :prompt "x" :status 'running :pid 31337
+             :started-at started))
+      (let ((saved-notify (when (fboundp 'notifications-notify)
+                            (symbol-function 'notifications-notify)))
+            (anvil-orchestrator-watchdog-functions
+             (list (lambda (task)
+                     (push (plist-get task :id) hook-calls)))))
+        (unwind-protect
+            (progn
+              (when saved-notify
+                (fmakunbound 'notifications-notify))
+              (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                         (lambda () 0))
+                        ((symbol-function 'anvil-orchestrator--pid-alive-p)
+                         (lambda (_pid) nil))
+                        ((symbol-function 'message)
+                         (lambda (fmt &rest args)
+                           (push (apply #'format fmt args) messages))))
+                (anvil-orchestrator--watchdog-tick)))
+          (when saved-notify
+            (fset 'notifications-notify saved-notify))))
+      (should (equal '("wd-notify-1") hook-calls))
+      (should (= 1 (length messages)))
+      (should (string-match-p "anvil-orchestrator watchdog: task notify"
+                              (car messages))))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-wedge-kills-stale-silent-proc ()
+  "Wedge detection sends SIGTERM, schedules SIGKILL, and marks the task failed."
+  (anvil-orchestrator-test--with-fresh
+    (let ((proc 'fake-proc)
+          (started (- (float-time) 600))
+          (last-output (- (float-time) 120))
+          (signals nil)
+          (scheduled nil)
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-max-silence-sec 30))
+      (puthash "wd-wedge-1" proc anvil-orchestrator--running)
+      (anvil-orchestrator--persist
+       (list :id "wd-wedge-1" :name "wedged" :provider 'test
+             :prompt "x" :status 'running :started-at started))
+      (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                 (lambda () 0))
+                ((symbol-function 'process-live-p)
+                 (lambda (obj)
+                   (eq obj proc)))
+                ((symbol-function 'process-get)
+                 (lambda (obj prop)
+                   (when (eq obj proc)
+                     (pcase prop
+                       ('anvil-last-output-at last-output)
+                       ('anvil-started-at started)
+                       (_ nil)))))
+                ((symbol-function 'signal-process)
+                 (lambda (obj sig)
+                   (push (list obj sig) signals)))
+                ((symbol-function 'run-at-time)
+                 (lambda (secs repeat fn)
+                   (push (list secs repeat fn) scheduled)
+                   'fake-timer))
+                ((symbol-function 'message)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'anvil-orchestrator--watchdog-notify)
+                 (lambda (&rest _args) nil)))
+        (anvil-orchestrator--watchdog-tick))
+      (let ((task (anvil-orchestrator--task-get "wd-wedge-1")))
+        (should (eq 'failed (plist-get task :status)))
+        (should (plist-get task :watchdog-killed))
+        (should (string-match-p "wedged" (or (plist-get task :error) ""))))
+      (should (member (list proc 'SIGTERM) signals))
+      (should (= 1 (length scheduled)))
+      (should (= 2 (car (car scheduled))))
+      (should-not (cadr (car scheduled))))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-wedge-disabled-by-default ()
+  "Nil `watchdog-max-silence-sec' leaves silent running tasks untouched."
+  (anvil-orchestrator-test--with-fresh
+    (let ((proc 'fake-proc)
+          (started (- (float-time) 600))
+          (signals nil)
+          (anvil-orchestrator-watchdog-interval-sec 300)
+          (anvil-orchestrator-watchdog-max-silence-sec nil))
+      (puthash "wd-wedge-off" proc anvil-orchestrator--running)
+      (anvil-orchestrator--persist
+       (list :id "wd-wedge-off" :name "quiet" :provider 'test
+             :prompt "x" :status 'running :started-at started))
+      (cl-letf (((symbol-function 'anvil-orchestrator--reap-dead-running)
+                 (lambda () 0))
+                ((symbol-function 'process-live-p)
+                 (lambda (_obj) t))
+                ((symbol-function 'process-get)
+                 (lambda (_obj _prop) started))
+                ((symbol-function 'signal-process)
+                 (lambda (&rest args)
+                   (push args signals)))
+                ((symbol-function 'message)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'anvil-orchestrator--watchdog-notify)
+                 (lambda (&rest _args) nil)))
+        (anvil-orchestrator--watchdog-tick))
+      (should (eq 'running
+                  (plist-get (anvil-orchestrator--task-get "wd-wedge-off")
+                             :status)))
+      (should-not signals))))
+
+(ert-deftest anvil-orchestrator-test-watchdog-ensure-timer-guards-duplicates ()
+  "Ensuring twice with a live timer only registers once; nil interval is a no-op."
+  (let ((anvil-orchestrator-watchdog-interval-sec 300)
+        (anvil-orchestrator--watchdog-timer nil)
+        (timer-list nil)
+        (calls 0)
+        (fake-timer 'watchdog-timer))
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _args)
+                 (setq calls (1+ calls))
+                 fake-timer)))
+      (anvil-orchestrator--ensure-watchdog-timer)
+      (push fake-timer timer-list)
+      (anvil-orchestrator--ensure-watchdog-timer)
+      (should (= 1 calls))
+      (should (eq fake-timer anvil-orchestrator--watchdog-timer))))
+  (let ((anvil-orchestrator-watchdog-interval-sec nil)
+        (anvil-orchestrator--watchdog-timer nil)
+        (calls 0))
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (&rest _args)
+                 (setq calls (1+ calls))
+                 'unexpected)))
+      (anvil-orchestrator--ensure-watchdog-timer)
+      (should (= 0 calls))
+      (should-not anvil-orchestrator--watchdog-timer))))
+
 (provide 'anvil-orchestrator-test)
 ;;; anvil-orchestrator-test.el ends here

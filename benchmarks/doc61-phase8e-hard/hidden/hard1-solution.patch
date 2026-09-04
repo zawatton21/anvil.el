@@ -1,0 +1,72 @@
+--- a/calc-eval.el
++++ b/calc-eval.el
+@@ -7,6 +7,7 @@
+ (defun calc-eval-ast (ast)
+   "Evaluate AST produced by `calc-parse'."
+   (pcase ast
++    (`(neg ,expr) (- (calc-eval-ast expr)))
+     (`(num ,n) n)
+     (`(bin "+" ,l ,r) (+ (calc-eval-ast l) (calc-eval-ast r)))
+     (`(bin "-" ,l ,r) (- (calc-eval-ast l) (calc-eval-ast r)))
+--- a/calc-parse.el
++++ b/calc-parse.el
+@@ -3,6 +3,7 @@
+ ;;; Commentary:
+ ;; Parses the token stream from `calc-tokenize' into a small AST:
+ ;;   (num N)
++;;   (neg EXPR)
+ ;;   (bin OP LEFT RIGHT)
+ ;;
+ ;; Binary precedence is table-driven.  The obvious place to bolt prefix
+@@ -24,6 +25,10 @@
+   "Return non-nil if OP is right-associative."
+   (equal op "^"))
+ 
++(defun calc--prefix-binding-power (op)
++  "Return the prefix binding power for OP, or nil."
++  (cdr (assoc op '(("-" . 30)))))
++
+ (defun calc--infix-binding-power (op)
+   "Return the infix binding power for OP, or nil."
+   (cdr (assoc op calc-operator-precedence)))
+@@ -52,15 +57,22 @@
+     (cons left rest)))
+ 
+ (defun calc--parse-primary (tokens)
+-  "Parse a number or parenthesized expression from TOKENS."
++  "Parse a number, prefix minus, or parenthesized expression from TOKENS."
+   (unless tokens
+     (error "Unexpected end of input"))
+   (let ((tok (car tokens)))
+     (cond
+      ((numberp tok)
+       (cons (list 'num tok) (cdr tokens)))
++     ((and (stringp tok) (calc--prefix-binding-power tok))
++      (let ((bp (calc--prefix-binding-power tok)))
++        (pcase-let ((`(,expr . ,rest)
++                     (calc--parse-expression (cdr tokens) bp)))
++          (cons (list 'neg expr) rest))))
+      ((equal tok "(")
+       (pcase-let ((`(,inner . ,rest) (calc--parse-expression (cdr tokens) 0)))
++        (unless rest
++          (error "Expected closing parenthesis"))
+         (unless (equal (car rest) ")")
+           (error "Expected closing parenthesis"))
+         (cons inner (cdr rest))))
+--- a/calc-tokenize.el
++++ b/calc-tokenize.el
+@@ -29,12 +29,8 @@
+               (setq i (1+ i)))
+             (push (string-to-number (substring expr start i)) tokens)))
+          ((calc--operator-char-p ch)
+-          (let ((start i))
+-            (setq i (1+ i))
+-            (while (and (< i len)
+-                        (calc--operator-char-p (aref expr i)))
+-              (setq i (1+ i)))
+-            (push (substring expr start i) tokens)))
++          (push (char-to-string ch) tokens)
++          (setq i (1+ i)))
+          (t
+           (error "Unexpected character: %c" ch)))))
+     (nreverse tokens)))

@@ -1,0 +1,82 @@
+#+title: Doc 61 Phase 8e Hard -- de-saturation end-to-end eval fixtures
+#+date: 2026-07-04
+
+* Purpose
+
+This directory is a *harder* companion to =benchmarks/doc61-phase8e/=.
+The original 8e battery saturated: a single-step/one-shot baseline was
+able to solve every shipped fixture quickly, so the full Phase 8 harness
+had no room to demonstrate uplift. These fixtures are intentionally
+constructed to resist that mode: a visible green build is achievable with
+an incomplete patch, while the hidden suite checks the deeper invariant or
+secondary bug the visible suite leaves uncovered.
+
+This directory is fixtures + scoring script only. It performs *no* live
+LLM/orchestrator calls.
+
+* Eval protocol
+
+Use the *same* two-arm protocol as =benchmarks/doc61-phase8e/=:
+
+- Arm A: single-provider baseline longrun (no panel, no verify gate).
+- Arm B: full harness (=opus-solo= hard-step panel + inter-step verify).
+
+The ground-truth metric is still *hidden-test completion*. Visible
+=make check= is necessary but not sufficient.
+
+Recommended caps are the same defaults as 8e, with one caveat:
+
+- =step timeout 240s=
+- =max-steps 8= is still a reasonable default, but these fixtures are
+  calibrated to sometimes need *up to 12* steps when an agent first lands
+  on the visible-only patch and must debug the hidden miss after further
+  reasoning. Runners may want to raise =max-steps= to 12 for this battery.
+
+* Difficulty levers
+
+Each task uses at least three of the following levers, and the per-task
+notes below identify which ones:
+
+1. Information spread across =TASK.md=, repo =README=, docstrings, and an
+   existing visible test comment.
+2. Multi-file cascade: the correct change touches 3+ files with a real
+   dependency between them.
+3. Hidden invariant described in prose but not fully exercised by the
+   visible tests.
+4. A pre-existing bug that only shows up after the feature is added.
+5. A small refactor-before-feature: the obvious insertion point is the
+   wrong abstraction boundary.
+
+| Task  | Library                        | New feature / failure shape                                                      | Levers     |
+|-------+--------------------------------+-----------------------------------------------------------------------------------+------------|
+| hard1 | =calc-*.el= mini calculator    | Add unary minus; exponent must bind tighter; tokenizer bug only appears on =--=. | 1,2,3,4,5 |
+| hard2 | =rq-*.el= query DSL            | Add =join= + =group-by=; grouped output must preserve stable tie order and empty groups. | 1,2,3,4,5 |
+| hard3 | =tt-*.el= text table renderer  | Add per-column alignment + CJK width; border math has an off-by-one once width is fixed. | 1,2,3,4,5 |
+
+* Layout
+
+#+begin_example
++benchmarks/doc61-phase8e-hard/
+  README.org
+  score.sh
+  fixtures/
+    hard1/  README.org TASK.md Makefile calc-*.el tests/visible-test.el
+    hard2/  README.org TASK.md Makefile rq-*.el   tests/visible-test.el
+    hard3/  README.org TASK.md Makefile tt-*.el   tests/visible-test.el
+  hidden/
+    hard1-hidden-test.el hard1-naive.patch hard1-solution.patch
+    hard2-hidden-test.el hard2-naive.patch hard2-solution.patch
+    hard3-hidden-test.el hard3-naive.patch hard3-solution.patch
+#+end_example
+
+* Verification contract
+
+Each task must satisfy all three checks:
+
+1. Unpatched fixture fails both visible and hidden tests.
+2. =hardN-naive.patch= makes visible tests pass, but hidden tests still
+   fail on at least one invariant/edge not exercised by the visible suite.
+3. =hardN-solution.patch= passes both visible and hidden tests.
+
+That second condition is the de-saturation proof: a superficial
+visible-only answer is *demonstrably* insufficient.

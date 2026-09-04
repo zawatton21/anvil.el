@@ -1,0 +1,19 @@
+--- a/agg-summarize.el
++++ b/agg-summarize.el
+@@ -29,9 +29,13 @@
+ only account for non-NA readings; AVG is SUM/N rounded to 2 decimal
+ places, or nil when there are no non-NA readings; K is how many NA
+ \(nil) entries were present."
+-  (let* ((n (length values))
+-         (sum (apply #'+ (mapcar (lambda (v) (or v 0)) values))))
+-    (list :count n :sum sum :avg (/ (float sum) n))))
++  (let* ((non-na (seq-filter #'identity values))
++         (skipped (- (length values) (length non-na)))
++         (n (length non-na))
++         (sum (apply #'+ non-na))
++         (avg (when (> n 0)
++                (/ (fround (* (/ (float sum) n) 100)) 100.0))))
++    (list :count n :sum sum :avg avg :skipped skipped)))
+ 
+ (defun agg-summarize (records)
+   "Summarize RECORDS grouped by sensor.

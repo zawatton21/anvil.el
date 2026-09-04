@@ -1,0 +1,71 @@
+--- a/tt-draw.el
++++ b/tt-draw.el
+@@ -4,18 +4,25 @@
+ 
+ (require 'tt-layout)
+ 
+-(defun tt-pad-cell (text width)
+-  "Pad TEXT on the right to WIDTH."
++(defun tt-pad-cell (text width align)
++  "Pad TEXT to WIDTH using ALIGN."
+   (let ((gap (- width (length text))))
+-    (if (> gap 0)
+-        (concat text (make-string gap ?\s))
+-      text)))
++    (cond
++     ((<= gap 0) text)
++     ((eq align 'right)
++      (concat (make-string gap ?\s) text))
++     ((eq align 'center)
++      (let* ((left (/ gap 2))
++             (right (- gap left)))
++        (concat (make-string left ?\s) text (make-string right ?\s))))
++     (t
++      (concat text (make-string gap ?\s))))))
+ 
+ (defun tt--border-line (widths)
+   "Return a +----+ border line for WIDTHS."
+   (concat "+"
+           (mapconcat (lambda (width)
+-                       (make-string (+ width 1) ?-))
++                       (make-string (+ width 2) ?-))
+                      widths
+                      "+")
+           "+"))
+@@ -27,7 +34,8 @@
+                        (pcase-let ((`(,column . ,width) pair))
+                          (tt-pad-cell
+                           (tt--cell-string row (plist-get column :key))
+-                          width)))
++                          width
++                          (or (plist-get column :align) 'left))))
+                      (cl-mapcar #'cons columns widths)
+                      " | ")
+           " |"))
+--- a/tt-layout.el
++++ b/tt-layout.el
+@@ -13,9 +13,9 @@
+   (mapcar (lambda (column)
+             (let* ((key (plist-get column :key))
+                    (title (plist-get column :title))
+-                   (width (length title)))
++                   (width (tt-string-width title)))
+               (dolist (row rows)
+-                (setq width (max width (length (tt--cell-string row key)))))
++                (setq width (max width (tt-string-width (tt--cell-string row key)))))
+               width))
+           columns))
+ 
+--- a/tt-width.el
++++ b/tt-width.el
+@@ -11,7 +11,9 @@
+ (defun tt-string-width (s)
+   "Return the display width of S.
+ All layout and border code is supposed to route through this helper."
+-  (length s))
++  (let ((width 0))
++    (dolist (ch (append s nil) width)
++      (setq width (+ width (if (tt-wide-char-p ch) 2 1))))))
+ 
+ (provide 'tt-width)
+ ;;; tt-width.el ends here

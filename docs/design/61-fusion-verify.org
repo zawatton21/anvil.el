@@ -1,7 +1,7 @@
 #+TITLE: Doc 61 — anvil-fusion-verify: Verifier-Grounded Judge, Opus Self-Consistency, Agentic Fusion
 #+AUTHOR: zawatton + Claude
 #+DATE: <2026-07-03>
-#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories
+#+STATUS: ALL PHASES SHIPPED (6a-9, 2026-07-03/04); 6e acceptance PASS (saturated); ops follow-ups: de-saturation re-run, KB relevance threshold (6f), traj library needs live trajectories, 8e end-to-end eval 2026-07-04 saturated (baseline 3/3 = full 3/3; panels/gates unexercised; found+fixed orchestrator permission-mode blocker for coding quests) — C-axis proof still open, needs harder battery + longrun permission knob
 #+OPTIONS: toc:2 num:t
 
 * 0. Executive summary
@@ -179,7 +179,67 @@ Phase 6-7 produce trajectories worth keeping.
 | 8a    | plan fusion                                        | 6d         | SHIPPED 9b4fdc4 |
 | 8b    | longrun step = fusion panel                        | 8a         | SHIPPED 543295c |
 | 8c    | inter-step verify gate                             | 6d, 8b     | SHIPPED c191a43 |
+| 8e    | end-to-end eval: longrun baseline vs full harness  | 8a-8c      | MEASURED (PASS, saturated — see below) |
 | 9     | verified-trajectory exemplar library (sketch)      | 6-7 live   | SHIPPED (anvil-fusion-traj; admission gate = verified wins only; opt-in :exemplars / :store-trajectory) |
+| 7'    | sonnet-solo panel (sonnet-tier twin of opus-solo)  | 7          | SHIPPED b87ad70 |
+| 8f    | agentic members: member-extras passthrough (permission/tools/sandbox) + tool-using panel members | 7, 8e | SHIPPED (member-extras + :agentic; longrun step permission fix; async/plan passthrough = follow-up) |
+| 10    | multi-round debate (critique loop depth > 1)       | 6d         | SHIPPED (anvil-fusion-debate; cross-candidate rounds + incremental verify; HIGH-tier gated) |
+| 11    | router auto-calibration from the decision log      | Doc62 Ph2  | SHIPPED (anvil-fusion-route-calibrate; propose-only, manual apply) |
+
+** 8f. Agentic members + execution-permission passthrough (design)
+
+8e's operational finding and the "agentic member" gap are the same root
+defect: `anvil-fusion-panel-tasks` builds member task plists carrying only
+:provider :prompt :name [:model] [:cwd], while the orchestrator already
+honors per-task :permission-mode (claude path) and :sandbox (codex path) —
+members simply never receive them, so a panel member (or a longrun coding
+step's claude child under the default acceptEdits) cannot run its own
+build/tests or consult tools.
+
+Design:
+- `anvil-fusion-panel-tasks` gains an optional MEMBER-EXTRAS plist merged
+  into every member task (whitelist: :permission-mode :allowed-tools
+  :sandbox :no-worktree :timeout-sec). Providers ignore keys they do not
+  read, so one merged plist serves all member providers safely.
+- `anvil-fusion-ask` gains :member-extras (passthrough) and :agentic
+  (convenience: a safe preset — claude members get :permission-mode
+  "bypassPermissions" ONLY when a scratch :cwd outside any user repo is
+  supplied, else :allowed-tools grant for the build command; codex members
+  get :sandbox "workspace-write"). Member prompts under :agentic get an
+  appended instruction block: you may run commands/tools in CWD to check
+  your answer before finalizing it.
+- `anvil-fusion-longrun-run` / async / plan: passthrough of :member-extras
+  to their panel calls; longrun's own single-provider step task accepts
+  the same extras (this is the 8e permission-knob follow-up, closed here).
+- Sovereignty: local-only panels reject extras that would grant network
+  egress tools; local execution remains allowed.
+- Safety: :agentic defaults nil everywhere; docstrings must spell out the
+  bypassPermissions blast radius and the scratch-cwd requirement.
+
+** 10. Multi-round debate (design)
+
+Today's critique loop is a single divergence-triggered re-round. Deepen it
+into a bounded debate: when candidates diverge after round 1, each member
+receives the OTHER candidates' answers (deduped per Doc 62 Phase 7
+rendering) plus the verified-claims table, and must either defend or
+revise; re-judge after each round. Termination: convergence
+(should-loop-p), max-rounds (existing defcustom now meaning debate depth),
+or a judge-declared resolution. Verify runs once on round 1 claims plus
+incrementally on NEW claims surfacing in later rounds (extraction diff by
+claim-key hash — reuses the Phase 4 cache so re-verification is cheap).
+Cost note: each debate round ~ one member fan-out + judge; router should
+only enable depth > 1 at the HIGH tier.
+
+** 11. Router auto-calibration (design)
+
+The Doc 62 Phase 2 router logs every decision (risk, reason, tier). Close
+the loop offline: a calibration command reads the log joined with
+follow-up outcome signals — verify verdicts of the escalated runs (were
+HIGH escalations justified: did claims get refuted?), user re-ask within
+the session (proxy for a wrong LOW), cost per decision — and proposes (not
+auto-applies) threshold/mapping changes as a diff to
+`anvil-fusion-route-escalation` with the supporting counts. Manual apply
+keeps the human in the calibration loop until enough log volume exists.
 
 Phase 8 implementation notes (2026-07-03/04, codex via orchestrator — 8a on
 the daemon orchestrator, 8b/8c on the Doc 43 standalone batch orchestrator
@@ -214,6 +274,92 @@ a verdict. Follow-ups filed: de-saturation re-run with a small/local judge
 (runner supports it), KB evidence-relevance threshold (irrelevant file:line
 sources mislead even when verdicts are right — "6f" candidate), hedging
 candidates getting REFUTED.
+
+8e measured 2026-07-04 (benchmarks/doc61-phase8e/, ~$5.15 incl. one voided
+smoke, results-8e-2026-07-04.org + raw/ in that dir; HEAD 4ed3cd8). Both
+arms of anvil-fusion-longrun-run (baseline single-provider vs :step-panel
+'opus-solo hard-only + :verify-steps t) completed 3/3 tasks on the HIDDEN
+acceptance tests — no separation: the benchmark saturated (a sonnet step
+agent with shell access solved every fixture in 1-2 steps and never took
+the visible-test overfit bait). All 3 full-arm verify gates passed first
+try (0 retried-pass / 0 failed / 0 :gate-failures — no REFUTED claim ever
+fired), and :panel-steps was 0 everywhere (hard-only never panels step 1
+and every quest finished at step 1, so 8b's panel path got zero
+end-to-end exercise). Verdict: proves the full harness is plumbed
+correctly end-to-end and its cost discipline holds (+$0.03-0.16/run,
+panel budget untouched), but demonstrates no uplift at this task
+difficulty. MOST CONSEQUENTIAL finding is operational, not comparative:
+under the orchestrator default --permission-mode acceptEdits a
+non-interactive claude child CANNOT run Bash, so a longrun coding quest
+that must run its own build/test never reaches STATUS: DONE (smoke
+attempt burned $2.65 across 4+ steps of static re-verification before
+kill; the produced patch was already hidden-passing). Any code-task use
+of longrun needs an explicit permission decision (bypassPermissions in a
+sandboxed scratch cwd, as the 8e harness did, or an --allowedTools grant
+covering the build command). Follow-ups filed: de-saturate with harder /
+larger-codebase fixtures or a weaker baseline step model; an 8e re-run
+that forces the panel path (:step-panel-mode 'always or multi-step
+tasks); surface the permission knob in anvil-fusion-longrun docs.
+
+8e-hard measured 2026-07-05 (benchmarks/doc61-phase8e-hard/,
+results-8ehard-2026-07-05.org, ~$4.81, 6 runs). The de-saturation attempt
+FAILED to de-saturate: on the one-shot-resistant battery (naive
+visible-passing patches provably fail the hidden tests) baseline was still
+3/3 == full 3/3 hidden completions, every run finished in 1 step (mean
+baseline 1.33 / full 1.00), panels never fired (hard-only skips step 1 and
+every quest ended at step 1) and all 3 gates passed first try. The C-axis
+(does panel+verify raise completion over a plain baseline?) is STILL
+unproven — not because the harness is wrong but because a single Claude
+Code step-agent WITH real Bash/build execution already self-corrects to
+ceiling on coding tasks: it runs the code, sees the failure, and fixes it,
+so the difficulty levers that would trip a text-only one-shot model
+(hidden invariants, multi-file cascades) do not trip an executing agent.
+Honest conclusion after two saturated runs: for CODE tasks where the agent
+can execute and iterate, the ensemble/verify machinery has little room to
+add completion — the execution oracle is doing the verification already
+(this is 6c's premise from the other direction). The harness's measurable
+value must be sought where there is NO cheap execution oracle: fact/
+citation-critical Q&A (6e's 0/10 hallucination-adoption win), KB-grounded
+domain answers, and multi-hour tasks exceeding a single agent's context —
+none of which these coding fixtures exercise. A fair C-axis test needs a
+NON-code long-horizon task with a checkable-but-not-self-evident answer.
+NEW design gap found: anvil-fusion-longrun--default-distill-fn passes no
+member-extras, so the distill (and any future verify) phase always runs
+under the orchestrator default permission mode — harmless today (the step
+phase already ran the build) but a real wall if distill/verify is ever
+given execution duties. Follow-up: thread member-extras into the distill
+fn.
+
+8g measured 2026-07-05 (benchmarks/doc61-phase8g/, results-8g-2026-07-05.org,
+$22.20, 6 KB-verifiable domain questions x 4 arms). FIRST non-saturated,
+positive C-axis signal in the campaign — these questions have no cheap
+execution oracle, so a wrong intermediate is caught only by KB grounding.
+Mean rubric score (score/max): single-weak 0.40, single-strong 0.50,
+verify-weak 0.37, verify-strong 0.60. Deltas: verify-strong minus
+single-strong = +0.10 (+0.18 excluding q6's errored run) — real uplift
+concentrated where the plain sonnet answer had headroom (q3 4/8 -> 8/8);
+verify-weak minus single-weak = -0.03 (NO help at the haiku tier; haiku
+judge/synthesis too unreliable, though the KB-refutation mechanism itself
+fired correctly once). Mechanism demonstrated, not asserted: on q3
+verify-weak a haiku member claimed "測定電圧は直流750V"; the skeptic vote
+REFUTED it against node/20260614220903_catchall_box.org:2349 (JIS C 1302
+rated voltages 25/50/100/125/250/500/1000V, no 750V) and the synthesis
+adopted 500V. Trap adoption: single-strong 0/6, verify-strong ~0 — at the
+strong tier the uplift is added completeness, not trap avoidance (sonnet
+already dodges traps). Honest bounds: single run, 6 questions, rubric-grep,
+one scorer false-positive ("25Ω" is a rejected in-text alternative), and q6
+verify-strong hard-killed twice by the 20-min cap with zero completions
+(panel + verify + critique can exceed 20 min on a hard question — follow-up:
+bound verify-strong wall/cost).
+
+Campaign conclusion (8e / 8e-hard / 8g): the fusion verify harness adds
+measurable capability specifically where there is NO cheap verification
+oracle and the base model is strong-but-not-saturated — grounded domain
+Q&A (+0.10-0.18 here; 6e's 0/10 hallucination adoption). It saturates on
+coding (execution self-corrects — 8e/8e-hard) and does not lift a weak
+(haiku) model. So "raise Opus/Sonnet toward Fable" is TRUE but scoped:
+modestly and measurably on fact/citation/KB-grounded work; not on tasks a
+strong model with tools already nails, and not by rescuing a weak model.
 
 Recommended order: 6 -> 7 -> 8 (Phase 6 fixes a recorded, harmful failure mode
 and is measurable immediately; Phase 7 is a small addition on top; Phase 8 is

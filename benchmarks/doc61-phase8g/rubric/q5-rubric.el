@@ -1,0 +1,11 @@
+(:id "q5"
+ :required ((:key "選任許可[^。\n]*不可\\|不可[^。\n]*選任許可" :desc "選任許可は不可" :points 1)
+            (:key "外部委託[^。\n]*可能\\|可能[^。\n]*外部委託" :desc "外部委託は可能" :points 1)
+            (:key "第4?3条" :desc "第43条を根拠に挙げる" :points 1)
+            (:key "500\\s-*kW" :desc "500kW境界に触れる" :points 1)
+            (:key "7000\\s-*V" :desc "7000V境界に触れる" :points 1)
+            (:key "外部委託承認\\|外部委託\\s-*(承認)" :desc "外部委託承認に触れる" :points 1)
+            (:key "600\\s-*kW" :desc "案件条件600kWに触れる" :points 1))
+ :traps ((:key "外部委託[^。\n]*不可\\|不可[^。\n]*外部委託" :desc "500kW境界を外部委託にも誤適用" :penalty 1)
+         (:key "500\\s-*V" :desc "500Vを持ち出す文脈誤り" :penalty 1))
+ :max-score 7)

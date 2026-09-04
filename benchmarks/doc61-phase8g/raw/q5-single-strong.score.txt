@@ -1,0 +1,1 @@
+q5 score=3/7 required=3/7 traps=0

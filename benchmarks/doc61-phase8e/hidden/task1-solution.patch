@@ -1,0 +1,36 @@
+--- a/strutil-core.el
++++ b/strutil-core.el
+@@ -18,7 +18,7 @@
+ fits within N characters, it is returned unchanged."
+   (if (<= (length s) n)
+       s
+-    (concat (substring s 0 n) "...")))
++    (concat (substring s 0 (max 0 (- n 3))) "...")))
+ 
+ (defun strutil-split-csv (line)
+   "Split LINE on commas, honoring double-quoted fields.
+@@ -49,5 +49,11 @@
+     (push cur fields)
+     (nreverse fields)))
+ 
++(defun strutil-join-nonempty (strings sep)
++  "Join non-nil, non-empty STRINGS with SEP."
++  (mapconcat #'identity
++             (seq-filter (lambda (s) (and s (> (length s) 0))) strings)
++             sep))
++
+ (provide 'strutil-core)
+ ;;; strutil-core.el ends here
+--- a/strutil-format.el
++++ b/strutil-format.el
+@@ -20,7 +20,9 @@
+ 
+ (defun strutil-display-width (s)
+   "Return the display width of S, counting wide characters as 2 columns."
+-  (length s))
++  (let ((w 0))
++    (dolist (ch (append s nil) w)
++      (setq w (+ w (if (strutil-wide-char-p ch) 2 1))))))
+ 
+ (defun strutil-pad-display-width (s width)
+   "Pad S on the right with spaces until it reaches display WIDTH.

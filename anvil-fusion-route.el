@@ -111,6 +111,24 @@ Intended for domain-critical prompt markers wired by the user in init."
   :type 'integer
   :group 'anvil-fusion)
 
+(defcustom anvil-fusion-route-calib-min-samples 20
+  "Minimum outcome-bearing samples required before a tier yields proposals."
+  :type 'integer
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-route-calib-low-reask-max 0.2
+  "Maximum tolerated LOW-tier re-ask rate before proposing tighter routing."
+  :type 'number
+  :group 'anvil-fusion)
+
+(defcustom anvil-fusion-route-calib-high-refuted-min 0.1
+  "Minimum tolerated HIGH-tier mean refuted-claim count.
+When the measured mean falls below this threshold over enough
+outcome-bearing HIGH samples, calibration proposes relaxing the
+MEDIUM-to-HIGH bar."
+  :type 'number
+  :group 'anvil-fusion)
+
 (defconst anvil-fusion-route--risk-line-regexp
   "risk[ \t]*:[ \t]*\\([[:alpha:]]+\\)"
   "Case-insensitive regexp matching a probe `RISK:' line anywhere.")
@@ -123,7 +141,8 @@ Intended for domain-critical prompt markers wired by the user in init."
   "Newest-first routing decision log.
 Each entry is a plist:
   (:time FLOAT :prompt-head STRING :risk SYMBOL :reason STRING
-   :tier SYMBOL :panel SYMBOL-OR-NIL :verify BOOL)")
+   :tier SYMBOL :panel SYMBOL-OR-NIL :verify BOOL
+   [:outcome (:verified-refuted-count INT :reask BOOL :cost-usd FLOAT)])")
 
 (defun anvil-fusion-route--probe-prompt (question answer)
   "Build the routing probe prompt from QUESTION and ANSWER."
@@ -192,6 +211,250 @@ Unknown RISK keys fall back to the `medium' action."
 (defun anvil-fusion-route-log ()
   "Return a copy of the routing decision log."
   (copy-tree anvil-fusion-route--log))
+
+(defun anvil-fusion-route--sanitize-outcome (outcome-plist)
+  "Return a normalized outcome plist from OUTCOME-PLIST.
+Outcome attachment is best-effort only; absent keys are left absent so
+offline calibration degrades gracefully when signals are missing."
+  (let (outcome)
+    (when (plist-member outcome-plist :verified-refuted-count)
+      (let ((value (plist-get outcome-plist :verified-refuted-count)))
+        (when (integerp value)
+          (setq outcome
+                (append outcome (list :verified-refuted-count value))))))
+    (when (plist-member outcome-plist :reask)
+      (setq outcome
+            (append outcome
+                    (list :reask (and (plist-get outcome-plist :reask) t)))))
+    (when (plist-member outcome-plist :cost-usd)
+      (let ((value (plist-get outcome-plist :cost-usd)))
+        (when (numberp value)
+          (setq outcome
+                (append outcome (list :cost-usd (float value)))))))
+    outcome))
+
+(defun anvil-fusion-route-annotate-outcome (index outcome-plist)
+  "Best-effort attach OUTCOME-PLIST to routing log entry at INDEX.
+INDEX counts newest-first from zero.  OUTCOME-PLIST may contain
+`:verified-refuted-count', `:reask', and `:cost-usd'.  Out-of-range
+indexes, missing log state, and malformed payloads are ignored; this
+annotation is opportunistic and never required for the router itself."
+  (condition-case nil
+      (let ((cell (and (natnump index) (nthcdr index anvil-fusion-route--log)))
+            (outcome (anvil-fusion-route--sanitize-outcome outcome-plist)))
+        (when (and cell outcome)
+          (setcar cell (plist-put (copy-tree (car cell)) :outcome outcome))))
+    (error nil))
+  nil)
+
+(defun anvil-fusion-route--calib-stats-init ()
+  "Return a fresh calibration accumulator plist."
+  (list :count 0
+        :cost-sum 0.0
+        :cost-count 0
+        :reask-count 0
+        :reask-samples 0
+        :refuted-sum 0
+        :refuted-samples 0))
+
+(defun anvil-fusion-route--calib-stats-update (stats entry)
+  "Return STATS updated with ENTRY."
+  (let ((outcome (plist-get entry :outcome)))
+    (setq stats (plist-put stats :count (1+ (plist-get stats :count))))
+    (when (numberp (plist-get outcome :cost-usd))
+      (setq stats (plist-put stats :cost-sum
+                             (+ (plist-get stats :cost-sum)
+                                (plist-get outcome :cost-usd))))
+      (setq stats (plist-put stats :cost-count
+                             (1+ (plist-get stats :cost-count)))))
+    (when (plist-member outcome :reask)
+      (setq stats (plist-put stats :reask-samples
+                             (1+ (plist-get stats :reask-samples))))
+      (when (plist-get outcome :reask)
+        (setq stats (plist-put stats :reask-count
+                               (1+ (plist-get stats :reask-count))))))
+    (when (integerp (plist-get outcome :verified-refuted-count))
+      (setq stats (plist-put stats :refuted-sum
+                             (+ (plist-get stats :refuted-sum)
+                                (plist-get outcome :verified-refuted-count))))
+      (setq stats (plist-put stats :refuted-samples
+                             (1+ (plist-get stats :refuted-samples))))))
+  stats)
+
+(defun anvil-fusion-route--calib-tier-signal (tier stats)
+  "Return report signal plist for TIER from STATS."
+  (let ((cost-count (plist-get stats :cost-count))
+        (reask-samples (plist-get stats :reask-samples))
+        (refuted-samples (plist-get stats :refuted-samples)))
+    (append
+     (list :count (plist-get stats :count)
+           :cost-samples cost-count
+           :mean-cost-usd (and (> cost-count 0)
+                               (/ (plist-get stats :cost-sum) cost-count)))
+     (when (eq tier 'low)
+       (list :reask-count (plist-get stats :reask-count)
+             :reask-samples reask-samples
+             :reask-rate (and (> reask-samples 0)
+                              (/ (float (plist-get stats :reask-count))
+                                 reask-samples))))
+     (when (eq tier 'high)
+       (list :verified-refuted-sum (plist-get stats :refuted-sum)
+             :verified-refuted-samples refuted-samples
+             :mean-verified-refuted-count
+             (and (> refuted-samples 0)
+                  (/ (float (plist-get stats :refuted-sum))
+                     refuted-samples)))))))
+
+(defun anvil-fusion-route--calib-format-float (value)
+  "Format numeric VALUE compactly for calibration text."
+  (if (numberp value)
+      (format "%.2f" (float value))
+    "n/a"))
+
+(defun anvil-fusion-route--calib-low-proposal (signal)
+  "Return a LOW-tier proposal plist from SIGNAL, or nil."
+  (let ((samples (plist-get signal :reask-samples))
+        (reask-count (plist-get signal :reask-count))
+        (rate (plist-get signal :reask-rate)))
+    (when (and (>= samples anvil-fusion-route-calib-min-samples)
+               (numberp rate)
+               (> rate anvil-fusion-route-calib-low-reask-max))
+      (list :change 'tighten-low
+            :summary "Lower the LOW->MEDIUM bar so more borderline prompts escalate."
+            :why "LOW-tier same-session re-asks exceed the configured ceiling."
+            :evidence (list :tier 'low
+                            :count (plist-get signal :count)
+                            :reask-count reask-count
+                            :reask-samples samples
+                            :reask-rate rate
+                            :threshold anvil-fusion-route-calib-low-reask-max
+                            :mean-cost-usd (plist-get signal :mean-cost-usd))))))
+
+(defun anvil-fusion-route--calib-high-proposal (signal)
+  "Return a HIGH-tier proposal plist from SIGNAL, or nil."
+  (let ((samples (plist-get signal :verified-refuted-samples))
+        (mean-refuted (plist-get signal :mean-verified-refuted-count)))
+    (when (and (>= samples anvil-fusion-route-calib-min-samples)
+               (numberp mean-refuted)
+               (< mean-refuted anvil-fusion-route-calib-high-refuted-min))
+      (list :change 'relax-high
+            :summary "Raise the MEDIUM->HIGH bar so fewer prompts pay for verify-heavy escalation."
+            :why "HIGH-tier escalations rarely produce refuted claims in follow-up verification."
+            :evidence (list :tier 'high
+                            :count (plist-get signal :count)
+                            :verified-refuted-sum (plist-get signal :verified-refuted-sum)
+                            :verified-refuted-samples samples
+                            :mean-verified-refuted-count mean-refuted
+                            :threshold anvil-fusion-route-calib-high-refuted-min
+                            :mean-cost-usd (plist-get signal :mean-cost-usd))))))
+
+(defun anvil-fusion-route-calibrate (&optional log)
+  "Analyze LOG and return an offline calibration report plist.
+LOG defaults to `anvil-fusion-route-log'.  The report is descriptive
+only and never mutates `anvil-fusion-route-escalation'."
+  (let* ((entries (copy-tree (or log (anvil-fusion-route-log))))
+         (stats-by-tier nil)
+         (stats-by-risk nil)
+         (by-tier nil)
+         proposals
+         notes)
+    (dolist (entry entries)
+      (let* ((tier (plist-get entry :tier))
+             (risk (plist-get entry :risk))
+             (tier-stats (or (alist-get tier stats-by-tier)
+                        (anvil-fusion-route--calib-stats-init))))
+        (setq tier-stats (anvil-fusion-route--calib-stats-update tier-stats entry))
+        (setf (alist-get tier stats-by-tier) tier-stats)
+        (when (memq risk '(low medium high))
+          (let ((risk-stats (or (alist-get risk stats-by-risk)
+                                (anvil-fusion-route--calib-stats-init))))
+            (setq risk-stats
+                  (anvil-fusion-route--calib-stats-update risk-stats entry))
+            (setf (alist-get risk stats-by-risk) risk-stats)))))
+    (setq by-tier
+          (mapcar (lambda (tier)
+                    (cons tier (plist-get (alist-get tier stats-by-tier) :count)))
+                  '(single panel)))
+    (let* ((low-signal (anvil-fusion-route--calib-tier-signal
+                        'low
+                        (or (alist-get 'low stats-by-risk)
+                            (anvil-fusion-route--calib-stats-init))))
+           (medium-signal (anvil-fusion-route--calib-tier-signal
+                           'medium
+                           (or (alist-get 'medium stats-by-risk)
+                            (anvil-fusion-route--calib-stats-init))))
+           (high-signal (anvil-fusion-route--calib-tier-signal
+                         'high
+                         (or (alist-get 'high stats-by-risk)
+                             (anvil-fusion-route--calib-stats-init)))))
+      (when (zerop (length entries))
+        (setq notes (list "No routing decisions available; calibration proposals suppressed.")))
+      (unless (>= (plist-get low-signal :reask-samples) anvil-fusion-route-calib-min-samples)
+        (push (format "LOW tier omitted from proposals: %d/%d re-ask samples."
+                      (plist-get low-signal :reask-samples)
+                      anvil-fusion-route-calib-min-samples)
+              notes))
+      (unless (>= (plist-get high-signal :verified-refuted-samples)
+                  anvil-fusion-route-calib-min-samples)
+        (push (format "HIGH tier omitted from proposals: %d/%d verify-outcome samples."
+                      (plist-get high-signal :verified-refuted-samples)
+                      anvil-fusion-route-calib-min-samples)
+              notes))
+      (setq proposals (delq nil (list (anvil-fusion-route--calib-low-proposal low-signal)
+                                      (anvil-fusion-route--calib-high-proposal high-signal))))
+      (list :n (length entries)
+            :by-tier by-tier
+            :signals (list (cons 'low low-signal)
+                           (cons 'medium medium-signal)
+                           (cons 'high high-signal))
+            :proposals proposals
+            :notes (nreverse notes)))))
+
+(defun anvil-fusion-route-calibrate-report-string (&optional log)
+  "Return a compact multi-line offline calibration report for LOG."
+  (let* ((report (anvil-fusion-route-calibrate log))
+         (signals (plist-get report :signals))
+         (low (alist-get 'low signals))
+         (high (alist-get 'high signals))
+         (proposals (plist-get report :proposals))
+         (notes (plist-get report :notes))
+         (lines
+          (list
+           (format "Router calibration: n=%d single=%d panel=%d"
+                   (plist-get report :n)
+                   (or (alist-get 'single (plist-get report :by-tier)) 0)
+                   (or (alist-get 'panel (plist-get report :by-tier)) 0))
+           (format "LOW  reask=%s/%s rate=%s mean-cost=%s"
+                   (or (plist-get low :reask-count) 0)
+                   (or (plist-get low :reask-samples) 0)
+                   (anvil-fusion-route--calib-format-float
+                    (plist-get low :reask-rate))
+                   (anvil-fusion-route--calib-format-float
+                    (plist-get low :mean-cost-usd)))
+           (format "HIGH refuted=%s/%s mean=%s mean-cost=%s"
+                   (or (plist-get high :verified-refuted-sum) 0)
+                   (or (plist-get high :verified-refuted-samples) 0)
+                   (anvil-fusion-route--calib-format-float
+                    (plist-get high :mean-verified-refuted-count))
+                   (anvil-fusion-route--calib-format-float
+                    (plist-get high :mean-cost-usd))))))
+    (if proposals
+        (cl-loop for proposal in proposals
+                 for idx from 1
+                 do (push (format "%d. %s [%s]"
+                                  idx
+                                  (plist-get proposal :summary)
+                                  (plist-get proposal :change))
+                          lines)
+                 do (push (format "   why: %s evidence=%S"
+                                  (plist-get proposal :why)
+                                  (plist-get proposal :evidence))
+                          lines))
+      (push "0. No calibration proposals." lines))
+    (dolist (note notes)
+      (push (format "note: %s" note) lines))
+    (push "適用は手動: anvil-fusion-route-escalation を編集" lines)
+    (mapconcat #'identity (nreverse lines) "\n")))
 
 (cl-defun anvil-fusion-route--run-single-task
     (name prompt provider &key model cwd timeout-sec (max-wait-sec 1800))

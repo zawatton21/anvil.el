@@ -1,0 +1,54 @@
+#+title: q6 reference answer
+
+機器は *DGR*。
+
+完全地絡時の対地電圧は *3810V* と扱う。
+これは
+
+#+begin_example
+6600 / √3 = 3810V
+#+end_example
+
+であり、*EVT* による仮想接地があっても、
+*電技解釈 第15条* では「電位変成器を用いて中性点を接地するものは、中性点非接地式とみなす」
+ためである。
+
+5% タップの動作印加電圧は
+
+#+begin_example
+3810V × 0.05 = 190.5V
+#+end_example
+
+Io 試験時の 150% 電圧は
+
+#+begin_example
+190.5V × 1.5 = 285.75V
+#+end_example
+
+であり、KB の整理値に合わせれば *285.3V* として扱う。
+
+また、年次点検ノートでは DGR の判定基準として *JIS C 4601* が挙がっている。
+
+* KB citations
+
+- 3810V、5%=190.5V、150%=285.3V:
+  =/home/madblack-21/Cowork/Notes/node/20251227000920-リレー試験.org:66-98=
+- 第15条のみなし非接地:
+  =/home/madblack-21/Cowork/Notes/node/20260427151832-高圧電路は_evt_を接地してあるのに非接地電路_電技解釈_第15条_.org:17-21=
+- EVT と 3810V:
+  =/home/madblack-21/Cowork/Notes/node/20260427152311-evt_接地型計器用変圧器_.org:9-15=
+- DGR 判定基準 JIS C 4601:
+  =/home/madblack-21/Cowork/Notes/node/20250521090644-年次点検.org:194-196=
+
+* Note
+
+The arithmetic result of =190.5 × 1.5= is =285.75V=.
+The KB's DGR note states =285.3V= at =20251227000920-リレー試験.org:98=, and
+the rubric follows that shipped KB value because this benchmark is scored
+against the KB-backed answer surface.
+
+* Anti-triviality
+
+The DGR test values are in =リレー試験.org=, the non-grounded-system legal leg
+is in the =第15条= note, the EVT leg is in the =EVT= note, and the JIS leg is
+in =年次点検.org=.

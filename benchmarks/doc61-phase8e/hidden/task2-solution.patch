@@ -1,0 +1,13 @@
+--- a/flow.el
++++ b/flow.el
+@@ -28,8 +28,9 @@
+     ((open     . hold)    . pending)
+     ((pending  . resume)  . open)
+     ((open     . approve) . resolved)
+-    ((pending  . approve) . closed)
++    ((pending  . approve) . resolved)
+     ((resolved . close)   . closed)
++    ((resolved . reopen)  . reopened)
+     ((reopened . start)   . open))
+   "Alist mapping (STATE . EVENT) to the next STATE.")
+ 

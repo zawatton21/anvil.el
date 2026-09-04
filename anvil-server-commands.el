@@ -110,7 +110,10 @@ Legacy responses are emitted as a single line terminated by `terpri'."
         (let ((coding-system-for-write 'utf-8))
           (anvil-server--batch-write-stdout frame))))
      (t
-      (anvil-server--batch-write-stdout (concat resp "\n"))))))
+      ;; MCP stdio is UTF-8 on every platform.  In particular, native
+      ;; Windows Emacs otherwise writes non-ASCII characters as CP932.
+      (let ((coding-system-for-write 'utf-8))
+        (anvil-server--batch-write-stdout (concat resp "\n")))))))
 
 (defun anvil-server--batch-skip-blank-lines ()
   "Drain consecutive blank lines from STDIN and return next non-blank.

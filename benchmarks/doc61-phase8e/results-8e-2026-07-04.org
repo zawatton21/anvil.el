@@ -1,0 +1,160 @@
+#+title: Doc 61 Phase 8e -- end-to-end eval results (baseline vs full harness)
+#+date: 2026-07-04
+#+author: zawatton + Claude
+
+* Setup
+
+- Repo: =dev/anvil.el= @ develop =4ed3cd8= (modules read-only for this
+  eval; harness lives in scratch, copies archived as
+  =raw/harness-run.el= / =raw/harness-run_one.sh=).
+- Runner: =anvil-fusion-longrun-run= per =README.org='s two arms, one
+  run at a time, fresh fixture copy + throwaway =git init= per run,
+  standalone batch Emacs with sandboxed =anvil-state-db-path= /
+  =anvil-orchestrator-work-dir= (Phase 6e pattern), non-repo cwd.
+- Arms:
+  - baseline :: =(anvil-fusion-longrun-run GOAL :provider 'claude
+    :max-steps 8 :timeout-sec 240 :cwd TASKDIR)= -- note the module
+    default provider is ='codex=, so ='claude= is passed explicitly;
+    step model is the orchestrator claude default (=sonnet=).
+  - full :: same + =:step-panel 'opus-solo :step-panel-mode 'hard-only
+    :verify-steps t=.
+- GOAL = fixture =TASK.md= prefixed with the work-dir instruction
+  ("作業ディレクトリは TASKDIR。ファイルを直接編集してよい。完了条件は
+  make check が通ること。各ステップで実際に編集・実行を進めること。").
+- Scoring: visible = =make check= in the (post-run) task dir; hidden =
+  =score.sh TASKDIR N= (the only ground-truth completion signal).
+  Both were run even for killed/errored quests.
+- Caps honored: max-steps 8, 240s per step call, 25-min wall kill
+  (=timeout 1500= around the batch Emacs), sequential runs.
+
+** Harness deviation found by the smoke run (attempt 1, task1/baseline)
+
+The first smoke attempt ran with the orchestrator default
+=--permission-mode acceptEdits=. A non-interactive =claude --print=
+child can edit files under that mode but CANNOT run Bash -- every
+=make check= attempt came back "requires approval". The step agent
+produced a (retrospectively hidden-passing) patch within ~2 steps, then
+burned steps 3+ re-verifying statically; its own digest concluded:
+
+#+begin_quote
+`make check`（Bash経由）を改めて実行し、「requires approval」で拒否され
+ることを再確認（累計6回目）。… 親オーケストレーター側が承認済みモードで
+`make check`を代行実行するか、… このサブタスクではこれ以上前進できない。
+#+end_quote
+
+The run was killed at step 4 ($2.65 spent, 708s wall); scoring the
+leftover tree gave visible PASS + hidden PASS anyway (the patch was
+already correct -- artifacts kept as
+=raw/task1-baseline.attempt1-permblocked.*=). Fix (harness only, no
+module touched): =(setq anvil-orchestrator-permission-mode
+"bypassPermissions")= in the batch process, safe because every child
+cwd is a throwaway scratch copy. Smoke was retried once per protocol
+and passed end-to-end in 46s / 1 step / $0.33.
+
+* Per-run results (scored runs, post-fix)
+
+All numbers from =raw/<task>-<arm>.meta.sexp= (cost = sum of
+=:cost-usd= across every orchestrator extract-result in the quest's
+dynamic extent + panel candidate costs; wall = in-process quest wall).
+"visible" = =make check=; "hidden" = =score.sh= exit.
+
+| task | arm      | visible | hidden | steps | stopped | panel-steps | gate-failures | gate trace | digest-chars | wall (s) | cost (USD) |
+|------+----------+---------+--------+-------+---------+-------------+---------------+------------+--------------+----------+------------|
+|    1 | baseline | PASS    | PASS   |     1 | done    |           0 | 0             | n/a        |          605 |     45.3 |     0.3321 |
+|    1 | full     | PASS    | PASS   |     1 | done    |           0 | 0             | pass       |          946 |     95.5 |     0.4889 |
+|    2 | baseline | PASS    | PASS   |     1 | done    |           0 | 0             | n/a        |          705 |     47.2 |     0.3300 |
+|    2 | full     | PASS    | PASS   |     1 | done    |           0 | 0             | pass       |          640 |     57.4 |     0.3742 |
+|    3 | baseline | PASS    | PASS   |     2 | done    |           0 | 0             | n/a        |         1028 |    101.3 |     0.5446 |
+|    3 | full     | PASS    | PASS   |     1 | done    |           0 | 0             | pass       |         1238 |     97.0 |     0.4324 |
+
+Voided smoke attempt (not comparable -- permission-blocked harness):
+
+| task | arm      | visible | hidden | steps        | outcome                     | wall (s) | cost (USD) |
+|------+----------+---------+--------+--------------+-----------------------------+----------+------------|
+|    1 | baseline | PASS    | PASS   | 4+ (killed)  | killed after perm blocker   |      708 |     2.6500 |
+
+* Aggregate comparison
+
+| arm      | hidden completion | visible completion | mean steps | mean wall (s) | mean cost | total cost |
+|----------+-------------------+--------------------+------------+---------------+-----------+------------|
+| baseline | 3/3               | 3/3                |       1.33 |          64.6 |   $0.4022 |    $1.2067 |
+| full     | 3/3               | 3/3                |       1.00 |          83.3 |   $0.4318 |    $1.2955 |
+
+- Total scored-run spend: $2.5022; total including the voided smoke
+  attempt: ~$5.15. Total scored-run wall (outer, incl. scoring):
+  443s; including attempt 1: ~1,151s (~19 min).
+- Gate events: 3 verify gates evaluated (one per full-arm step), all
+  =pass= on the first attempt. *Zero* =retried-pass=, zero =failed=,
+  =:gate-failures= 0 everywhere. No gate retry ever fired, so there
+  are no refuted claims to quote and no case where a gate retry saved
+  a step.
+- Panel events: =:panel-steps= 0 in every full run. Under
+  =hard-only= mode step 1 is never a panel step (the gate is the
+  *previous* distill's =NEXT-HARD: yes=), and every full-arm quest
+  finished at step 1 -- the opus-solo panel was never exercised.
+
+* Honest interpretation
+
+1. *No separation between arms -- the benchmark saturated.* Both arms
+   completed 3/3 hidden. The task calibration ("3-6 focused steps",
+   visible-vs-hidden traps for superficial fixes) did not hold against
+   a current sonnet step agent with shell access: it solved each task
+   in 1-2 steps and never took the overfit bait (task 2's silent
+   =pending -> approve= regression and task 3's spec-only requirements
+   were all fixed from =TASK.md= + spec comments, not test-to-green
+   hacking). With zero baseline failures there is nothing for the
+   verify gate or panel to rescue; this eval cannot demonstrate (or
+   refute) an Arm B advantage, only measure its overhead.
+2. *The full harness's measured overhead at this difficulty*: +$0.03
+   to +$0.16 and +10..50s per run (verify-gate claim extraction +
+   check on a clean digest), for identical outcomes. =hard-only= mode
+   correctly kept the expensive panel at 0 -- the cost discipline
+   works, but that also means Phase 8b's panel path got zero
+   end-to-end exercise here.
+3. *The most consequential finding is the permission-mode blocker*,
+   not the arm comparison: under the orchestrator default
+   =acceptEdits=, a longrun coding quest that must RUN anything
+   (build/test) cannot ever reach =STATUS: DONE= -- it converges to a
+   loop of static re-verification and burned $2.65 / 8x the fixed-run
+   cost before being killed. Any Doc 61 8x follow-up that points
+   longrun at code tasks needs an explicit permission/allowed-tools
+   decision (bypassPermissions in a sandbox, or an =--allowedTools=
+   grant covering the build command) baked into the module or
+   documented as a required knob.
+4. Cost accounting caveat: per-run =:cost-usd= sums every
+   =anvil-orchestrator-extract-result= in the quest's dynamic extent
+   (steps + distills + verify sub-calls) plus fusion-ask candidate
+   costs (none fired). Where a sub-call reported no numeric cost it
+   contributes 0, so figures are lower bounds, though the claude
+   stream-json path reports cost reliably.
+
+* Limitations
+
+- n=1 per (task, arm): no variance estimate; a single lucky/unlucky
+  sample per cell.
+- Ceiling effect (see above) -- to discriminate the arms, tasks need
+  to be hard enough that the baseline fails hidden at a measurable
+  rate (bigger codebases, cross-file inconsistencies, requirements
+  hidden behind execution-only behavior, or a weaker/cheaper step
+  model as the baseline).
+- The panel path (8b) and the gate-retry path (8c's REFUTED feedback
+  loop) were structurally reachable but never triggered; this eval
+  does not validate their end-to-end behavior, only that they do not
+  fire spuriously on easy tasks.
+- The baseline arm also had =bypassPermissions=; the attempt-1
+  blocker means results under the shipped default permission mode
+  would look categorically different (0/6 quests able to self-verify).
+- Step model was the orchestrator claude default (sonnet) for
+  non-panel steps in BOTH arms; the arms differ only in panel/verify
+  wiring, per the 8e design.
+
+* Artifacts
+
+- =raw/<task>-<arm>.digest.txt= -- final carried digest per run
+- =raw/<task>-<arm>.score.txt= -- visible + hidden outcomes + meta dump
+- =raw/<task>-<arm>.checkpoint.sexp= -- last per-step checkpoint
+- =raw/<task>-<arm>.meta.sexp= -- steps/stopped/panel/gate/wall/cost/trace
+- =raw/task1-baseline.attempt1-permblocked.{score.txt,checkpoint.sexp}=
+  -- voided first smoke attempt (permission blocker evidence)
+- =raw/harness-run.el=, =raw/harness-run_one.sh= -- the scratch harness
+  actually used (archived copies; canonical ran from scratch space)

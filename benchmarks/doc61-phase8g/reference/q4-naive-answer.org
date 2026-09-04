@@ -1,0 +1,10 @@
+#+title: q4 naive answer
+
+3040A に CT 比 100/5 だけを考えればよいので、
+
+#+begin_example
+3040 × (5 / 100) = 152A
+#+end_example
+
+直近上位タップは 10A とする。
+OCR である。

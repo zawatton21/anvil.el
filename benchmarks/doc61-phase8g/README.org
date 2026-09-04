@@ -1,0 +1,102 @@
+#+title: Doc 61 Phase 8g -- non-code long-horizon KB-grounded eval fixtures
+#+date: 2026-07-05
+
+* Purpose
+
+This directory is a non-code companion to =benchmarks/doc61-phase8e-hard/=.
+The goal is to evaluate long-horizon domain reasoning in a setting with no
+cheap execution oracle: the agent must assemble an answer from the read-only
+KB under =/home/madblack-21/Cowork/Notes/node/=, and wrong intermediate
+values are only catchable by grounded verification.
+
+This directory contains fixtures, reference answers, naive answers, rubrics,
+and a deterministic scorer. It performs *no* live LLM/orchestrator calls.
+
+* Run Protocol
+
+Use the same two-arm comparison style as the earlier Doc 61 batteries, but
+with the KB mounted read-only in both arms:
+
+- Arm A: baseline single-provider longrun.
+- Arm B: full harness with =:step-panel opus-solo=, hard-only routing,
+  =:verify-steps t=, and =kb-roots= set to:
+
+#+begin_src emacs-lisp
+'("/home/madblack-21/Cowork/Notes/node")
+#+end_src
+
+Both arms may read the KB. The uplift target here is not build/test success;
+it is the quality of the final grounded answer text.
+
+* Metric
+
+This battery is *graded*, not pass/fail.
+
+Each question ships a rubric plist:
+
+#+begin_src emacs-lisp
+(:id "qN"
+ :required ((:key REGEXP :desc STR :points N) ...)
+ :traps    ((:key REGEXP :desc STR :penalty N) ...)
+ :max-score N)
+#+end_src
+
+Scoring rule:
+
+- score = sum of hit required keys
+- minus sum of hit trap values
+- floored at 0
+
+The scorer only inspects the final answer text. It does not consult the KB.
+
+* Scoring Procedure
+
+Run:
+
+#+begin_src sh
+./benchmarks/doc61-phase8g/score.sh ANSWER_FILE qN
+#+end_src
+
+Example output:
+
+#+begin_example
+q4 score=6/6 required=6/6 traps=0
+#+end_example
+
+* Layout
+
+#+begin_example
+benchmarks/doc61-phase8g/
+  README.org
+  score.sh
+  questions/
+    q1.org ... q6.org
+  rubric/
+    q1-rubric.el ... q6-rubric.el
+  reference/
+    q1-answer.org ... q6-answer.org
+    q1-naive-answer.org ... q6-naive-answer.org
+#+end_example
+
+* Anti-triviality
+
+The target property is: no single KB file contains the fully assembled answer
+as shipped here.
+
+For each question, the self-check should verify both:
+
+1. every =:required= regex is supported somewhere in =node/=
+2. at least one required leg comes from a different KB file than another leg
+
+Where the original design would have collapsed into a single-file grep-copy,
+the question was adjusted by adding one extra required leg that forces a
+multi-file join.
+
+Known deviation:
+
+- =q3=: the plain-text node files expose the statutory value ladder
+  =0.1/0.2/0.4MΩ=, but the exact =150V/300V= band text is present only via
+  screenshots in the KB. The rubric therefore scores the numeric ladder and
+  the concrete 100V / 200V-three-phase answers, while the reference answer
+  explicitly marks the voltage-band mapping as an inference from the cited
+  note set rather than a grep-able plain-text quote.

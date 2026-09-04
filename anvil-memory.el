@@ -157,7 +157,7 @@ onto this alist; built-ins stay in the list for defaults."
          search save-check duplicates audit-urls
          decay promote regenerate reindex-fts llm-verdict
          mdl-distill export-html serve contradictions
-         add export-md get session-delta)
+         add update export-md get session-delta)
   "Capability tags this module currently provides.
 Tests in tests/anvil-memory-test.el gate their `skip-unless' on
 membership here so a half-shipped feature never breaks CI.")
@@ -633,7 +633,8 @@ recognized prefix it is returned unchanged."
 Required:
   NAME — basename without `.md' (e.g. `feedback_my_rule').  When the
          leading `<type>_' prefix is absent it is added automatically.
-  TYPE — one of `user' / `feedback' / `project' / `reference' / `memo'.
+  TYPE — a symbol (a string is coerced via `intern'): one of `user' /
+         `feedback' / `project' / `reference' / `memo'.
   BODY — body string without YAML frontmatter (frontmatter is
          re-synthesized on `anvil-memory-export-md').
 
@@ -653,11 +654,12 @@ Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
 :created CREATED :digest SHA1)=."
   (unless (and (stringp name) (not (string-empty-p name)))
     (user-error "anvil-memory-add: NAME must be a non-empty string"))
+  (when (stringp type) (setq type (intern type)))
   (unless (and type (symbolp type)
                (assq type anvil-memory-ttl-policies))
     (user-error
-     "anvil-memory-add: TYPE must be one of %S"
-     (mapcar #'car anvil-memory-ttl-policies)))
+     "anvil-memory-add: TYPE must be a symbol, one of %S (got %S)"
+     (mapcar #'car anvil-memory-ttl-policies) type))
   (unless (stringp body)
     (user-error "anvil-memory-add: BODY must be a string"))
   (let* ((db (anvil-memory--db))
@@ -696,6 +698,94 @@ Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
             :type type
             :description description*
             :created created*
+            :digest digest))))
+
+(cl-defun anvil-memory-update (file-or-name &key body type tags ttl-policy)
+  "Update fields of an existing DB-direct memory entry in place.
+
+FILE-OR-NAME is either the synthetic id (`anvil-memory:db:<basename>')
+or the bare basename (e.g. `feedback_my_rule').  Scan-from-md rows are
+rejected — for those, edit the backing `.md' file and re-run
+`anvil-memory-scan' so disk stays canonical.
+
+Optional keys (at least one must be supplied):
+  :body       — replacement body string (no YAML frontmatter).  The
+                `memory_body_fts' row is replaced in the same call so
+                `memory-search' reflects the new text immediately.
+  :type       — new type: one of `user' / `feedback' / `project' /
+                `reference' / `memo' (a string is coerced via `intern').
+  :tags       — string list or comma-joined string.
+  :ttl-policy — TTL key symbol.
+
+`created' is never touched.  `description' is not persisted for
+DB-direct rows (`anvil-memory-get' derives it from the basename), so
+there is nothing to update for it here.
+
+Returns =(:file SYNTHETIC :name BASENAME :updated FIELDS :digest
+SHA1-OR-NIL)= where FIELDS lists the updated field keywords and the
+digest covers the new body when :body was supplied."
+  (unless (and (stringp file-or-name) (not (string-empty-p file-or-name)))
+    (user-error "anvil-memory-update: FILE-OR-NAME must be a non-empty string"))
+  (when (and (not (anvil-memory--synthetic-file-p file-or-name))
+             (string-match-p "/" file-or-name))
+    (user-error
+     "anvil-memory-update: scan-from-md rows are disk-canonical — edit the .md and re-run anvil-memory-scan"))
+  (unless (or body type tags ttl-policy)
+    (user-error "anvil-memory-update: nothing to update (supply :body / :type / :tags / :ttl-policy)"))
+  (when (stringp type) (setq type (intern type)))
+  (when (and type (not (assq type anvil-memory-ttl-policies)))
+    (user-error
+     "anvil-memory-update: TYPE must be one of %S (got %S)"
+     (mapcar #'car anvil-memory-ttl-policies) type))
+  (when body
+    (unless (stringp body)
+      (user-error "anvil-memory-update: BODY must be a string")))
+  (let* ((db (anvil-memory--db))
+         (file (if (anvil-memory--synthetic-file-p file-or-name)
+                   file-or-name
+                 (concat anvil-memory--synthetic-prefix
+                         (file-name-sans-extension file-or-name))))
+         (basename (substring file (length anvil-memory--synthetic-prefix)))
+         (existing (sqlite-select
+                    db
+                    "SELECT 1 FROM memory_meta WHERE file = ?1 LIMIT 1"
+                    (list file))))
+    (unless existing
+      (user-error "anvil-memory-update: no DB-direct entry named %s" basename))
+    (let ((updated nil)
+          (digest nil))
+      (when type
+        (sqlite-execute
+         db "UPDATE memory_meta SET type = ?2 WHERE file = ?1"
+         (list file (symbol-name type)))
+        (push :type updated))
+      (when ttl-policy
+        (when (stringp ttl-policy) (setq ttl-policy (intern ttl-policy)))
+        (sqlite-execute
+         db "UPDATE memory_meta SET ttl_policy = ?2 WHERE file = ?1"
+         (list file (symbol-name ttl-policy)))
+        (push :ttl-policy updated))
+      (when tags
+        (let ((tags* (cond ((stringp tags) tags)
+                           ((listp tags) (mapconcat #'identity tags ","))
+                           (t nil))))
+          (sqlite-execute
+           db "UPDATE memory_meta SET tags = ?2 WHERE file = ?1"
+           (list file tags*))
+          (push :tags updated)))
+      (when body
+        (let ((body-trimmed
+               (replace-regexp-in-string "[ \t\n]+\\'" "" body)))
+          (setq digest (secure-hash 'sha1 body-trimmed))
+          (sqlite-execute
+           db "DELETE FROM memory_body_fts WHERE file = ?1" (list file))
+          (sqlite-execute
+           db "INSERT INTO memory_body_fts(file, body) VALUES (?1, ?2)"
+           (list file body-trimmed))
+          (push :body updated)))
+      (list :file file
+            :name basename
+            :updated (nreverse updated)
             :digest digest))))
 
 
@@ -3107,6 +3197,33 @@ Returns =(:file SYNTHETIC :name BASENAME :type TYPE :description DESC
       :tags (anvil-memory--coerce-string tags)
       :ttl-policy (anvil-memory--coerce-type ttl_policy)))))
 
+(defun anvil-memory--tool-update (file_or_name &optional body type
+                                               tags ttl_policy)
+  "Update fields of an existing DB-direct memory entry in place.
+
+MCP Parameters:
+  file_or_name - Required key: synthetic id (`anvil-memory:db:<basename>')
+                 or bare basename (`feedback_my_rule').  Scan-from-md
+                 rows are rejected — edit the `.md' and re-run
+                 `memory-scan' for those.
+  body         - Optional replacement body (no YAML frontmatter).  The
+                 FTS index row is refreshed in the same call.
+  type         - Optional new type: user / feedback / project /
+                 reference / memo.
+  tags         - Optional comma-separated string or list.
+  ttl_policy   - Optional TTL key.
+
+At least one of body / type / tags / ttl_policy must be supplied.
+Returns =(:file SYNTHETIC :name BASENAME :updated FIELDS :digest
+SHA1-OR-NIL)=."
+  (anvil-server-with-error-handling
+   (anvil-memory-update
+    (or file_or_name "")
+    :body (anvil-memory--coerce-string body)
+    :type (anvil-memory--coerce-type type)
+    :tags (anvil-memory--coerce-string tags)
+    :ttl-policy (anvil-memory--coerce-type ttl_policy))))
+
 (defun anvil-memory--tool-get (file_or_name &optional bump_access)
   "Return one memory entry plist by synthetic id / basename / path.
 
@@ -3426,6 +3543,20 @@ Optional: `description', `tags', `ttl_policy'.  Body should NOT
 include YAML frontmatter — it is synthesized on `memory-export-md'.
 Returns the synthetic file id so callers can later round-trip the
 entry to disk via `memory-export-md'.")
+
+    (,(anvil-server-encode-handler #'anvil-memory--tool-update)
+     :id "memory-update"
+     :intent '(memory)
+     :layer 'workflow
+     :description
+     "Phase 5 DB-direct in-place update — replace `body' / `type' /
+`tags' / `ttl_policy' of an existing DB-direct entry (synthetic id or
+basename) without touching any .md file.  Scan-from-md rows are
+rejected: edit the .md and re-run `memory-scan' so disk stays
+canonical for those.  At least one field must be supplied; the FTS
+body index is refreshed in the same call so `memory-search' reflects
+the new text immediately.  Use this to correct a wrong memory instead
+of stacking a second corrective entry next to it.")
 
     (,(anvil-server-encode-handler #'anvil-memory--tool-get)
      :id "memory-get"

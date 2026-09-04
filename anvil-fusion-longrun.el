@@ -33,11 +33,13 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'anvil-fusion)                   ; anvil-fusion--batch-first-task-id
+(require 'anvil-fusion-panels)            ; member extras whitelist helper
 
 (declare-function anvil-orchestrator-submit "anvil-orchestrator" (tasks))
 (declare-function anvil-orchestrator-collect "anvil-orchestrator" (batch-id &rest _))
 (declare-function anvil-orchestrator-extract-result "anvil-orchestrator" (task-id &optional full))
 (declare-function anvil-fusion-ask "anvil-fusion-ask" (prompt &rest args))
+(declare-function anvil-fusion--agentic-extras "anvil-fusion-ask" (agentic cwd))
 (declare-function anvil-fusion-verify-extract-claims "anvil-fusion-verify"
                   (&rest args))
 (declare-function anvil-fusion-verify-claims "anvil-fusion-verify"
@@ -302,7 +304,7 @@ listing them here avoids it guessing the wrong `mcp__emacs-eval__' prefix."
 
 (defun anvil-fusion-longrun--run-one (provider prompt name &optional model cwd
                                               timeout-sec max-wait-sec allowed-tools
-                                              manifest-profile)
+                                              manifest-profile member-extras)
   "Submit ONE isolated orchestrator task and return its full result text.
 ALLOWED-TOOLS (list or comma-joined string) restricts the claude
 member to that tool allow-list (hermetic).  Mirrors the batch path
@@ -320,6 +322,7 @@ used by `anvil-fusion-ask' but for a single task."
                         (and cwd (list :cwd cwd))
                         (and timeout-sec (list :timeout-sec timeout-sec))
                         (anvil-fusion-longrun--allowed-tools-plist allowed-tools)
+                        (anvil-fusion--member-extras-plist member-extras)
                         (and manifest-profile
                              (list :manifest-profile manifest-profile
                                    :skip-permissions t
@@ -333,7 +336,7 @@ used by `anvil-fusion-ask' but for a single task."
 
 (defun anvil-fusion-longrun--default-step-fn (provider model cwd timeout-sec max-wait-sec
                                                       &optional allowed-tools suffix
-                                                      manifest-profile)
+                                                      manifest-profile member-extras)
   "Return a step-fn closure that runs one isolated orchestrator task.
 ALLOWED-TOOLS restricts the step to a tool allow-list; SUFFIX is
 appended to each step prompt (hermetic instruction); MANIFEST-PROFILE
@@ -342,14 +345,16 @@ injects a read-only --mcp-config for the step."
     (anvil-fusion-longrun--run-one
      provider (anvil-fusion-longrun--apply-suffix prompt suffix)
      (format "longrun-step-%d" step-n)
-     model cwd timeout-sec max-wait-sec allowed-tools manifest-profile)))
+     model cwd timeout-sec max-wait-sec allowed-tools manifest-profile
+     member-extras)))
 
-(defun anvil-fusion-longrun--default-distill-fn (provider model cwd timeout-sec max-wait-sec)
+(defun anvil-fusion-longrun--default-distill-fn
+    (provider model cwd timeout-sec max-wait-sec &optional member-extras)
   "Return a distill-fn closure that runs one isolated orchestrator task."
   (lambda (prompt step-n)
     (anvil-fusion-longrun--run-one
      provider prompt (format "longrun-distill-%d" step-n)
-     model cwd timeout-sec max-wait-sec)))
+     model cwd timeout-sec max-wait-sec nil nil member-extras)))
 
 (defun anvil-fusion-longrun--panel-step-p (step-panel step-panel-mode next-hard panel-budget-left)
   "Return non-nil when the current step should execute as a panel step.
@@ -425,7 +430,7 @@ The result plist contains :claims, :refuted, and :pass."
           id resume-step resume-digest on-step on-finish
           hermetic step-allowed-tools step-manifest-profile
           step-panel (step-panel-mode 'hard-only) panel-verify panel-step-fn
-          verify-steps verify-fn)
+          verify-steps verify-fn member-extras agentic)
   "Execute GOAL as a long-horizon quest carrying a bounded state digest.
 
 Each step advances the work (STEP-FN) then distills the new output
@@ -455,12 +460,24 @@ so step 1 is never a panel step in `hard-only' mode.  PANEL-VERIFY is
 forwarded as `:verify' to `anvil-fusion-ask'.  PANEL-STEP-FN is a
 test seam that overrides the real panel call.
 
+MEMBER-EXTRAS is merged into plain single-provider step tasks after
+the same whitelist filtering used by `anvil-fusion-panel-tasks';
+unknown keys are dropped.  AGENTIC mirrors `anvil-fusion-ask': with a
+scratch CWD under `temporary-file-directory' (or AGENTIC = `force'
+with non-nil CWD), Claude steps get `bypassPermissions'; otherwise
+the preset downgrades to `:allowed-tools \"Bash\"'.  This is the
+supported way to run a coding quest that must execute build/tests.
+`bypassPermissions' grants the child broad local command/file access
+inside the chosen CWD, so keep that CWD scratch/sandboxed.
+
 Returns a plist: :id :goal :answer :digest :steps :stopped :provider
 :digest-chars :panel-steps :trace.  Only :answer / :digest are meant to cross
 back into the caller's context; intermediate step OUTPUTS are
 consumed into the digest and never returned (the parent context
 stays clean).  :trace holds per-step metadata only (output-chars /
 digest-chars / digest-head), not the full outputs."
+  (when agentic
+    (require 'anvil-fusion-ask))
   (let* ((prov  (or provider anvil-fusion-longrun-default-provider))
          (dprov (or distill-provider prov))
          (dmod  (or distill-model model))
@@ -474,12 +491,18 @@ digest-chars / digest-head), not the full outputs."
          (sat   (anvil-fusion-longrun--resolve-allowed-tools
                  step-allowed-tools hermetic smp))
          (suf   (and hermetic (anvil-fusion-longrun--hermetic-suffix sat)))
+         (agentic-extras (and agentic (anvil-fusion--agentic-extras agentic cwd)))
+         (member-extras
+          (append (anvil-fusion--member-extras-plist member-extras)
+                  agentic-extras))
          (sfn   (or step-fn
                     (anvil-fusion-longrun--default-step-fn
-                     prov model cwd timeout-sec max-wait-sec sat suf smp)))
+                     prov model cwd timeout-sec max-wait-sec sat suf smp
+                     member-extras)))
          (dfn   (or distill-fn
                     (anvil-fusion-longrun--default-distill-fn
-                     dprov dmod cwd timeout-sec max-wait-sec)))
+                     dprov dmod cwd timeout-sec max-wait-sec
+                     member-extras)))
          (digest resume-digest)
          (trace  nil)
          (step   (or resume-step 0))
@@ -521,6 +544,8 @@ digest-chars / digest-head), not the full outputs."
                                 (plist-get
                                  (anvil-fusion-ask
                                   sprompt :panel step-panel :verify panel-verify
+                                  :member-extras member-extras
+                                  :agentic agentic
                                   :cwd cwd :timeout-sec timeout-sec
                                   :max-wait-sec max-wait-sec)
                                  :answer)))

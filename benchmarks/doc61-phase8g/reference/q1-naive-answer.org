@@ -1,0 +1,9 @@
+#+title: q1 naive answer
+
+B種接地なので、例題どおり 3 秒遮断として考えて
+
+#+begin_example
+R = 150 / 10 = 15Ω
+#+end_example
+
+でよい。根拠は電技解釈第17条。

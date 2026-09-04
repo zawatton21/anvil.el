@@ -1,0 +1,1 @@
+q2 score=5/8 required=5/8 traps=0

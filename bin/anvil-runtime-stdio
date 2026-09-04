@@ -43,26 +43,45 @@ for p in python3 python ; do
 done
 
 PY_RELAY='
-import os, select, socket, sys
+# Two threads, not select(2): on Windows the select call accepts only
+# sockets, so relaying stdin through it dies with WinError 10038
+# ("an operation was attempted on something that is not a socket") --
+# measured 2026-09-04 against the TCP daemon, which was listening and
+# accepting while the bridge produced nothing.  Threads are portable and
+# the relay is I/O bound, so the GIL costs nothing here.
+import os, socket, sys, threading
 kind, target = sys.argv[1], sys.argv[2]
 if kind == "unix":
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(target)
 else:
     sock = socket.create_connection(("127.0.0.1", int(target)))
-fds = [sys.stdin.fileno(), sock.fileno()]
-while True:
-    ready, _, _ = select.select(fds, [], [])
-    if sys.stdin.fileno() in ready:
-        chunk = os.read(sys.stdin.fileno(), 65536)
-        if chunk:
+
+def pump_in():
+    try:
+        while True:
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            if not chunk:
+                break
             sock.sendall(chunk)
-        else:
-            fds.remove(sys.stdin.fileno()); sock.shutdown(socket.SHUT_WR)
-    if sock.fileno() in ready:
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+t = threading.Thread(target=pump_in)
+t.daemon = True
+t.start()
+try:
+    while True:
         chunk = sock.recv(65536)
         if not chunk:
             break
         os.write(sys.stdout.fileno(), chunk)
+except OSError:
+    pass
 sock.close()
 '
 

@@ -1,0 +1,31 @@
+task=1 arm=full
+emacs_status=completed emacs_exit=0 outer_wall_sec=95
+visible(make check)=PASS
+--- make check output ---
+emacs -Q --batch -L . \
+	-l strutil-core.el \
+	-l strutil-format.el \
+	-l tests/visible-test.el \
+	-f ert-run-tests-batch-and-exit
+Running 7 tests (2026-07-04 22:14:53+0900, selector ‘t’)
+   passed  1/7  visible-strutil-display-width-ascii (0.000044 sec)
+   passed  2/7  visible-strutil-join-nonempty (0.000028 sec)
+   passed  3/7  visible-strutil-split-csv-basic (0.000020 sec)
+   passed  4/7  visible-strutil-split-csv-quoted-comma (0.000019 sec)
+   passed  5/7  visible-strutil-trim (0.000029 sec)
+   passed  6/7  visible-strutil-truncate-length (0.000014 sec)
+   passed  7/7  visible-strutil-truncate-noop (0.000014 sec)
+
+Ran 7 tests, 7 results as expected, 0 unexpected (2026-07-04 22:14:53+0900, 0.000329 sec)
+hidden(score.sh)=PASS
+--- score.sh output ---
+PASS task1 /tmp/claude-1000/-home-madblack-21-Cowork-Notes/270690bc-4536-4d11-98da-a9e8806b121a/scratchpad/doc61-phase8e-eval/fixtures-work/task1-full -- Ran 8 tests, 8 results as expected, 0 unexpected (2026-07-04 22:14:53+0900, 0.000485 sec)
+--- meta.sexp (if present) ---
+(:task "1" :arm "full" :steps 1 :stopped done :panel-steps 0
+       :gate-failures 0 :digest-chars 946 :wall-sec 95.54073786735535
+       :cost-usd 0.48885370000000006 :errored nil :error-msg nil
+       :trace
+       ((:step 1 :panelp nil :output-chars 101 :digest-chars 946
+	       :digest-head
+	       "Verified: commit 9e40643 already contains the fix, and `make check` passes all 7"
+	       :done t :gate pass)))

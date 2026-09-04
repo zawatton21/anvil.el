@@ -1,0 +1,27 @@
+# ゴール
+作業ディレクトリ: /tmp/claude-1000/-home-madblack-21-Cowork-Notes/270690bc-4536-4d11-98da-a9e8806b121a/scratchpad/doc61-phase8e-eval/fixtures-work/task3-baseline
+
+`agg-summarize.el` の `agg-summarize-group` 仕様:
+1. NA行（値が nil）は :count / :sum / :avg の計算対象から除外
+2. 除外した欠測件数を返り値plistの新キー `:skipped` として追加
+3. `:avg` は非欠測データの平均を小数点以下2桁に丸めた値
+4. 非欠測データが0件（全て NA、または空リスト）でもエラーを出さず `:avg` を nil にする
+
+`agg-format.el` の `agg-format-summary` は `:skipped` と丸め済み `:avg`（0件時は文字列 "N/A"）を前提にすでに実装済み・変更不要。
+スコープ外: `agg-parse-line` のフォーマット変更、新しい集計軸の追加。
+完了条件: `make check` が全てパスすること。
+
+# 進捗（完了）
+`agg-summarize.el` の `agg-summarize-group` を仕様1〜4に沿って修正済み:
+- NA（nil）値を件数・合計・平均の計算から除外
+- 除外件数を `:skipped` として返り値 plist に追加
+- `:avg` は非欠測データの平均を小数点以下2桁に丸め
+- 非欠測データが0件（全NA/空リスト）の場合は `:avg` を nil にしてエラーを回避
+
+`agg-format.el` は変更不要であることを確認済み（`:skipped` と丸め済み `:avg`／0件時 "N/A" を前提にすでに実装されている）。
+
+`make check` を実行 → 可視6テスト全てパス（Makefile の `check` ターゲットに定義された全項目、隠しテストなし）。
+コミットは未実施（ユーザーから明示指示がないため）。
+
+# 次の一手
+追加作業は不要。完了条件（`make check` 全パス）を満たしている。必要であればコミットするかどうかユーザーに確認する。

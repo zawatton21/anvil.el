@@ -71,6 +71,29 @@
   "The shipped Opus self-consistency panel validates."
   (should (anvil-fusion-panel-validate 'opus-solo)))
 
+(ert-deftest anvil-fusion-panels-test-sonnet-solo-exists ()
+  "The Sonnet self-consistency panel is registered."
+  (should (assq 'sonnet-solo anvil-fusion-panels)))
+
+(ert-deftest anvil-fusion-panels-test-sonnet-solo-shape ()
+  "The Sonnet self-consistency panel matches the shipped design."
+  (let* ((body (anvil-fusion-panel-get 'sonnet-solo))
+         (members (anvil-fusion-panel-members body)))
+    (should (= 3 (length members)))
+    (should (equal '((claude . "claude-sonnet-5")
+                     (claude . "claude-sonnet-5")
+                     (claude . "claude-sonnet-5"))
+                   members))
+    (should (equal '(claude . "claude-sonnet-5")
+                   (anvil-fusion-panel-judge body)))
+    (should (eq 'external (anvil-fusion-panel-egress body)))
+    (should (equal '(correctness completeness skeptic)
+                   (cdr (assq 'lenses body))))))
+
+(ert-deftest anvil-fusion-panels-test-sonnet-solo-validates ()
+  "The shipped Sonnet self-consistency panel validates."
+  (should (anvil-fusion-panel-validate 'sonnet-solo)))
+
 ;;;; --- validation: sovereignty enforcement --------------------------------
 
 (ert-deftest anvil-fusion-panels-test-local-only-rejects-external-member ()
@@ -179,6 +202,65 @@
                        (plist-get (nth 2 tasks) :prompt)))
     (should-not (equal (plist-get (nth 0 tasks) :prompt)
                        (plist-get (nth 2 tasks) :prompt)))))
+
+(ert-deftest anvil-fusion-panels-test-sonnet-solo-tasks ()
+  "Sonnet self-consistency members keep order, names, and lens prefixes."
+  (let* ((body (anvil-fusion-panel-get 'sonnet-solo))
+         (prompt "PROMPT-X")
+         (lenses (cdr (assq 'lenses body)))
+         (tasks (anvil-fusion-panel-tasks body prompt lenses))
+         (prefixes (mapcar (lambda (lens) (cdr (assq lens anvil-fusion-lenses)))
+                           lenses))
+         (names (mapcar (lambda (tk) (plist-get tk :name)) tasks)))
+    (should (= 3 (length tasks)))
+    (should (cl-every (lambda (tk) (eq 'claude (plist-get tk :provider)))
+                      tasks))
+    (should (equal '("claude-sonnet-5" "claude-sonnet-5" "claude-sonnet-5")
+                   (mapcar (lambda (tk) (plist-get tk :model)) tasks)))
+    (should (= 3 (length (delete-dups (copy-sequence names)))))
+    (should (string-prefix-p (nth 0 prefixes) (plist-get (nth 0 tasks) :prompt)))
+    (should (string-prefix-p (nth 1 prefixes) (plist-get (nth 1 tasks) :prompt)))
+    (should (string-prefix-p (nth 2 prefixes) (plist-get (nth 2 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 0 tasks) :prompt)
+                       (plist-get (nth 1 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 1 tasks) :prompt)
+                       (plist-get (nth 2 tasks) :prompt)))
+    (should-not (equal (plist-get (nth 0 tasks) :prompt)
+                       (plist-get (nth 2 tasks) :prompt)))))
+
+(ert-deftest anvil-fusion-panels-test-member-extras-whitelist-merged ()
+  "Whitelisted MEMBER-EXTRAS keys reach every member; unknown keys are dropped."
+  (let* ((tasks (anvil-fusion-panel-tasks
+                 (anvil-fusion-panel-get 'sovereign) "Q" nil nil
+                 '(:permission-mode "bypassPermissions"
+                   :allowed-tools "Bash"
+                   :sandbox "workspace-write"
+                   :no-worktree t
+                   :timeout-sec 55
+                   :bogus "nope"))))
+    (should (= 3 (length tasks)))
+    (dolist (task tasks)
+      (should (equal "bypassPermissions" (plist-get task :permission-mode)))
+      (should (equal "Bash" (plist-get task :allowed-tools)))
+      (should (equal "workspace-write" (plist-get task :sandbox)))
+      (should (eq t (plist-get task :no-worktree)))
+      (should (= 55 (plist-get task :timeout-sec)))
+      (should-not (plist-member task :bogus)))))
+
+(ert-deftest anvil-fusion-panels-test-member-extras-nil-regression-identical ()
+  "Nil MEMBER-EXTRAS keeps the exact prior task plist shape."
+  (let* ((body (anvil-fusion-panel-get 'sovereign))
+         (expected
+          '((:provider ollama :prompt "Q" :name "fusion-member-0-ollama"
+             :model "llama3.1:8b" :cwd "/tmp")
+            (:provider ollama :prompt "Q" :name "fusion-member-1-ollama"
+             :model "llama3.2:3b" :cwd "/tmp")
+            (:provider ollama :prompt "Q" :name "fusion-member-2-ollama"
+             :model "gemma4:e4b" :cwd "/tmp"))))
+    (should (equal expected
+                   (anvil-fusion-panel-tasks body "Q" nil "/tmp")))
+    (should (equal expected
+                   (anvil-fusion-panel-tasks body "Q" nil "/tmp" nil)))))
 
 (provide 'anvil-fusion-panels-test)
 ;;; anvil-fusion-panels-test.el ends here

@@ -1,0 +1,8 @@
+(:id nil :task "3" :arm "full" :step 1 :digest
+     "# 最終ゴール\n作業ディレクトリ `/tmp/claude-1000/.../hard3-full` の `tt-*.el`（プレーンテキスト表描画ライブラリ）に、列 spec の `:align`(left/right/center) と CJK 全角文字対応の表示幅計算を追加する。header/body で共通のpadding/alignmentロジックを使うこと。完了条件: `make check` が全てパス。スコープ外: 複数行セル、ANSI color、box-drawing文字の変更。\n\n# 実施済みの変更\n- `tt-width.el`: `tt-string-width` をCJK対応の実表示幅計算に変更(全角文字は幅2としてカウント)。README.org/docstringの幅仕様に準拠。\n- `tt-layout.el`: `tt-compute-widths` を新しい `tt-string-width` に追随させ、列幅計算をCJK幅ベースに統一。`tt-pad-cell` に `align` 引数を追加(left/right/center対応、center時の端数パディングは右側に寄せる)。\n- `tt-draw.el`: 罫線幅計算に幅計算修正で表面化していたオフバイワンを修正(`width+1` → `width+2`)。\n- `tt--render-row`: header/bodyで別々に寄せ処理を書かず、共通helper(`tt-pad-cell`)経由で列specの`:align`を渡すよう統一。\n\n# 検証状況\n- 前ステップで `make check` 実行 → 5/5 パス確認済み。\n- 本ステップでは環境上 `make check` 実行がサンドボックス承認待ちで再実行不可だったため未再検証だが、コード変更は前ステップ以降なし(`git status --short` で `tt-draw.el`/`tt-layout.el`/`tt-width.el` の3ファイルのみ変更、未コミット、内容の追加変更なしを確認)。\n- コミットはユーザー指示によりまだ作成していない(要望があれば作成可能)。\n\n# 残タスク\n特になし。ゴール(alignサポート、CJK幅対応、header/body共通ロジック、`make check`パス)は実装・検証済み。ユーザーがコミットを希望する場合のみ追加アクションが必要。"
+     :done t :meta
+     (:step 1 :panelp nil :output-chars 268 :digest-chars 1043
+	    :digest-head
+	    "# 最終ゴール\n作業ディレクトリ `/tmp/claude-1000/.../hard3-full` の `tt-*.el`（プレーンテキスト表描画ライブラリ）"
+	    :done t :gate pass)
+     :cost-so-far 0.6954008)

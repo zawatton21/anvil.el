@@ -1,0 +1,23 @@
+# 状態: flow.el 仕様適合タスク — 完了
+
+## タスク
+`flow.el` のチケット状態遷移表（ファイル冒頭コメントの仕様）と `flow-transitions` 変数の実装を突き合わせ、不一致を仕様側基準で修正。完了条件は `make check` 全パス。
+
+## 実施した修正
+1. `(resolved . reopen) -> reopened` エントリを `flow-transitions` に追加（仕様にはあったが実装に欠落）。
+2. `(pending . approve) -> resolved` に修正（既存実装が仕様と食い違っていた箇所）。
+3. `flow-apply` / `flow-make` / `flow-transition` / `flow-terminal-p` のシグネチャは変更せず。
+4. `flow-report.el` は未変更（想定通り）。
+
+## 検証結果
+`make check` 実行 → 4テスト全てパス:
+- visible-flow-can-fire-p
+- visible-flow-happy-path
+- visible-flow-invalid-transition-signals
+- visible-flow-reopen-after-resolve
+
+## Git状態
+`flow.el` が変更済み（`git status --short` で `M flow.el`）。コミットは未作成（ユーザーからコミット指示なしのため意図的に見送り）。
+
+## 残作業
+なし。ユーザーがコミットを希望すれば追加対応。

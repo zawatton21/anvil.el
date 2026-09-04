@@ -1,0 +1,28 @@
+#+title: q5 reference answer
+
+対象は *受電 6.6kV、最大電力 600kW の需要設備*。
+
+1. *有資格者以外の者を選任する許可(選任許可)は不可*。
+   理由は、需要設備の選任許可は *最大電力 500kW 未満* が境界であり、
+   この案件は 600kW なので境界を超えるため。
+
+2. *電気管理技術者への外部委託は可能*。
+   理由は、需要設備の外部委託承認の対象が *受電電圧 7000V 以下* であり、
+   この案件は 6.6kV (=6600V) なので範囲内だから。
+
+3. 根拠として、主任技術者の選任は *電気事業法 第43条*、
+   実務上の区分整理は *選任許可* と *外部委託承認* の閾値表による。
+
+* KB citations
+
+- 第43条:
+  =/home/madblack-21/Cowork/Notes/node/20250320212427-設置者への3つの義務.org:68-79=
+- 選任許可 500kW 未満:
+  =/home/madblack-21/Cowork/Notes/node/20250915182848-太陽光発電所の点検.org:506-510=
+- 外部委託承認 需要設備 7000V 以下:
+  =/home/madblack-21/Cowork/Notes/node/20250915182848-太陽光発電所の点検.org:516-528=
+
+* Anti-triviality
+
+The legal article is cited from =設置者への3つの義務.org=, while the
+threshold discrimination is in =太陽光発電所の点検.org=.

@@ -13,6 +13,33 @@ End-to-end verified: ~bin/anvil-runtime mcp serve~ with
 exposes the synthetic ~nelisp-shims-demo-ping~ tool, ~tools/list~
 includes it, ~tools/call~ returns ="pong"=.
 
+* NeLisp v1.1.0 string contract (Doc 200)
+
+The following measurements were made on 2026-08-28 with
+~nelisp/target/nelisp~ at ~acbd93b7f~ (v1.1.0 plus one unrelated tooling
+commit):
+
+- ~string-as-unibyte~ is the byte-accurate NeLisp conversion.  For ="あ"=,
+  ~(append (string-as-unibyte "あ") nil)~ returned ~(227 129 130)~.
+  ~string-bytes~ returned =3= for ="あ"= and =2= for
+  ~(unibyte-string 200 201)~.
+- ~encode-coding-string~ is still an identity stub: encoding ="あ"= as UTF-8
+  returned a multibyte string whose character list was ~(12354)~.  The
+  ~decode-coding-string~ stub also left explicit UTF-8 byte strings unchanged.
+  Anvil therefore uses ~string-as-unibyte~ / ~string-as-multibyte~ on NeLisp
+  and the coding-system functions on host Emacs 30.1.
+- The stdin primitive used by ~scripts/anvil-runtime-shell-loop.el~ is
+  ~read-stdin-bytes~, buffered by ~emacs-stdio-read-bytes~.  It returned a
+  150-byte ASCII JSON body as unibyte, but returned ="日本語"= as an already
+  decoded multibyte string with ~length~ =3= and ~string-bytes~ =9=.  Transport
+  code must therefore inspect the representation instead of assuming one tag.
+- Numeric reader escapes now match Emacs for octal, hexadecimal, and escape
+  forms.  Named/universal escapes remain literal: ~(append "\U00003042" nil)~
+  returned ~(85 48 48 48 48 51 48 52 50)~, and
+  ~(append "\N{HIRAGANA LETTER A}" nil)~ returned the literal =N{...}= byte
+  sequence.  Do not use ~\U...~ or ~\N{...}~ string escapes in anvil Elisp
+  sources.
+
 * Phase 1 result — what works
 
 - Pattern C accumulator (~anvil-server-register-tools~ stub) — ✓

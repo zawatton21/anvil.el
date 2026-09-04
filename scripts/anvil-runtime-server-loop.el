@@ -55,6 +55,66 @@ same filter recording into a global hash table worked.  That is why the
 daemon accepted connections and answered nothing.  Anything the filter
 or sentinel needs at dispatch time is therefore read from a global.")
 
+(defvar anvil-runtime-server--primitive-load nil
+  "Standalone `load' function saved before stdlib-misc replaces it.")
+
+(defvar anvil-runtime-server--primitive-hash-functions nil
+  "Standalone hash functions saved before stdlib-misc replaces them.")
+
+(defvar anvil-runtime-server--skip-load-files nil
+  "Absolute source files intentionally skipped by the runtime loader.")
+
+(defun anvil-runtime-server--absolute-file-name-p (file)
+  "Return non-nil when FILE is an absolute name on this platform.
+`file-name-absolute-p' is missing from some standalone images, and a
+leading-slash test alone rejects the Windows reader's own paths: the
+launcher hands the bootstrap `C:/...' names, so every absolute load fell
+through to `locate-library' and failed (measured 2026-09-04, the daemon
+died on emacs-init.el)."
+  (and (stringp file)
+       (> (length file) 0)
+       (if (fboundp 'file-name-absolute-p)
+           (file-name-absolute-p file)
+         (or (eq (aref file 0) ?/)
+             (eq (aref file 0) 92)
+             (and (> (length file) 2)
+                  (eq (aref file 1) ?:)
+                  (or (eq (aref file 2) ?/) (eq (aref file 2) 92)))))))
+
+(defun anvil-runtime-server--compat-load
+    (file &optional noerror nomessage _nosuffix _must-suffix)
+  "Load FILE with Emacs load context and the standalone native reader."
+  (let ((resolved
+         (if (anvil-runtime-server--absolute-file-name-p file)
+             (cond
+              ((file-exists-p file) file)
+              ((file-exists-p (concat file ".el")) (concat file ".el"))
+              (t nil))
+           (locate-library file))))
+    (if (null resolved)
+        (if noerror nil
+          (signal 'file-error (list "Cannot open load file" file)))
+      (if (member resolved anvil-runtime-server--skip-load-files)
+          t
+        (let ((prior-lfn (and (boundp 'load-file-name) load-file-name))
+              (prior-dd (and (boundp 'default-directory) default-directory))
+              (value nil)
+              (err nil))
+          (setq load-file-name resolved)
+          (setq default-directory (file-name-directory resolved))
+          (condition-case caught
+              (setq value
+                    (funcall anvil-runtime-server--primitive-load
+                             resolved noerror nomessage))
+            (error (setq err caught)))
+          (when (fboundp 'garbage-collect)
+            (garbage-collect))
+          (setq load-file-name prior-lfn)
+          (setq default-directory prior-dd)
+          (cond
+           ((null err) value)
+           (t (signal (car err) (cdr err)))))))))
+
 ;; Path resolution — same chain as shell-loop.el §path-resolution.
 ;; The primary channel is `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir'
 ;; set by `bin/anvil-runtime' before loading us; `getenv' is unreliable
@@ -78,6 +138,12 @@ or sentinel needs at dispatch time is therefore read from a global.")
              (concat (file-name-directory
                       (directory-file-name anvil-el-dir))
                      "nelisp-emacs"))))
+       (nelisp-lisp-dir
+        (or (and (boundp 'anvil-runtime-bootstrap-nelisp-lisp-dir)
+                 (> (length anvil-runtime-bootstrap-nelisp-lisp-dir) 0)
+                 anvil-runtime-bootstrap-nelisp-lisp-dir)
+            (concat (file-name-directory (directory-file-name anvil-el-dir))
+                    "nelisp/lisp")))
        (server-id
         (anvil-runtime-server--env "ANVIL_SERVER_ID" "emacs-eval"))
        ;; Publish it before any filter/sentinel closure can be called.
@@ -141,7 +207,9 @@ or sentinel needs at dispatch time is therefore read from a global.")
        ;; shell-loop.el resolves its copy pre-init for the same reason.
        (modules-env (anvil-runtime-server--env
                      "ANVIL_TOOL_MODULES"
-                     "anvil-discovery,anvil-sqlite,anvil-bench")))
+                     "anvil-discovery,anvil-sqlite,anvil-bench"))
+       (stdlib-misc (concat nelisp-lisp-dir "/nelisp-stdlib-misc.el"))
+       (bootstrap-skip-features '(nelisp-coding-jis-tables calendar)))
 
   ;; --- substrate bootstrap (same as shell-loop.el) ---
   ;; emacs-init.el gates its vendor load-path setup on
@@ -177,6 +245,43 @@ or sentinel needs at dispatch time is therefore read from a global.")
   (let ((src-dir (concat nelisp-emacs-dir "/src")))
     (unless (and (boundp 'load-path) (member src-dir load-path))
       (setq load-path (cons src-dir (and (boundp 'load-path) load-path)))))
+  ;; Load before emacs-init for the measured `load-file-name' behavior.
+  ;; See shell-loop.el for the 2026-08-28 JSON timing and call-count data.
+  ;; The stdlib-misc chain below is OPT-IN, default off.
+  ;;
+  ;; It was written for the pre-v1.2 runtime, where `load' left
+  ;; `load-file-name' nil and stdlib-misc supplied the coding-system and
+  ;; hash-traversal fixes.  NeLisp v1.2.1's prelude carries those fixes
+  ;; itself, and loading stdlib-misc on top of it is not free: measured
+  ;; 2026-09-04 on the windows-x86_64 reader, `(load init-el)' never
+  ;; returned -- a 600 s stdio run stalled after `[STEP] pre-init' with
+  ;; no output, where the same tree without this chain answered
+  ;; `tools/list' normally.  Set ANVIL_RUNTIME_STDLIB_MISC=1 to restore
+  ;; it for a runtime that still needs it.
+  (when (and (boundp 'anvil-runtime-bootstrap-stdlib-misc)
+             anvil-runtime-bootstrap-stdlib-misc
+             (file-exists-p stdlib-misc))
+    (setq anvil-runtime-server--primitive-load (symbol-function 'load))
+    (setq anvil-runtime-server--primitive-hash-functions
+          (mapcar (lambda (name) (cons name (symbol-function name)))
+                  '(maphash hash-table-keys hash-table-values hash-table-count)))
+    (load stdlib-misc nil t)
+    ;; Retain the working native hash traversal functions; see shell-loop.el
+    ;; for the measured missing-`nelisp--hash-pairs' failure.
+    (let ((saved anvil-runtime-server--primitive-hash-functions))
+      (while saved
+        (fset (car (car saved)) (cdr (car saved)))
+        (setq saved (cdr saved))))
+    ;; Install the same 2026-08-29 measured native-reader compatibility
+    ;; layer and exact vendor-calendar skip documented in shell-loop.el.
+    (setq anvil-runtime-server--skip-load-files
+          (list (concat nelisp-emacs-dir
+                        "/vendor/emacs-lisp/calendar/calendar.el")))
+    (fset 'load #'anvil-runtime-server--compat-load)
+    )
+  (dolist (feature bootstrap-skip-features)
+    (provide feature))
+
   (load init-el nil t)
   (load stub-el nil t)
 
@@ -266,9 +371,19 @@ killed the daemon right after bind)."
     "Return the wire bytes S as a decoded (multibyte) string for dispatch.
 The parser above slices by byte counts, so only the extracted body is
 decoded; see shell-loop.el's `anvil-runtime-shell--multibyte'."
-    (if (and (stringp s) (fboundp 'string-as-multibyte))
-        (funcall 'string-as-multibyte s)
-      s))
+    (cond
+     ((not (stringp s)) s)
+     ;; Prefer anvil-server's validating decoder (it also covers host
+     ;; Emacs); fall back to the lenient path when it rejects the bytes,
+     ;; so one malformed frame cannot take the daemon down.
+     ((fboundp 'anvil-server--utf8-bytes-to-string)
+      (condition-case nil
+          (anvil-server--utf8-bytes-to-string s)
+        (error (if (fboundp 'string-as-multibyte)
+                   (funcall 'string-as-multibyte s)
+                 s))))
+     ((fboundp 'string-as-multibyte) (funcall 'string-as-multibyte s))
+     (t s)))
 
   ;; --- shared polyfills (cl-loop / to-json-value / register-tools etc) ---
   ;; (migrated from nelisp-emacs/scripts/ to anvil.el/scripts/ 2026-05-14)

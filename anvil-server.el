@@ -471,180 +471,6 @@ in `tools/list' immediately.  The real module is loaded on first
                anvil-server--tools-list-cache))
     count))
 
-(defun anvil-server--scan-substr-pos (s needle)
-  "Return start index of NEEDLE in S, or nil.
-Pure char-by-char scan — does not depend on `string-match' which
-returns nil on raw-byte strings from `read-stdin-bytes' under
-standalone nelisp."
-  (let* ((s-len (length s))
-         (n-len (length needle))
-         (limit (- s-len n-len))
-         (i 0)
-         (found nil))
-    (while (and (<= i limit) (not found))
-      (let ((j 0) (ok t))
-        (while (and ok (< j n-len))
-          (if (eq (aref s (+ i j)) (aref needle j))
-              (setq j (1+ j))
-            (setq ok nil)))
-        (if ok (setq found i)
-          (setq i (1+ i)))))
-    found))
-
-(defun anvil-server--scan-int-after (s needle)
-  "Return integer after NEEDLE in S, tolerating whitespace, or nil."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             (digits nil)
-             (saw-digit nil))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (when (and (< i s-len) (eq (aref s i) ?-))
-          (push (aref s i) digits)
-          (setq i (1+ i)))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (and (>= c ?0) (<= c ?9))))
-          (push (aref s i) digits)
-          (setq saw-digit t)
-          (setq i (1+ i)))
-        (when saw-digit
-          (string-to-number (apply #'string (nreverse digits))))))))
-
-(defun anvil-server--scan-string-after (s needle)
-  "Return JSON string after NEEDLE in S, tolerating whitespace, or nil.
-NEEDLE should end at the colon before the value."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             (chars nil))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (when (and (< i s-len) (eq (aref s i) ?\"))
-          (setq i (1+ i))
-          (while (and (< i s-len) (not (eq (aref s i) ?\")))
-            (if (eq (aref s i) ?\\)
-                (progn
-                  (setq i (1+ i))
-                  (when (< i s-len)
-                    (push (aref s i) chars)
-                    (setq i (1+ i))))
-              (push (aref s i) chars)
-              (setq i (1+ i))))
-          (apply #'string (nreverse chars)))))))
-
-(defun anvil-server--scan-json-value-after (s needle)
-  "Return a string or integer JSON value after NEEDLE in S, or nil."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle))))
-        (while (and (< i s-len)
-                    (let ((c (aref s i)))
-                      (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?\r))))
-          (setq i (1+ i)))
-        (cond
-         ((and (< i s-len) (eq (aref s i) ?\"))
-          (anvil-server--scan-string-after s needle))
-         ((and (< i s-len)
-               (let ((c (aref s i)))
-                 (or (eq c ?-) (and (>= c ?0) (<= c ?9)))))
-          (anvil-server--scan-int-after s needle))
-         (t nil))))))
-
-(defun anvil-server--scan-flat-object-after (s needle)
-  "Parse a flat JSON object that begins right after NEEDLE in S.
-Returns an alist `((SYMBOL . STRING-OR-INT) ...)' or nil if no
-match.  Handles the bounded shape used by MCP tool arguments:
-`{\"key1\":\"val1\",\"key2\":42,\"key3\":\"val3\"}'.  Bypasses
-json-read-from-string (broken on read-stdin-bytes strings under
-standalone nelisp)."
-  (let ((pos (anvil-server--scan-substr-pos s needle)))
-    (when pos
-      (let* ((s-len (length s))
-             (i (+ pos (length needle)))
-             ;; Skip optional whitespace + opening `{'.
-             (_skip-open
-              (progn
-                (while (and (< i s-len)
-                            (let ((c (aref s i)))
-                              (or (eq c ?\s) (eq c ?\t) (eq c ?\n))))
-                  (setq i (1+ i)))
-                (when (and (< i s-len) (eq (aref s i) ?\{))
-                  (setq i (1+ i)))))
-             (result nil)
-             (done nil))
-        (while (and (not done) (< i s-len))
-          ;; Skip whitespace and commas
-          (while (and (< i s-len)
-                      (let ((c (aref s i)))
-                        (or (eq c ?\s) (eq c ?\t) (eq c ?\n) (eq c ?,))))
-            (setq i (1+ i)))
-          (cond
-           ((>= i s-len) (setq done t))
-           ((eq (aref s i) ?\})
-            (setq done t))
-           ((eq (aref s i) ?\")
-            ;; Read key string
-            (setq i (1+ i))
-            (let ((key-chars nil))
-              (while (and (< i s-len) (not (eq (aref s i) ?\")))
-                (push (aref s i) key-chars)
-                (setq i (1+ i)))
-              (when (< i s-len) (setq i (1+ i))) ; consume closing "
-              ;; Skip whitespace + colon
-              (while (and (< i s-len)
-                          (let ((c (aref s i)))
-                            (or (eq c ?\s) (eq c ?\t) (eq c ?:))))
-                (setq i (1+ i)))
-              ;; Read value
-              (let ((key (intern (apply #'string (nreverse key-chars))))
-                    (val nil))
-                (cond
-                 ((and (< i s-len) (eq (aref s i) ?\"))
-                  (setq i (1+ i))
-                  (let ((val-chars nil))
-                    (while (and (< i s-len) (not (eq (aref s i) ?\")))
-                      ;; Minimal escape handling: skip a single backslash
-                      ;; and copy the next char verbatim (covers `\"' and
-                      ;; `\\' for typical MCP args).
-                      (if (eq (aref s i) ?\\)
-                          (progn
-                            (setq i (1+ i))
-                            (when (< i s-len)
-                              (push (aref s i) val-chars)
-                              (setq i (1+ i))))
-                        (push (aref s i) val-chars)
-                        (setq i (1+ i))))
-                    (when (< i s-len) (setq i (1+ i))) ; consume closing "
-                    (setq val (apply #'string (nreverse val-chars)))))
-                 ((and (< i s-len)
-                       (let ((c (aref s i)))
-                         (or (eq c ?-)
-                             (and (>= c ?0) (<= c ?9)))))
-                  (let ((num-chars nil))
-                    (while (and (< i s-len)
-                                (let ((c (aref s i)))
-                                  (or (eq c ?-)
-                                      (eq c ?.)
-                                      (and (>= c ?0) (<= c ?9)))))
-                      (push (aref s i) num-chars)
-                      (setq i (1+ i)))
-                    (setq val
-                          (string-to-number
-                           (apply #'string (nreverse num-chars))))))
-                 (t (setq done t)))
-                (push (cons key val) result))))
-           (t (setq i (1+ i)))))
-        (nreverse result)))))
-
 (defun anvil-server--jsonrpc-response (id result)
   "Create a JSON-RPC response with ID and RESULT."
   (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
@@ -2005,6 +1831,67 @@ See also: `anvil-server-tool-throw'"
 
 ;;; API - Transport
 
+(defun anvil-server--string-to-utf8-bytes (string)
+  "Return STRING as a unibyte UTF-8 byte string."
+  (if (not (multibyte-string-p string))
+      string
+    ;; Measured 2026-08-28 with "あ": NeLisp v1.1.0+1
+    ;; `string-as-unibyte' => (227 129 130); Emacs 30.1
+    ;; `encode-coding-string' => (227 129 130).
+    (if (fboundp 'nelisp--write-stderr-line)
+        (string-as-unibyte string)
+      (encode-coding-string string 'utf-8 t))))
+
+(defun anvil-server--valid-utf8-bytes-p (string)
+  "Return non-nil when unibyte STRING is well-formed UTF-8."
+  (let ((i 0)
+        (n (length string))
+        (valid t))
+    (while (and valid (< i n))
+      (let ((b0 (aref string i)))
+        (cond
+         ((< b0 #x80)
+          (setq i (1+ i)))
+         ((and (>= b0 #xC2) (<= b0 #xDF)
+               (< (1+ i) n)
+               (>= (aref string (1+ i)) #x80)
+               (<= (aref string (1+ i)) #xBF))
+          (setq i (+ i 2)))
+         ((and (>= b0 #xE0) (<= b0 #xEF)
+               (< (+ i 2) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xE0) (>= b1 #xA0) (>= b1 #x80))
+                      (if (= b0 #xED) (<= b1 #x9F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF))
+          (setq i (+ i 3)))
+         ((and (>= b0 #xF0) (<= b0 #xF4)
+               (< (+ i 3) n)
+               (let ((b1 (aref string (1+ i))))
+                 (and (if (= b0 #xF0) (>= b1 #x90) (>= b1 #x80))
+                      (if (= b0 #xF4) (<= b1 #x8F) (<= b1 #xBF))))
+               (>= (aref string (+ i 2)) #x80)
+               (<= (aref string (+ i 2)) #xBF)
+               (>= (aref string (+ i 3)) #x80)
+               (<= (aref string (+ i 3)) #xBF))
+          (setq i (+ i 4)))
+         (t
+          (setq valid nil)))))
+    valid))
+
+(defun anvil-server--utf8-bytes-to-string (string)
+  "Decode unibyte UTF-8 STRING while preserving multibyte input."
+  (if (multibyte-string-p string)
+      string
+    (unless (anvil-server--valid-utf8-bytes-p string)
+      (signal 'json-error '("Invalid UTF-8 in JSON input")))
+    ;; Measured 2026-08-28 with UTF-8 bytes for "日本語": NeLisp
+    ;; v1.1.0+1 `string-as-multibyte' => (26085 26412 35486);
+    ;; Emacs 30.1 `decode-coding-string' => (26085 26412 35486).
+    (if (fboundp 'nelisp--write-stderr-line)
+        (string-as-multibyte string)
+      (decode-coding-string string 'utf-8 t))))
+
 (defun anvil-server-process-jsonrpc (json-string server-id)
   "Process a JSON-RPC message JSON-STRING for SERVER-ID and return the response.
 This is the main entry point for stdio transport in MCP.
@@ -2036,67 +1923,24 @@ See also: `anvil-server-process-jsonrpc-parsed'"
           (decoded nil))
       (condition-case json-err
           (progn
-            ;; Bypass decode-coding-string on standalone nelisp:
-            ;; read-stdin-bytes already returns a UTF-8 string, and
-            ;; decode-coding-string on it produces a multibyte string
-            ;; whose internal representation makes json-read-from-string
-            ;; pathologically slow (> 600 s observed for 150-byte body).
-            (setq decoded
-                  (if (fboundp 'nelisp--write-stderr-line)
-                      ;; Standalone nelisp: read-stdin-bytes already returns
-                      ;; UTF-8 text; decode-coding-string would make json-read
-                      ;; pathologically slow, so pass through unchanged.
-                      json-string
-                    ;; Host Emacs: the JSON-RPC line arrives as a unibyte
-                    ;; (raw UTF-8 byte) string, so decode to multibyte before
-                    ;; json-read.  Otherwise CJK argument values come back
-                    ;; unibyte and `search-forward' / `re-search-forward'
-                    ;; never match the multibyte file buffer (manifested as
-                    ;; file-replace-string "string not found" on Japanese
-                    ;; while pure-ASCII args were unaffected).
-                    (if (and (fboundp 'multibyte-string-p)
-                             (multibyte-string-p json-string))
-                        json-string
-                      (decode-coding-string json-string 'utf-8 t))))
+            ;; NeLisp v1.1.0+1 measurement (2026-08-28): converting a
+            ;; 150-byte unibyte CJK JSON request with `string-as-multibyte'
+            ;; took 0.000012875 s and `json-read-from-string' then took
+            ;; 0.013195038 s.  The former >600 s pathology is gone.
+            ;; Emacs 30.1 measurement: searching a multibyte "日本語"
+            ;; buffer with its unibyte UTF-8 bytes returned nil; decoding
+            ;; the query first returned buffer position 4.
+            (setq decoded (anvil-server--utf8-bytes-to-string json-string))
             (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
               (nelisp--write-stderr-line
                (format "[PJ] decode %.4fs decoded-len=%d"
                        (- (float-time) t0) (length decoded))))
-            ;; Standalone nelisp: json-read-from-string and string-match
-            ;; both return nil on raw-byte strings from read-stdin-bytes,
-            ;; so use a char-by-char scan that bypasses both.
-            ;; Host Emacs: json-read works fine and is needed because
-            ;; the scan-extract path drops `params' (real tool dispatch
-            ;; needs full alist).  Gate on a standalone-only fboundp.
             (let ((t1 (float-time)))
-              (if (fboundp 'nelisp--write-stderr-line)
-                  ;; standalone path
-                  (let* ((sx-id (anvil-server--scan-json-value-after
-                                 decoded "\"id\":"))
-                         (sx-method (anvil-server--scan-string-after
-                                     decoded "\"method\":"))
-                         ;; For `tools/call' the handler needs
-                         ;; `(name . X) (arguments . ALIST)' in params.
-                         ;; Extract both with a flat-object scanner.
-                         (sx-params
-                          (when (equal sx-method "tools/call")
-                            (let ((nm (anvil-server--scan-string-after
-                                       decoded "\"name\":"))
-                                  (args (anvil-server--scan-flat-object-after
-                                         decoded "\"arguments\":")))
-                              `((name . ,nm) (arguments . ,args))))))
-                    (setq json-object
-                          `((jsonrpc . "2.0")
-                            (id . ,sx-id)
-                            (method . ,sx-method)
-                            (params . ,sx-params)))
-                    (when anvil-server--debug-trace
-                      (nelisp--write-stderr-line
-                       (format "[PJ] scan-extract %.4fs id=%S method=%S name=%S"
-                               (- (float-time) t1) sx-id sx-method
-                               (and sx-params (alist-get 'name sx-params))))))
-                ;; host Emacs path — normal json-read
-                (setq json-object (json-read-from-string decoded)))))
+              (setq json-object (json-read-from-string decoded))
+              (when (and anvil-server--debug-trace
+                         (fboundp 'nelisp--write-stderr-line))
+                (nelisp--write-stderr-line
+                 (format "[PJ] json-read %.4fs" (- (float-time) t1))))))
         (json-error
          (setq response
                (anvil-server--jsonrpc-error
@@ -2181,12 +2025,12 @@ characters report the correct on-the-wire byte count.
 Raises `wrong-type-argument' if JSON-STRING is not a string."
   (unless (stringp json-string)
     (signal 'wrong-type-argument (list 'stringp json-string)))
-  (let* ((body (encode-coding-string json-string 'utf-8 t))
+  (let* ((body (anvil-server--string-to-utf8-bytes json-string))
          (n (length body))
          (header (format "%s: %d\r\n\r\n"
                          anvil-server-mcp-framing-header-name n)))
     ;; Header is ASCII, body is already a unibyte UTF-8 string.
-    (concat (encode-coding-string header 'utf-8 t) body)))
+    (concat (anvil-server--string-to-utf8-bytes header) body)))
 
 (defun anvil-server-mcp-parse-content-length-header (header-block)
   "Parse HEADER-BLOCK and return the Content-Length integer or nil.
@@ -2216,9 +2060,7 @@ Signals an error tagged `anvil-mcp-frame-error' on malformed
 framing (e.g. missing Content-Length header)."
   (unless (stringp input)
     (signal 'wrong-type-argument (list 'stringp input)))
-  (let* ((unibyte (if (multibyte-string-p input)
-                      (encode-coding-string input 'utf-8 t)
-                    input))
+  (let* ((unibyte (anvil-server--string-to-utf8-bytes input))
          ;; \r\n\r\n separator between header section and body.
          (sep "\r\n\r\n")
          (sep-pos (string-match (regexp-quote sep) unibyte)))
@@ -2242,7 +2084,7 @@ framing (e.g. missing Content-Length header)."
          (t
           (let* ((body-bytes (substring unibyte body-start
                                         (+ body-start n)))
-                 (body (decode-coding-string body-bytes 'utf-8 t))
+                 (body (anvil-server--utf8-bytes-to-string body-bytes))
                  (consumed (+ body-start n)))
             (list :body body :consumed consumed)))))))))
 

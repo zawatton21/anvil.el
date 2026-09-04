@@ -1,0 +1,11 @@
+(:id "q6"
+ :required ((:key "190\\.5\\s-*V" :desc "5%タップの動作印加電圧" :points 1)
+            (:key "285\\.3\\s-*V" :desc "150%条件の印加電圧" :points 1)
+            (:key "3810\\s-*V" :desc "完全地絡時の対地電圧" :points 1)
+            (:key "6600\\s-*[/:÷]\\s-*√3\\|6600\\s-*V\\s-*[/÷]\\s-*√3" :desc "3810Vの導出式" :points 1)
+            (:key "EVT" :desc "EVTに言及" :points 1)
+            (:key "第1?5条" :desc "第15条に言及" :points 1)
+            (:key "JIS\\s-*C\\s-*4601" :desc "DGR判定基準JIS C4601" :points 1))
+ :traps ((:key "76\\.2\\s-*V" :desc "2%タップ値の誤用" :penalty 1)
+         (:key "6600\\s-*V" :desc "線間電圧をそのまま対地電圧にした誤答" :penalty 1))
+ :max-score 7)
