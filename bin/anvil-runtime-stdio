@@ -42,24 +42,7 @@ for p in python3 python ; do
     if command -v "$p" >/dev/null 2>&1 ; then python_bin="$p"; break; fi
 done
 
-if [ -S "$SOCKET" ] ; then
-    # ---- legacy UNIX-socket daemon --------------------------------------
-    # Two non-obvious bits learned during the 2026-05-11 PoC: `stdbuf -o0'
-    # on the OUTPUT side is required when stdout is a pipe to the MCP
-    # client's frame parser (nc full-buffers otherwise and the initialize
-    # response never arrives inside the handshake timeout); `nc -N' is
-    # deliberately OFF because Claude Code may close the bridge's stdin
-    # before reading the response.
-    if command -v socat >/dev/null 2>&1 ; then
-        exec socat -T 0 STDIO UNIX-CONNECT:"$SOCKET"
-    elif command -v nc >/dev/null 2>&1 ; then
-        if command -v stdbuf >/dev/null 2>&1 ; then
-            exec stdbuf -i0 -o0 -e0 nc -U "$SOCKET"
-        else
-            exec nc -U "$SOCKET"
-        fi
-    elif [ -n "$python_bin" ] ; then
-        exec "$python_bin" -u - unix "$SOCKET" <<'PY'
+PY_RELAY='
 import os, select, socket, sys
 kind, target = sys.argv[1], sys.argv[2]
 if kind == "unix":
@@ -81,7 +64,26 @@ while True:
             break
         os.write(sys.stdout.fileno(), chunk)
 sock.close()
-PY
+'
+
+if [ -S "$SOCKET" ] ; then
+    # ---- legacy UNIX-socket daemon --------------------------------------
+    # Two non-obvious bits learned during the 2026-05-11 PoC: `stdbuf -o0'
+    # on the OUTPUT side is required when stdout is a pipe to the MCP
+    # client's frame parser (nc full-buffers otherwise and the initialize
+    # response never arrives inside the handshake timeout); `nc -N' is
+    # deliberately OFF because Claude Code may close the bridge's stdin
+    # before reading the response.
+    if command -v socat >/dev/null 2>&1 ; then
+        exec socat -T 0 STDIO UNIX-CONNECT:"$SOCKET"
+    elif command -v nc >/dev/null 2>&1 ; then
+        if command -v stdbuf >/dev/null 2>&1 ; then
+            exec stdbuf -i0 -o0 -e0 nc -U "$SOCKET"
+        else
+            exec nc -U "$SOCKET"
+        fi
+    elif [ -n "$python_bin" ] ; then
+        exec "$python_bin" -u -c "$PY_RELAY" unix "$SOCKET"
     else
         echo "anvil-runtime-stdio: need \`socat', OpenBSD \`nc' or python for the UNIX-socket bridge" >&2
         exit 1
@@ -100,29 +102,7 @@ if command -v socat >/dev/null 2>&1 ; then
 elif [ -n "$python_bin" ] ; then
     # Preferred over nc on hosts that have both: unbuffered both ways with
     # no per-implementation flag differences (Windows/MSYS included).
-    exec "$python_bin" -u - tcp "$PORT" <<'PY'
-import os, select, socket, sys
-kind, target = sys.argv[1], sys.argv[2]
-if kind == "unix":
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(target)
-else:
-    sock = socket.create_connection(("127.0.0.1", int(target)))
-fds = [sys.stdin.fileno(), sock.fileno()]
-while True:
-    ready, _, _ = select.select(fds, [], [])
-    if sys.stdin.fileno() in ready:
-        chunk = os.read(sys.stdin.fileno(), 65536)
-        if chunk:
-            sock.sendall(chunk)
-        else:
-            fds.remove(sys.stdin.fileno()); sock.shutdown(socket.SHUT_WR)
-    if sock.fileno() in ready:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        os.write(sys.stdout.fileno(), chunk)
-sock.close()
-PY
+    exec "$python_bin" -u -c "$PY_RELAY" tcp "$PORT"
 elif command -v nc >/dev/null 2>&1 ; then
     if command -v stdbuf >/dev/null 2>&1 ; then
         exec stdbuf -i0 -o0 -e0 nc 127.0.0.1 "$PORT"

@@ -42,6 +42,19 @@ nil for production (silent).")
   (let ((val (and (fboundp 'getenv) (getenv name))))
     (if (and val (> (length val) 0)) val default)))
 
+(defvar anvil-mcp--server-id "emacs-eval"
+  "Server id the connection filter dispatches to.
+
+A GLOBAL, deliberately.  Every `defun' below is written inside one big
+`let*', so each is a closure over that `let*''s bindings -- and on the
+NeLisp v1.2.x reader a closure invoked from the process pump does not
+reliably see or write those captured bindings: measured 2026-09-04, a
+`:filter' closure recording through a captured variable lost every
+write, and mutating a captured cons took the process down, while the
+same filter recording into a global hash table worked.  That is why the
+daemon accepted connections and answered nothing.  Anything the filter
+or sentinel needs at dispatch time is therefore read from a global.")
+
 ;; Path resolution — same chain as shell-loop.el §path-resolution.
 ;; The primary channel is `anvil-runtime-bootstrap-{anvil-el,nelisp-emacs}-dir'
 ;; set by `bin/anvil-runtime' before loading us; `getenv' is unreliable
@@ -67,6 +80,8 @@ nil for production (silent).")
                      "nelisp-emacs"))))
        (server-id
         (anvil-runtime-server--env "ANVIL_SERVER_ID" "emacs-eval"))
+       ;; Publish it before any filter/sentinel closure can be called.
+       (_srvid (setq anvil-mcp--server-id server-id))
        (socket-path
         ;; The launcher (`bin/anvil-runtime server PATH') writes a
         ;; bootstrap.el that `setq's `anvil-runtime-bootstrap-socket-path'
@@ -118,7 +133,15 @@ nil for production (silent).")
        (eventloop-el (concat nelisp-emacs-dir "/src/emacs-eventloop.el"))
        (metrics-el (concat anvil-el-dir "/anvil-server-metrics.el"))
        (server-el (concat anvil-el-dir "/anvil-server.el"))
-       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el")))
+       (server-commands-el (concat anvil-el-dir "/anvil-server-commands.el"))
+       ;; Resolved HERE, in the binding list, so it is read while `getenv' is
+       ;; still the reader's own.  Read after `(load init-el)' it came back
+       ;; nil and the daemon silently served the three-module default even
+       ;; when ANVIL_TOOL_MODULES asked for six (measured 2026-09-04).
+       ;; shell-loop.el resolves its copy pre-init for the same reason.
+       (modules-env (anvil-runtime-server--env
+                     "ANVIL_TOOL_MODULES"
+                     "anvil-discovery,anvil-sqlite,anvil-bench")))
 
   ;; --- substrate bootstrap (same as shell-loop.el) ---
   ;; emacs-init.el gates its vendor load-path setup on
@@ -353,17 +376,8 @@ helper instead of `frame-send' for those clients."
     (process-send-string proc "\n"))
 
   ;; --- tool-module load chain (same as shell-loop default) ---
-  (let* ((modules-env (anvil-runtime-server--env
-                       "ANVIL_TOOL_MODULES"
-                       ;; Default trimmed 2026-05-24 from 8 → 3 modules.
-                       ;; anvil-{state,memory,worklog,org-index,
-                       ;; orchestrator} all fail at *-enable with
-                       ;; "sqlite not available" under post-2026-05-17
-                       ;; nelisp standalone (no sqlite primitive yet),
-                       ;; burning 63 % of cold-load time before failing.
-                       ;; Set ANVIL_TOOL_MODULES explicitly to re-enable
-                       ;; any of them once nelisp ships sqlite.
-                       "anvil-discovery,anvil-sqlite,anvil-bench")))
+  (progn
+
     (when (and anvil-server--debug-trace (fboundp 'nelisp--write-stderr-line))
       (nelisp--write-stderr-line
        (concat "[server-loop] ANVIL_TOOL_MODULES=" modules-env)))
@@ -572,7 +586,7 @@ Responses go back in the matching wire format."
                                (substring body 0 (min 120 (length body))))))
                     (let ((response
                            (condition-case err
-                               (anvil-server-process-jsonrpc (anvil-mcp--decode body) server-id)
+                               (anvil-server-process-jsonrpc (anvil-mcp--decode body) anvil-mcp--server-id)
                              (error
                               (format
                                "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: %s\"}}"
@@ -626,7 +640,7 @@ Responses go back in the matching wire format."
                              (substring body 0 (min 120 (length body))))))
                   (let ((response
                          (condition-case err
-                             (anvil-server-process-jsonrpc (anvil-mcp--decode body) server-id)
+                             (anvil-server-process-jsonrpc (anvil-mcp--decode body) anvil-mcp--server-id)
                            (error
                             (format
                              "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32603,\"message\":\"Internal error: %s\"}}"

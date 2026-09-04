@@ -76,14 +76,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`anvil-runtime prewarm`** — loads the modules once, writes the schema
   cache, the module→tool map and the fast-tools file, and exits, so the
   first-ever schema generation no longer happens inside an MCP session.
-- **Daemon on TCP loopback** — `anvil-runtime server [PORT]`,
-  `anvil-runtime-daemon` and `anvil-runtime-stdio` now use
+- **Daemon on TCP loopback, working end to end** — `anvil-runtime server
+  [PORT]`, `anvil-runtime-daemon` and `anvil-runtime-stdio` now use
   127.0.0.1:PORT (default 47171, `ANVIL_RUNTIME_PORT`) through nelisp's
   own process adapter (`make-network-process :server t` over the native
   socket family), the same on Linux and Windows.  The K2 UNIX-socket
   stack spoke the Rust-era FFI contract and could not open a socket on
-  the v1.2.0 reader; it remains reachable by passing a socket path.  The
-  bridge gained a python fallback (socat → python → nc).
+  the v1.2.x reader; it remains reachable by passing a socket path.  The
+  bridge gained a python fallback (socat → python → nc).  Measured on
+  Linux with the six-module set: the daemon is listening 17 s after
+  start with warm caches, and serves 38 tools over both dialects, DB
+  tools included, across successive client connections.
+
+  Three things had to be right for that, each of which had failed
+  silently:
+
+  - The **bridge must not read its relay program from stdin.**  Handing
+    python the program on stdin left `sys.stdin` at EOF, so every
+    connection opened, sent nothing, and closed -- which read exactly
+    like a server that never answers.  The program is passed with `-c`.
+  - **The filter and sentinel read what they need from globals.**  Every
+    `defun` in the server loop sits inside one `let*`, and on the v1.2.x
+    reader a closure invoked from the process pump does not reliably
+    see or write those captured bindings (measured: a filter recording
+    through a captured variable lost every write; mutating a captured
+    cons took the process down).  `anvil-mcp--server-id` is a global for
+    that reason.
+  - **`ANVIL_TOOL_MODULES` is resolved before Layer 2 loads**, as the
+    shell loop already did.  Read afterwards it came back nil and the
+    daemon quietly served the three-module default while asked for six.
+
+  On Linux the DB-backed tools need the DYNAMIC reader
+  (`NELISP_READER_DYNAMIC=1 make standalone-reader`): that is the build
+  carrying nelisp's sqlite3 FFI rows.  The static reader serves the
+  discovery and bench tools and reports sqlite as unavailable.
 - `bin/anvil-runtime doctor` and the server loop share the shell loop's
   v1.2.0 pre-init (src/ on load-path, `nelisp` feature marker, state-dir
   temporary directory, probe-gated `alist-get`, anvil-config).
