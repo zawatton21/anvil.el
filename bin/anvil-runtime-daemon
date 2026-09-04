@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# anvil-runtime-daemon — persistent UNIX-socket daemon for `bin/anvil-runtime'.
+# anvil-runtime-daemon — persistent daemon for `bin/anvil-runtime'.
 #
-# K2 (= 2026-05-11) rewrite: replaces the G v1 FIFO-based scheme
-# (mkfifo + Linux O_RDWR keep-alive + `dd bs=1' bridge hacks) with a
-# proper UNIX domain socket listener.  Powered by the
-# `make-network-process' polyfill in nelisp-emacs/src/emacs-*.el
-# (commit `b662671' on nelisp-emacs main).
+# NeLisp v1.2.0 (2026-09-04): the daemon is `anvil-runtime server PORT',
+# a TCP loopback listener (127.0.0.1:PORT) served by nelisp's process
+# adapter -- the same on Linux and Windows.  It replaces the K2
+# (2026-05-11) UNIX-socket listener, which was built on the Rust-era
+# `nl-ffi-call' contract the pure-elisp reader no longer has.  Bridges
+# (`anvil-runtime-stdio') relay each MCP client session to it.
 #
 # Lifecycle:
-#   start    — cold-load `anvil-runtime server' once, leave it listening
-#              on `~/.anvil-runtime/sock'.  Subsequent bridges (=
-#              `anvil-runtime-stdio') just `socat - UNIX-CONNECT:...'.
-#   stop     — kill the daemon process; the socket file is removed by
-#              the daemon's accept loop on next start.
-#   status   — report running / stopped.
+#   start    — start `anvil-runtime server PORT' in the background.  With
+#              warm caches (`anvil-runtime prewarm' once) it is listening
+#              within seconds; a cold state dir spends minutes generating
+#              tool schemas first.
+#   stop     — kill the daemon process.
+#   status   — report running / listening.
 #   logs     — tail the daemon stderr log.
 #
-# Drop-in for `.mcp.json' is `anvil-runtime-stdio' (sibling script).
-#
-# Multi-client concurrency: each connection becomes a separate
-# `network-connection' process in the standalone NeLisp registry, with
-# its own MCP parser state.  N bridges can run in parallel.
+# Environment:
+#   ANVIL_RUNTIME_DAEMON_DIR   state dir (default ~/.anvil-runtime)
+#   ANVIL_RUNTIME_PORT         listen port (default 47171)
+#   ANVIL_TOOL_MODULES         tool modules, e.g.
+#                              anvil-discovery,anvil-sqlite,anvil-bench,anvil-state,anvil-memory,anvil-worklog
 
 set -euo pipefail
 
@@ -28,7 +29,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANVIL_RUNTIME="$script_dir/anvil-runtime"
 
 DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
-SOCKET="$DIR/sock"
+PORT="${ANVIL_RUNTIME_PORT:-47171}"
 PID_FILE="$DIR/daemon.pid"
 LOG_FILE="$DIR/daemon.log"
 
@@ -36,6 +37,10 @@ cmd="${1:-status}"
 
 is_running() {
     [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+is_listening() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
 }
 
 start_daemon() {
@@ -47,25 +52,25 @@ start_daemon() {
         echo "anvil-runtime: launcher not found / not executable: $ANVIL_RUNTIME" >&2
         exit 1
     fi
+    if is_listening ; then
+        echo "anvil-runtime: something already listens on 127.0.0.1:$PORT (set ANVIL_RUNTIME_PORT)" >&2
+        exit 1
+    fi
     mkdir -p "$DIR"
-    # Stale socket from previous run will be unlinked by the server-loop
-    # before it calls bind(2), but tidy up here as a courtesy so `ls'
-    # of the dir does not show a dangling file.
-    rm -f "$SOCKET"
 
-    nohup "$ANVIL_RUNTIME" server "$SOCKET" </dev/null >>"$LOG_FILE" 2>&1 &
+    nohup "$ANVIL_RUNTIME" server "$PORT" </dev/null >>"$LOG_FILE" 2>&1 &
     local daemon_pid=$!
     disown "$daemon_pid" 2>/dev/null || true
     echo "$daemon_pid" > "$PID_FILE"
 
     echo "anvil-runtime daemon started" >&2
     echo "  daemon pid: $daemon_pid" >&2
-    echo "  socket:     $SOCKET" >&2
+    echo "  listen:     127.0.0.1:$PORT" >&2
     echo "  log:        $LOG_FILE" >&2
     echo "" >&2
-    echo "Cold-load: ~5-7 minutes — wait for the registry-keys log line" >&2
-    echo "(\`pre-loop registry keys=...') before pointing MCP clients at" >&2
-    echo "$SOCKET via \`bin/anvil-runtime-stdio'." >&2
+    echo "Wait for \`status' to say listening before pointing MCP clients at" >&2
+    echo "\`bin/anvil-runtime-stdio'.  Seconds with warm caches; run" >&2
+    echo "\`bin/anvil-runtime prewarm' first on a cold state dir." >&2
 }
 
 stop_daemon() {
@@ -83,7 +88,7 @@ stop_daemon() {
         fi
         rm -f "$PID_FILE"
     fi
-    rm -f "$SOCKET"
+    rm -f "$DIR/sock"
     if [ "$stopped" = 1 ] ; then
         echo "anvil-runtime daemon stopped" >&2
     else
@@ -93,10 +98,10 @@ stop_daemon() {
 
 status_daemon() {
     if is_running ; then
-        if [ -S "$SOCKET" ] ; then
-            echo "running (pid $(cat "$PID_FILE"), socket $SOCKET ready)"
+        if is_listening ; then
+            echo "running (pid $(cat "$PID_FILE"), listening on 127.0.0.1:$PORT)"
         else
-            echo "running (pid $(cat "$PID_FILE"), socket not yet bound — still cold-loading)"
+            echo "running (pid $(cat "$PID_FILE"), not listening yet — still loading)"
         fi
         return 0
     else
@@ -124,8 +129,8 @@ case "$cmd" in
 usage: anvil-runtime-daemon {start|stop|restart|status|logs}
 
 Environment:
-  ANVIL_RUNTIME_DAEMON_DIR   (default: ~/.anvil-runtime)
-                             — where socket / pid / log live.
+  ANVIL_RUNTIME_DAEMON_DIR   (default: ~/.anvil-runtime) — where pid / log live.
+  ANVIL_RUNTIME_PORT         (default: 47171)            — TCP loopback port.
 EOF
         exit 2
         ;;

@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
-# anvil-runtime-stdio — MCP-stdio ↔ UNIX-socket bridge for the
-# persistent anvil-runtime daemon.  K2 v2 (2026-05-11) — uses `socat'
-# to relay each MCP client session over the daemon's `~/.anvil-runtime/sock'.
-# Multi-client concurrent: N MCP clients can run at once, each getting
-# their own connection process inside the standalone NeLisp registry.
+# anvil-runtime-stdio — MCP-stdio bridge to the persistent anvil-runtime
+# daemon.  Relays one MCP client session to the daemon started by
+# `anvil-runtime-daemon start'.  Multi-client: N bridges can run at once,
+# each becoming its own connection process inside the daemon.
+#
+# NeLisp v1.2.0 (2026-09-04): the daemon listens on TCP 127.0.0.1:PORT
+# (nelisp's process adapter over the native socket family, Linux and
+# Windows alike); the K2 (2026-05-11) UNIX-socket form is kept for a
+# daemon started with a socket path.  Relay backends, first available:
+# socat, OpenBSD nc, python3 / python.
 #
 # Drop-in for `.mcp.json':
 #   {"mcpServers":{"anvil-standalone":{"command":"<...>/anvil-runtime-stdio"}}}
 #
 # Setup:
-#   1. Start the daemon (cold-load ~5-7 min, one-time):
-#        bin/anvil-runtime-daemon start
-#   2. Wait for `pre-loop registry keys=...' to appear in the log:
-#        bin/anvil-runtime-daemon logs
-#   3. Wire `.mcp.json' as above and start the MCP client.
+#   1. (once) bin/anvil-runtime prewarm      -- schema caches, ~minutes
+#   2. bin/anvil-runtime-daemon start        -- seconds with warm caches
+#   3. wire `.mcp.json' as above and start the MCP client.
+#
+# Environment:
+#   ANVIL_RUNTIME_DAEMON_DIR   state dir (default ~/.anvil-runtime)
+#   ANVIL_RUNTIME_PORT         daemon port (default 47171)
+#   ANVIL_RUNTIME_SOCKET       legacy UNIX-socket path; when it exists the
+#                              bridge uses it instead of TCP
 
 set -eu -o pipefail
 
 DIR="${ANVIL_RUNTIME_DAEMON_DIR:-$HOME/.anvil-runtime}"
-SOCKET="$DIR/sock"
 PID_FILE="$DIR/daemon.pid"
-
-if [ ! -S "$SOCKET" ] ; then
-    echo "anvil-runtime-stdio: socket missing — start the daemon first:" >&2
-    echo "    $(dirname "$0")/anvil-runtime-daemon start" >&2
-    exit 1
-fi
+PORT="${ANVIL_RUNTIME_PORT:-47171}"
+SOCKET="${ANVIL_RUNTIME_SOCKET:-$DIR/sock}"
 
 if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null ; then
     echo "anvil-runtime-stdio: daemon process is dead (pid $(cat "$PID_FILE")). Restart:" >&2
@@ -33,43 +37,99 @@ if [ -f "$PID_FILE" ] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null ; then
     exit 1
 fi
 
-# Prefer socat if available (= more featureful, half-close handling),
-# fall back to OpenBSD `nc -U' (= ships with Debian / Ubuntu / most
-# distros by default and supports UNIX-domain sockets via `-U').
-#
-# Two non-obvious bits we learned during PoC validation (2026-05-11):
-#
-# 1. `nc -N' (= shutdown socket on stdin EOF) is required for one-shot
-#    smoke tests so nc exits cleanly and its stdio buffer flushes.  For
-#    long-lived MCP clients (Claude Code etc.) stdin stays open between
-#    frames, so `-N' is a no-op — but leaving it on is still useful
-#    because the daemon sees "connection broken" promptly when the MCP
-#    client tears down the bridge process.
-#
-# 2. `stdbuf -o0' on the OUTPUT side is critical when the bridge's
-#    stdout is a pipe to another process (= Claude Code's MCP frame
-#    parser) rather than a tty.  Without it nc full-buffers the
-#    response, the parser sees nothing, and "Failed to reconnect"
-#    surfaces because the initialize response never arrives within the
-#    MCP client's handshake timeout.  socat's `-T 0' avoids the same
-#    pitfall via its own scheduling.
-if command -v socat >/dev/null 2>&1 ; then
-    exec socat -T 0 STDIO UNIX-CONNECT:"$SOCKET"
-elif command -v nc >/dev/null 2>&1 ; then
-    # `-N' (= shutdown socket on stdin EOF) is intentionally OFF.  When
-    # Claude Code spawns this bridge and feeds initialize, it sometimes
-    # closes the bridge's stdin before reading the response — `-N' then
-    # tears the socket down before the daemon's process-send-string
-    # call lands, producing EPIPE (errno=32) in the daemon log and
-    # "Failed to reconnect" on the client.  `stdbuf -o0' is what gets
-    # the response bytes to the client promptly; the bridge process
-    # itself exits when the MCP client kills it at session teardown.
-    if command -v stdbuf >/dev/null 2>&1 ; then
-        exec stdbuf -i0 -o0 -e0 nc -U "$SOCKET"
+python_bin=""
+for p in python3 python ; do
+    if command -v "$p" >/dev/null 2>&1 ; then python_bin="$p"; break; fi
+done
+
+if [ -S "$SOCKET" ] ; then
+    # ---- legacy UNIX-socket daemon --------------------------------------
+    # Two non-obvious bits learned during the 2026-05-11 PoC: `stdbuf -o0'
+    # on the OUTPUT side is required when stdout is a pipe to the MCP
+    # client's frame parser (nc full-buffers otherwise and the initialize
+    # response never arrives inside the handshake timeout); `nc -N' is
+    # deliberately OFF because Claude Code may close the bridge's stdin
+    # before reading the response.
+    if command -v socat >/dev/null 2>&1 ; then
+        exec socat -T 0 STDIO UNIX-CONNECT:"$SOCKET"
+    elif command -v nc >/dev/null 2>&1 ; then
+        if command -v stdbuf >/dev/null 2>&1 ; then
+            exec stdbuf -i0 -o0 -e0 nc -U "$SOCKET"
+        else
+            exec nc -U "$SOCKET"
+        fi
+    elif [ -n "$python_bin" ] ; then
+        exec "$python_bin" -u - unix "$SOCKET" <<'PY'
+import os, select, socket, sys
+kind, target = sys.argv[1], sys.argv[2]
+if kind == "unix":
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(target)
+else:
+    sock = socket.create_connection(("127.0.0.1", int(target)))
+fds = [sys.stdin.fileno(), sock.fileno()]
+while True:
+    ready, _, _ = select.select(fds, [], [])
+    if sys.stdin.fileno() in ready:
+        chunk = os.read(sys.stdin.fileno(), 65536)
+        if chunk:
+            sock.sendall(chunk)
+        else:
+            fds.remove(sys.stdin.fileno()); sock.shutdown(socket.SHUT_WR)
+    if sock.fileno() in ready:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        os.write(sys.stdout.fileno(), chunk)
+sock.close()
+PY
     else
-        exec nc -U "$SOCKET"
+        echo "anvil-runtime-stdio: need \`socat', OpenBSD \`nc' or python for the UNIX-socket bridge" >&2
+        exit 1
+    fi
+fi
+
+# ---- TCP loopback daemon (NeLisp v1.2.0) ---------------------------------
+if ! (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null ; then
+    echo "anvil-runtime-stdio: nothing listens on 127.0.0.1:$PORT — start the daemon first:" >&2
+    echo "    $(dirname "$0")/anvil-runtime-daemon start" >&2
+    exit 1
+fi
+
+if command -v socat >/dev/null 2>&1 ; then
+    exec socat -T 0 STDIO TCP:127.0.0.1:"$PORT"
+elif [ -n "$python_bin" ] ; then
+    # Preferred over nc on hosts that have both: unbuffered both ways with
+    # no per-implementation flag differences (Windows/MSYS included).
+    exec "$python_bin" -u - tcp "$PORT" <<'PY'
+import os, select, socket, sys
+kind, target = sys.argv[1], sys.argv[2]
+if kind == "unix":
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.connect(target)
+else:
+    sock = socket.create_connection(("127.0.0.1", int(target)))
+fds = [sys.stdin.fileno(), sock.fileno()]
+while True:
+    ready, _, _ = select.select(fds, [], [])
+    if sys.stdin.fileno() in ready:
+        chunk = os.read(sys.stdin.fileno(), 65536)
+        if chunk:
+            sock.sendall(chunk)
+        else:
+            fds.remove(sys.stdin.fileno()); sock.shutdown(socket.SHUT_WR)
+    if sock.fileno() in ready:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        os.write(sys.stdout.fileno(), chunk)
+sock.close()
+PY
+elif command -v nc >/dev/null 2>&1 ; then
+    if command -v stdbuf >/dev/null 2>&1 ; then
+        exec stdbuf -i0 -o0 -e0 nc 127.0.0.1 "$PORT"
+    else
+        exec nc 127.0.0.1 "$PORT"
     fi
 else
-    echo "anvil-runtime-stdio: need \`socat' or OpenBSD \`nc' for UNIX-socket bridge" >&2
+    echo "anvil-runtime-stdio: need \`socat', python or \`nc' for the TCP bridge" >&2
     exit 1
 fi

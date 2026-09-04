@@ -272,8 +272,12 @@ usage() {
     cat >&2 <<EOF
 usage: anvil-runtime --version
        anvil-runtime doctor                 (print resolved paths + probe the reader)
+       anvil-runtime prewarm                (load the modules once, write the caches, exit)
        anvil-runtime mcp serve              (Phase B5 stdio loop, single-client)
-       anvil-runtime server [SOCKET_PATH]   (K2 UNIX-socket loop, multi-client)
+       anvil-runtime server [PORT]          (multi-client daemon on TCP 127.0.0.1:PORT,
+                                             default \$ANVIL_RUNTIME_PORT or 47171;
+                                             a non-numeric argument is a legacy
+                                             UNIX-socket path)
 EOF
     exit 2
 }
@@ -290,6 +294,21 @@ case "$1" in
     doctor)
         doctor
         ;;
+    prewarm)
+        # Same driver as `mcp serve', but the loop returns after the module
+        # chain instead of serving: generates the schema cache, the module
+        # -> tool map and the fast-handshake file under the state dir.  A
+        # first-ever start of the DB-backed module set otherwise spends ~9
+        # minutes of schema generation inside the first MCP session.
+        require_runtime "$LOOP_EL"
+        mkdir -p "$STATE_DIR/tmp"
+        BOOTSTRAP="$STATE_DIR/prewarm-bootstrap.el"
+        write_bootstrap "$BOOTSTRAP" \
+            "(setq anvil-runtime-bootstrap-prewarm t)" \
+            "(load \"$(native_path "$LOOP_EL")\" nil t)"
+        echo "anvil-runtime: prewarming $STATE_DIR (modules: ${ANVIL_TOOL_MODULES:-<driver default>})" >&2
+        run_nelisp "$BOOTSTRAP" </dev/null
+        ;;
     mcp)
         if [ "$#" -ge 2 ] && [ "$2" = "serve" ]; then
             require_runtime "$LOOP_EL"
@@ -302,16 +321,29 @@ case "$1" in
         ;;
     server)
         require_runtime "$SERVER_LOOP_EL"
-        if [ "$ANVIL_RUNTIME_OS" = "windows-msys" ]; then
-            echo "anvil-runtime: \`server' needs the UNIX-socket bridge (socat / nc -U); on Windows use \`mcp serve' directly from .mcp.json" >&2
-        fi
-        SOCKET_PATH="${2:-$STATE_DIR/sock}"
-        SOCKET_DIR="$(dirname "$SOCKET_PATH")"
-        mkdir -p "$SOCKET_DIR" "$STATE_DIR/tmp"
-        BOOTSTRAP="$SOCKET_DIR/bootstrap.el"
-        write_bootstrap "$BOOTSTRAP" \
-            "(setq anvil-runtime-bootstrap-socket-path \"$(native_path "$SOCKET_PATH")\")" \
-            "(load \"$(native_path "$SERVER_LOOP_EL")\" nil t)"
+        mkdir -p "$STATE_DIR/tmp"
+        TARGET="${2:-${ANVIL_RUNTIME_PORT:-47171}}"
+        case "$TARGET" in
+            ''|*[!0-9]*)
+                # Legacy: a UNIX-socket path, served by the K1 stack where
+                # the reader still supports it.
+                SOCKET_DIR="$(dirname "$TARGET")"
+                mkdir -p "$SOCKET_DIR"
+                BOOTSTRAP="$SOCKET_DIR/bootstrap.el"
+                write_bootstrap "$BOOTSTRAP" \
+                    "(setq anvil-runtime-bootstrap-socket-path \"$(native_path "$TARGET")\")" \
+                    "(load \"$(native_path "$SERVER_LOOP_EL")\" nil t)"
+                ;;
+            *)
+                # TCP loopback through nelisp's process adapter (NeLisp
+                # v1.2.0): the same daemon on Linux and Windows, bridged by
+                # `anvil-runtime-stdio'.
+                BOOTSTRAP="$STATE_DIR/server-bootstrap.el"
+                write_bootstrap "$BOOTSTRAP" \
+                    "(setq anvil-runtime-bootstrap-port $TARGET)" \
+                    "(load \"$(native_path "$SERVER_LOOP_EL")\" nil t)"
+                ;;
+        esac
         run_nelisp "$BOOTSTRAP"
         ;;
     *)

@@ -57,6 +57,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ever start 534 s (schema generation for ~40 tools), warm start 26 s,
   fast handshake 1.2 s to the initialize response.
 
+- **Linux verified (WSL Debian 13, dynamic reader)** — the same launcher
+  and driver serve the DB-backed set on the Linux reader: framed and
+  NDJSON dialects, worklog-search with a Japanese query, 37 tools; warm
+  start 25 s, initialize answered in 0.36 s on the fast handshake,
+  `prewarm` cold 339 s.
+- **Fast handshake speaks NDJSON** — Claude Code 2.1.138+ sends one JSON
+  object per line without Content-Length; the pre-init fast path now
+  detects the dialect from the first byte and answers initialize /
+  tools/list in kind (1.2–2.4 s on windows-x86_64) instead of falling
+  through to the full load.  Request bodies and lines are decoded with
+  `string-as-multibyte` before dispatch so non-ASCII arguments arrive
+  as text.
+- **Fast-tools cache keyed by module set** — the file records the
+  `ANVIL_TOOL_MODULES` it was written for and is ignored for another
+  set (a default-module run used to shrink it to 6 tools for the next
+  six-module run).  The eager (first-ever) path writes it too.
+- **`anvil-runtime prewarm`** — loads the modules once, writes the schema
+  cache, the module→tool map and the fast-tools file, and exits, so the
+  first-ever schema generation no longer happens inside an MCP session.
+- **Daemon on TCP loopback** — `anvil-runtime server [PORT]`,
+  `anvil-runtime-daemon` and `anvil-runtime-stdio` now use
+  127.0.0.1:PORT (default 47171, `ANVIL_RUNTIME_PORT`) through nelisp's
+  own process adapter (`make-network-process :server t` over the native
+  socket family), the same on Linux and Windows.  The K2 UNIX-socket
+  stack spoke the Rust-era FFI contract and could not open a socket on
+  the v1.2.0 reader; it remains reachable by passing a socket path.  The
+  bridge gained a python fallback (socat → python → nc).
+- `bin/anvil-runtime doctor` and the server loop share the shell loop's
+  v1.2.0 pre-init (src/ on load-path, `nelisp` feature marker, state-dir
+  temporary directory, probe-gated `alist-get`, anvil-config).
+
 ### Changed (standalone driver defaults)
 
 - `ANVIL_TOOL_MODULES` still defaults to the three original modules;
